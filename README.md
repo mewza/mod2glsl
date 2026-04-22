@@ -1,7 +1,7 @@
 # MOD2GLSL - Amiga MOD Player v1.1 for ShaderToy/GLSL
 #           (c) 2026 Orblivius
 
-# NEW: Real-time Surround Sound + FAT DSP processing
+## NEW: Real-time Surround Sound + FAT DSP processing
 
 Convert Amiga ProTracker MOD(and soon S3M/XM and IT) files 
 and export them as ShaderToy shaders. 
