@@ -1,4 +1,4 @@
-# MOD2GLSL - Stateless ProTracker MOD Player v1.1 for ShaderToy/GLSL
+# MOD2GLSL - Amiga MOD Player v1.1 for ShaderToy/GLSL
 #           (c) 2026 Orblivius
 
 # NEW: Real-time Surround Sound + FAT DSP processing
