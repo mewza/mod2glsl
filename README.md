@@ -14,7 +14,9 @@ and released source code for all to leran from from my
 admittedly, due to serious health issues. It'd probably make me 
 happier and more optimistic about youth and the future,
 and I am a life long committed audio guy, you can count 
-on that.
+on that. I write putty tunes, but my own, and original
+you can find them on my SoundCloud page at:
+[url]https://soundcloud.com/analogintelligence[/url]
 
 ## Overview
 
