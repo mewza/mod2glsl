@@ -17,7 +17,7 @@ and I am a life long committed audio guy, you can count
 on that. I write putty tunes, but my own, and original
 you can find them on my SoundCloud page at:
 
-    https://soundcloud.com/analogintelligence
+    <url>https://soundcloud.com/analogintelligence</url>
 
 ## Overview
 
