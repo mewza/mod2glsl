@@ -1,22 +1,20 @@
 # MOD to ShaderToy Converter
 
-Convert Amiga ProTracker MOD files into texture-based ShaderToy players!
+Convert Amiga ProTracker MOD(and soon S3M/XM and IT) files 
+into ShaderToy shaders.
 
 ## Overview
 
-This tool converts MOD files into:
-1. **PNG texture** containing all sample data
-2. **GLSL shader code** for playback in ShaderToy
-3. **Pattern data texture** (optional) for complete playback
+This python script mod_player.py allows you to convert MOD
+of size up to 150k-200k into a ShaderToy shader. 
 
 ## Features
 
-✅ Extracts and packs all samples into a single texture
-✅ Generates sample index table with loop points
-✅ Creates GLSL player framework
-✅ Encodes pattern data for full playback
+✅ RLE compression for patterns
+✅ Optimized ivec4 chunked data loader
+✅ Creates GLSL infrastructure for you
+✅ Has a fancy tracker-like GUI with note, fx, displayed
 ✅ Handles looping samples
-✅ Support for 31 samples
 
 ## Requirements
 
@@ -28,19 +26,42 @@ pip install numpy pillow
 
 ### Basic conversion:
 ```bash
-python mod_to_shadertoy.py yourfile.mod
+python mod_player.py yourfavorite.mod
 ```
+(pick MODs under 150k otherwise you would have to 
+deal with external storage into PNG. I will write 
+explanation how you can playback any size MOD inside
+of ShaderToy using a special plugin I wrote for FireFox
+which lets you drop a custom texture and at same time
+it resets iTime clock for engine to pick it up)
 
-### Complete conversion with pattern data:
+### Conversion using downsample argument:
 ```bash
-python mod_to_shadertoy_complete.py yourfile.mod
+python mod_player.py yourfavorite.mod --downsample 2
 ```
+(number can be 2, 4, and 8, beyond that sample degradation is too 
+unbearable)
 
-This generates:
-- `yourfile_samples.png` - Sample data texture (RGBA)
-- `yourfile_patterns.png` - Pattern data texture (RGBA)  
-- `yourfile_player.glsl` - GLSL shader code
-- `yourfile_info.json` - MOD metadata
+ars_player.html
+ars_player_data.png
+ars_shadertoy_bufferA.glsl
+ars_shadertoy_common.glsl
+ars_shadertoy_image.glsl
+ars_shadertoy_instructions.txt
+ars_shadertoy_sound.glsl
+
+For a MOD file named ars.mod, then the script would generate:
+- `ars_player.html` - HTML page that loads GLSL outside of ShaderToy.com
+- `ars_player_data.png` - Pattern data texture (RGBA)  
+- `ars_shadertoy_bufferA.glsl` - Shader code that goes into Buffer A tab (+)
+- `ars_shadertoy_common.glsl` - Common tab on ShaderToy (+)
+- `ars_shadertoy_image.glsl` - Image tab on ShaderToy (+)
+- `ars_shadertoy_sound.glsl` - Sound tab on ShaderToy (+)
+
+In addition to that you need to insert alphabet texture on Image tab
+into iChannel0, and add Buffer A to iChannel1 on the same Image tab,
+and you need to feedback Buffer A onto itself by setting iChannel0 
+of the Buffer A tab with itself.
 
 ## How It Works
 
