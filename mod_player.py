@@ -438,12 +438,14 @@ def create_fixed_player_html(mod, output_file, downsample=1, compress=False):
     
     for i, sample in enumerate(mod.samples):
         if sample['length'] > 0:
-            data_float = sample['data'].astype(np.float32) / 128.0
+            # mikIT zero-padding: append 32 zeros past sample end so interpolation (pos+1) never reads garbage
+            data_raw  = sample['data'].astype(np.float32) / 128.0
+            data_float = np.concatenate([data_raw, np.zeros(32, dtype=np.float32)])
             
             sample_map.append({
                 'index': i,
                 'start': current_pos,
-                'length': len(data_float),
+                'length': len(data_raw),   # audio length (not including 32-byte padding)
                 'loop_start': sample['repeat_point'],
                 'loop_length': sample['repeat_length'],
                 'volume': sample['volume'],
@@ -814,6 +816,9 @@ body{{background:var(--bg0);color:var(--text);font-family:var(--font);display:fl
   <button class="ctrl-btn" id="stopBtn" disabled>&#9632; STOP</button>
   <div class="sep"></div>
   <div id="volWrap"><span>VOL</span><input type="range" id="volSlider" min="0" max="1" step="0.01" value="0.8"></div>
+  <div id="volWrap"><span>3D</span><input type="range" id="surroundSlider" min="0" max="2" step="0.05" value="0.5" title="Only3D surround depth"></div>
+  <div id="volWrap"><button id="surroundModeBtn" title="Toggle: total mix vs outer channels only" style="font-size:11px;padding:2px 6px">3D:MIX</button></div>
+  <div id="volWrap"><span>PHAT</span><input type="range" id="phatSlider" min="0" max="1.5" step="0.05" value="0.5" title="Phat bass (Hilbert allpass)"></div>
   <div id="timeDisplay">00:00 / 00:00</div>
 </div>
 <div id="infoGrid">
@@ -846,6 +851,9 @@ const modData = {{
     songLength: {len(mod.song_positions)},
     songPositions: {json.dumps(mod.song_positions)},
     numPatterns: {mod.num_patterns},
+    initialBPM: {mod.initial_tempo},
+    initialSpeed: {mod.initial_speed},
+    bassSamples: {json.dumps([i+1 for i,s in enumerate(mod.samples) if s['length']>0 and 'bass' in s['name'].lower()])},
     {data_fields},
     samples: {chunk_concat},
     downsample: {downsample}
@@ -853,12 +861,128 @@ const modData = {{
 
 {decompress_code}
 
+// ── PhatBass — Hilbert allpass pair for bass enhancement ───────────────────────
+// Direct port of PHASESHIFT0 / PHASESHIFT90 from mss (c) Dmitry Boldyrev
+// Usage: PHASESHIFT90 → L,  PHASESHIFT0 → R  (separate state arrays, same input)
+// The 3-stage allpass shifts bass ~82° at 100Hz.  Adding the phase-rotated
+// signal to the dry mix gives +4 to +6 dB bass enhancement below 100Hz
+// and natural mid-roll-off — creating the "phat" bass sensation.
+// PHASESHIFT90 returns the PREVIOUS output (one-sample sync delay).
+class PhatBass {{
+    constructor() {{
+        this.coL = new Float64Array(11);  // state for L (PHASESHIFT90)
+        this.coR = new Float64Array(11);  // state for R (PHASESHIFT0)
+        this.depth = 0.5;
+    }}
+    reset() {{ this.coL.fill(0); this.coR.fill(0); }}
+    // PHASESHIFT0: current allpass output
+    _ps0(inp, co) {{
+        const s0 = (co[6]-inp)  * 0.232829 + co[4];
+        const s1 = (co[8]-s0)   * 0.843573 + co[6];
+        const s2 = (co[10]-s1)  * 0.980351 + co[8];
+        co[10]=co[9]; co[9]=s2; co[8]=co[7]; co[7]=s1;
+        co[6]=co[5];  co[5]=s0; co[4]=co[3]; co[3]=inp;
+        return s2;
+    }}
+    // PHASESHIFT90: previous allpass output (sync-delayed 1 sample)
+    _ps90(inp, co) {{
+        const s0 = (co[6]-inp)  * 0.232829 + co[4];
+        const s1 = (co[8]-s0)   * 0.843573 + co[6];
+        const s2 = (co[10]-s1)  * 0.980351 + co[8];
+        const out = co[9];                         // previous s2
+        co[10]=co[9]; co[9]=s2; co[8]=co[7]; co[7]=s1;
+        co[6]=co[5];  co[5]=s0; co[4]=co[3]; co[3]=inp;
+        return out;
+    }}
+    // Process a bass-channel sample: add phase-shifted version to L and R outputs
+    // bassIn = mono bass signal, outL/outR = current mix outputs
+    // Returns [new_outL, new_outR]
+    process(bassIn, outL, outR) {{
+        const d = this.depth;
+        if (d <= 0) return [outL, outR];
+        const ps90 = this._ps90(bassIn, this.coL);  // PHASESHIFT90 → L
+        const ps0  = this._ps0 (bassIn, this.coR);  // PHASESHIFT0  → R
+        return [outL + ps90 * d, outR + ps0 * d];
+    }}
+}}
+
+// ── Only3D — stereo surround widener ──────────────────────────────────────────
+// Ported from Only3D.h (c) Dmitry Boldyrev / mss
+// Algorithm: extract stereo difference → 6th-order IIR lowpass (flt6_44) →
+//            two first-order allpass filters at different frequencies →
+//            soft-saturate → cross-blend into L/R for 3D depth
+class Only3D {{
+    constructor(sampleRate) {{
+        this.sr = sampleRate;
+        // Allpass coefficients — two frequencies for genuine dd1 ≠ dd2
+        // Original uses 500Hz at 4× oversampled rate; we use 1× equivalents
+        const ap = (f) => {{
+            const d = Math.tan(f * Math.PI / sampleRate);
+            const s = Math.sin(d), c = Math.cos(d), sc = s + c;
+            return {{ p0: s/sc, p1: s/sc, p2: (c-s)/sc }};
+        }};
+        const a1 = ap(500), a2 = ap(2500);
+        this.p0_1=a1.p0; this.p1_1=a1.p1; this.p2_1=a1.p2;
+        this.p0_2=a2.p0; this.p1_2=a2.p1; this.p2_2=a2.p2;
+        // Allpass state
+        this.xx1=0; this.yy1=0;
+        this.xx2=0; this.yy2=0;
+        // flt6_44 ring buffers (xv=feedforward, yv=feedback)
+        this.xv = new Float64Array(7);
+        this.yv = new Float64Array(7);
+        this.fi = 0;
+        // DC blocker (fltefx equivalent)
+        this.dcx=0; this.dcy=0;
+        this.depth = 1.0;
+    }}
+    // 6th-order Butterworth lowpass — direct port of flt6_44 from Filter_Original
+    flt6(inp) {{
+        const i = this.fi = (this.fi + 1) % 7;
+        const xv=this.xv, yv=this.yv;
+        const x = n => xv[(i-n+70)%7];
+        const y = n => yv[(i-n+70)%7];
+        xv[i] = inp * (1.0/3526.975418);
+        yv[i] = (x(0)+x(6)) + 6*(x(1)+x(5)) + 15*(x(2)+x(4)) + 20*x(3)
+              + (-0.0916957868*y(6)) + (0.7643814944*y(5))
+              + (-2.7105761157*y(4)) + (5.2526413293*y(3))
+              + (-5.8968166830*y(2)) + (3.6639199024*y(1));
+        return yv[i];
+    }}
+    // DC blocker — simplified fltefx_44 (removes DC drift from difference signal)
+    dcBlock(x) {{
+        const y = x - this.dcx + 0.9977*this.dcy;
+        this.dcx=x; this.dcy=y;
+        return y;
+    }}
+    // Soft saturation: x/√(1 + x²·0.5)  — direct port from Only3D (saturation=0.5)
+    sat(x) {{ return x / Math.sqrt(1.0 + x*x*0.5); }}
+    
+    process(L, R) {{
+        if (this.depth <= 0) return [L, R];
+        // Extract stereo difference (side signal)
+        const diff = (L - R) * 0.5;
+        // Filter: DC block then 6th-order lowpass (focuses on mid-range content)
+        const w = this.flt6(this.dcBlock(diff));
+        // Allpass 1 at 500Hz → dd1
+        let dd1 = w*this.p0_1 + this.p1_1*this.xx1 + this.p2_1*this.yy1;
+        this.xx1 = w;
+        this.yy1 = dd1 = this.sat(dd1);
+        // Allpass 2 at 2500Hz → dd2  (different phase response → dd1 ≠ dd2)
+        let dd2 = w*this.p0_2 + this.p1_2*this.xx2 + this.p2_2*this.yy2;
+        this.xx2 = w;
+        this.yy2 = dd2 = this.sat(dd2);
+        // Cross-blend: (dd1-dd2) is a bandpass-shaped surround signal
+        const surround = (dd1 - dd2) * this.depth;
+        return [L + surround, R - surround];
+    }}
+}}
+
 class MODPlayer {{
     constructor() {{
         this.audioCtx = null;
         this.isPlaying = false;
-        this.bpm = 125;
-        this.speed = 6;
+        this.bpm   = Math.max(32, modData.initialBPM   || 125);  // mikIT: bpm min=32
+        this.speed = Math.min(32, modData.initialSpeed || 6);    // mikIT: speed max=32
         this.sampleRate = 44100;
         
         // CRITICAL: ProTracker timing
@@ -868,20 +992,26 @@ class MODPlayer {{
         // Channel state (persistent across ticks)
         this.numChannels = {num_channels};
         this._volume = 0.8;
+        this._only3dDepth = 0.5;
+        this._only3d = null;
+        this._only3dMode = 0;  // 0=total output, 1=outer channels only (ch0+ch3)
+        this._phatBassDepth = 0.5;
+        this._phatBass = new PhatBass();
+        this._phatBass.depth = this._phatBassDepth;
         this.channels = [];
         this.dyingChannels = [];  // OPTIMIZATION 2: Dying channels for microclick removal
-        this.crossfadeSamples = 64;  // Crossfade duration (C++-style)
+        this.crossfadeSamples = 0;  // Disabled: bass/percussive samples start at zero, no click risk
         this.volumeRampSamples = 0;  // DISABLED: Testing if this causes sand sound
         
         for (let i = 0; i < this.numChannels; i++) {{
             this.channels.push({{
                 sample: 0, period: 0, basePeriod: 0, samplePos: 0.0, 
                 volume: 64, active: false,
-                effect: 0, effectParam: 0, targetPeriod: 0, vibratoPos: 0, arpeggioCounter: 0,
-                // OPTIMIZATION 2: Volume fade parameters for sample crossfade
+                effect: 0, effectParam: 0, targetPeriod: 0, vibratoPos: 0, vibratoSpeed: 1, vibratoDepth: 0, arpeggioCounter: 0,
                 volumeFade: 1.0, volumeFadeInc: 0, targetVolume: 1.0,
-                // ANTI-CLICK: Volume ramping for effect C (Set Volume)
-                currentVolume: 64, targetVolume2: 64, volumeRampInc: 0, volumeRamping: false
+                currentVolume: 64, targetVolume2: 64, volumeRampInc: 0, volumeRamping: false,
+                mixVol: 0, volInc: 0,
+                loopbackPoint: 0, loopCount: 0, _delayedNote: null
             }});
             
             // Dying channel for crossfade (matches C++ dying[] array)
@@ -895,6 +1025,10 @@ class MODPlayer {{
         this.currentPattern = 0;
         this.currentRow = 0;
         this.currentTick = 0;
+        this._patBreakPending = false; this._patBreakRow = 0;
+        this._jumpPending = false;    this._jumpTarget = 0;
+        this._patLoopPending = false; this._patLoopRow = 0;
+        this._patDelayTicks = 0;      this._patDelayActive = false;
         this.sampleCounter = 0;
     }}
     
@@ -912,14 +1046,21 @@ class MODPlayer {{
     init() {{
         this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         this.sampleRate = this.audioCtx.sampleRate;
+        this._only3d = new Only3D(this.sampleRate);
+        this._only3d.depth = this._only3dDepth;
         this.nextPlayTime = this.audioCtx.currentTime; // Track next buffer start time
         this.updateTiming();
         this.log('Audio initialized: ' + this.sampleRate + ' Hz');
     }}
     
-    periodToFreq(period) {{
+    // Finetune table from mikIT (C4 playback speed for each of 16 finetune values)
+    // finetune nibble 0-7 = positive (higher pitch), 8-15 = negative (lower pitch)
+    periodToFreq(period, finetune) {{
         if (period === 0) return 0;
-        return 7093789.2 / (period * 2);
+        const c4speeds = [8363,8413,8463,8529,8581,8651,8723,8757,
+                          7895,7941,7985,8046,8107,8169,8232,8280];
+        const c4 = c4speeds[(finetune || 0) & 0xF];
+        return (c4 * 428) / period;  // 428 = period for middle C (C-3) at standard tuning
     }}
     
     getSampleData(sampleIdx, position) {{
@@ -928,32 +1069,38 @@ class MODPlayer {{
         
         let pos = position;
         
-        // Handle looping
+        // Loop wrapping
         if (info.loop_length > 2) {{
             if (pos >= info.loop_start + info.loop_length) {{
-                const loopPos = (pos - info.loop_start) % info.loop_length;
-                pos = info.loop_start + loopPos;
+                pos = info.loop_start + (pos - info.loop_start) % info.loop_length;
             }}
-        }} else if (pos >= info.length - 1) {{
+        }} else if (pos >= info.length) {{
             return 0;
         }}
         
-        // Linear interpolation
-        const pos0 = Math.floor(pos);
-        const pos1 = pos0 + 1;
+        // 4-point cubic Hermite (Catmull-Rom) interpolation.
+        // pos+1 and pos+2 are always safe due to 32-zero padding (mikIT technique).
+        // pos-1 is clamped to loop boundary or sample start.
+        const pos0 = pos | 0;
         const frac = pos - pos0;
+        const base = info.start;
         
-        let absolutePos0 = info.start + pos0;
-        let absolutePos1 = info.start + pos1;
+        // Read 4 consecutive samples, handling start boundary and loop wrap
+        const looping = info.loop_length > 2;
+        const wrap = (i) => {{
+            if (looping && i < info.loop_start) return info.loop_start + info.loop_length - 1;
+            return Math.max(0, i);  // clamp at start for non-looping
+        }};
+        const p0 = modData.samples[base + wrap(pos0 - 1)];
+        const p1 = modData.samples[base + pos0];
+        const p2 = modData.samples[base + pos0 + 1];  // safe: zero-padded
+        const p3 = modData.samples[base + pos0 + 2];  // safe: zero-padded
         
-        if (absolutePos0 >= modData.samples.length) return 0;
-        if (absolutePos1 >= modData.samples.length) absolutePos1 = absolutePos0;
-        
-        const sample0 = modData.samples[absolutePos0];
-        const sample1 = modData.samples[absolutePos1];
-        
-        // Return raw sample - volume is applied in generateSamples
-        return sample0 + (sample1 - sample0) * frac;
+        // Catmull-Rom: a*t³ + b*t² + c*t + p1
+        const a = -0.5*p0 + 1.5*p1 - 1.5*p2 + 0.5*p3;
+        const b =      p0 - 2.5*p1 + 2.0*p2 - 0.5*p3;
+        const c = -0.5*p0           + 0.5*p2;
+        return ((a * frac + b) * frac + c) * frac + p1;
     }}
     
     getNote(pattern, row, channel) {{
@@ -969,88 +1116,55 @@ class MODPlayer {{
             for (let ch = 0; ch < 4; ch++) {{
                 const note = this.getNote(patternIdx, this.currentRow, ch);
                 
-                // Handle new sample
+                // Handle new sample trigger
                 if (note.sample > 0) {{
                     const state = this.channels[ch];
+                    this.dyingChannels[ch].active = false;
                     
-                    // OPTIMIZATION 2: Copy to dying channel if currently playing
-                    if (state.active && state.volume > 0) {{
-                        const dying = this.dyingChannels[ch];
-                        dying.sample = state.sample;
-                        dying.samplePos = state.samplePos;
-                        dying.period = state.period;
-                        // BUG FIX: Copy CURRENT playing volume, not target!
-                        dying.volume = state.currentVolume;  // Use currentVolume (actual), not volume (target)
-                        dying.active = true;
-                        dying.volumeFade = 1.0;  // Fade from full
-                        dying.volumeFadeInc = -1.0 / this.crossfadeSamples;
-                        dying.samplesLeft = this.crossfadeSamples;
+                    // EDx note delay: stash and trigger x ticks later
+                    if (note.effect === 0xE && ((note.param >> 4) & 0xF) === 0xD) {{
+                        state._delayedNote = note;
+                        // Don't trigger sample now
                     }} else {{
-                        this.dyingChannels[ch].active = false;
-                    }}
-                    
-                    // Set new sample
-                    state.sample = note.sample - 1;
-                    state.samplePos = 0.0;
-                    
-                    // Use sample's default volume
-                    const sampleInfo = modData.sampleMap[note.sample - 1];
-                    state.volume = sampleInfo.volume;
-                    state.active = true;
-                    
-                    // ANTI-CLICK: Initialize volume ramping state
-                    state.currentVolume = sampleInfo.volume;
-                    state.targetVolume2 = sampleInfo.volume;
-                    state.volumeRamping = false;  // Disable ramping during crossfade
-                    
-                    // Set up fade in if crossfading
-                    if (this.dyingChannels[ch].active) {{
-                        state.volumeFade = 0.0;  // Start silent
-                        state.volumeFadeInc = 1.0 / this.crossfadeSamples;
-                        state.targetVolume = 1.0;
-                    }} else {{
-                        state.volumeFade = 1.0;  // No crossfade needed
-                        state.volumeFadeInc = 0;
-                        state.targetVolume = 1.0;
-                    }}
-                    
-                    // Effect 9xx: Sample offset
-                    if (note.effect === 0x9) {{
-                        state.samplePos = note.param * 256;
+                        const sampleInfo = modData.sampleMap[note.sample - 1];
+                        state.sample = note.sample - 1;
+                        state.volume = sampleInfo.volume;
+                        state.currentVolume = sampleInfo.volume;
+                        state.active = true;
+                        state.volumeRamping = false;
+                        
+                        if (note.effect === 0x3) {{
+                            // Tone portamento: keep current position, don't retrigger
+                        }} else {{
+                            state.samplePos = 0.0;
+                            state.mixVol = 0;
+                            state.volumeFade = 1.0;
+                            state.volumeFadeInc = 0;
+                            state.targetVolume = 1.0;
+                            if (note.effect === 0x9) state.samplePos = note.param * 256;
+                        }}
                     }}
                 }}
                 
                 // Handle new period (pitch)
                 if (note.period > 0) {{
-                    // If we have a period, set it
-                    this.channels[ch].period = note.period;
-                    this.channels[ch].basePeriod = note.period;
-                    this.channels[ch].targetPeriod = note.period;
-                    this.channels[ch].vibratoPos = 0;
-                    this.channels[ch].arpeggioCounter = 0;
-                    
-                    // If we have a period but NO new sample, retrigger current sample
-                    if (note.sample === 0 && this.channels[ch].active) {{
-                        const state = this.channels[ch];
+                    if (note.effect === 0x3) {{
+                        // Tone portamento: period = TARGET to slide toward, NOT immediate pitch change
+                        this.channels[ch].targetPeriod = note.period;
+                        // Don't touch state.period or basePeriod
+                    }} else {{
+                        this.channels[ch].period = note.period;
+                        this.channels[ch].basePeriod = note.period;
+                        this.channels[ch].targetPeriod = note.period;
+                        this.channels[ch].vibratoPos = 0;
+                        this.channels[ch].arpeggioCounter = 0;
                         
-                        // OPTIMIZATION 2: Copy to dying channel for smooth retrigger
-                        const dying = this.dyingChannels[ch];
-                        dying.sample = state.sample;
-                        dying.samplePos = state.samplePos;
-                        dying.period = state.period;
-                        // BUG FIX: Copy CURRENT playing volume!
-                        dying.volume = state.currentVolume;
-                        dying.active = true;
-                        dying.volumeFade = 1.0;
-                        dying.volumeFadeInc = -1.0 / this.crossfadeSamples;
-                        dying.samplesLeft = this.crossfadeSamples;
-                        
-                        // Reset position and fade in
-                        state.samplePos = 0.0;
-                        state.volumeFade = 0.0;
-                        state.volumeFadeInc = 1.0 / this.crossfadeSamples;
-                        state.targetVolume = 1.0;
-                        state.volumeRamping = false;  // Disable ramping during crossfade
+                        // Period-only (no new sample): retrigger sample from start
+                        if (note.sample === 0 && this.channels[ch].active) {{
+                            const state = this.channels[ch];
+                            state.samplePos = 0.0;
+                            state.mixVol = 0;
+                        }}
                     }}
                 }}
                 
@@ -1068,20 +1182,42 @@ class MODPlayer {{
             }}
         }}
         
-        // Advance tick
+        // Advance tick — honour Effect B (jump), D (pattern break), E6x (loop), EEx (delay)
         this.currentTick++;
-        if (this.currentTick >= this.speed) {{
+        if (this._patDelayActive && this._patDelayTicks > 0) {{
+            this._patDelayTicks--;
+            if (this._patDelayTicks <= 0) this._patDelayActive = false;
+        }} else if (this.currentTick >= this.speed) {{
             this.currentTick = 0;
-            this.currentRow++;
-            
-            if (this.currentRow >= 64) {{
-                this.currentRow = 0;
+            if (this._patLoopPending) {{
+                this._patLoopPending = false;
+                this.currentRow = this._patLoopRow;
+            }} else if (this._patBreakPending) {{
+                this._patBreakPending = false;
+                this.currentRow = this._patBreakRow || 0;
                 this.currentPattern++;
-                
-                if (this.currentPattern >= modData.songLength) {{
-                    this.stop();
+                if (this.currentPattern >= modData.songLength) {{ this.stop(); }}
+            }} else if (this._jumpPending) {{
+                this._jumpPending = false;
+                this.currentRow = 0;
+                this.currentPattern = this._jumpTarget;
+                if (this.currentPattern >= modData.songLength) {{ this.stop(); }}
+            }} else {{
+                this.currentRow++;
+                if (this.currentRow >= 64) {{
+                    this.currentRow = 0;
+                    this.currentPattern++;
+                    if (this.currentPattern >= modData.songLength) {{ this.stop(); }}
                 }}
             }}
+        }}
+        
+        // mikIT volinc: smooth volume transitions over ~64 samples to prevent clicks
+        // Ramp mixVol toward currentVolume once per tick (not once per note)
+        const FADE = (this.sampleRate / 689) | 0;  // ≈ 64 samples
+        for (let ch = 0; ch < this.numChannels; ch++) {{
+            const s = this.channels[ch];
+            s.volInc = (s.currentVolume - s.mixVol) / FADE;
         }}
     }}
     
@@ -1122,55 +1258,75 @@ class MODPlayer {{
                 break;
                 
             case 0x4: // Vibrato
-                if (!tick0) {{
-                    const speed = (param >> 4) & 0x0F;
-                    // Just update position - period modification happens during playback
-                    state.vibratoPos = (state.vibratoPos + speed) % 64;
+            case 0x6: // VolSlide + Vibrato
+                if (tick0) {{
+                    // Persist speed & depth — only overwrite when non-zero (param=0 = "continue")
+                    const vSpeedNew = (param >> 4) & 0x0F;
+                    const vDepthNew = param & 0x0F;
+                    if (vSpeedNew > 0) state.vibratoSpeed = vSpeedNew;
+                    if (vDepthNew > 0) state.vibratoDepth = vDepthNew;
+                }} else {{
+                    // Advance vibrato LFO on ticks 1+
+                    const vspeed = state.vibratoSpeed || 1;
+                    state.vibratoPos = (state.vibratoPos + vspeed) % 64;
+                    if (effect === 0x6) {{
+                        // Vol slide part — use current row's param directly
+                        const vup   = (param >> 4) & 0x0F;
+                        const vdown = param & 0x0F;
+                        if (vup > 0) {{
+                            state.volume = Math.min(64, state.volume + vup);
+                        }} else if (vdown > 0) {{
+                            state.volume = Math.max(0, state.volume - vdown);
+                        }}
+                        state.currentVolume = state.volume;
+                    }}
                 }}
                 break;
                 
-            case 0xA: // Volume slide
+            case 0xA: // Volume slide — instant update (no ramp)
                 if (!tick0) {{
                     const up = (param >> 4) & 0x0F;
                     const down = param & 0x0F;
                     if (up > 0) {{
                         const newVol = Math.min(64, state.volume + up);
-                        // ANTI-CLICK: Ramp volume changes
-                        state.currentVolume = state.volume;
+                        state.volume = newVol;
+                        state.currentVolume = newVol;
                         state.targetVolume2 = newVol;
-                        state.volumeRampInc = (newVol - state.volume) / this.volumeRampSamples;
-                        state.volumeRamping = true;
-                        state.volume = newVol;  // Update actual volume for next tick
+                        state.volumeRamping = false;
                     }} else if (down > 0) {{
                         const newVol = Math.max(0, state.volume - down);
-                        // ANTI-CLICK: Ramp volume changes
-                        state.currentVolume = state.volume;
-                        state.targetVolume2 = newVol;
-                        state.volumeRampInc = (newVol - state.volume) / this.volumeRampSamples;
-                        state.volumeRamping = true;
-                        state.volume = newVol;  // Update actual volume for next tick
-                    }}
-                }}
-                break;
-                
-            case 0xC: // Set volume
-                if (tick0) {{
-                    const newVol = Math.min(64, param);
-                    // ANTI-CLICK: Ramp volume changes instead of instant
-                    if (Math.abs(newVol - state.volume) > 2) {{  // Only ramp if change is significant
-                        state.currentVolume = state.volume;
-                        state.targetVolume2 = newVol;
-                        state.volumeRampInc = (newVol - state.volume) / this.volumeRampSamples;
-                        state.volumeRamping = true;
-                    }} else {{
+                        state.volume = newVol;
                         state.currentVolume = newVol;
                         state.targetVolume2 = newVol;
                         state.volumeRamping = false;
                     }}
-                    state.volume = newVol;  // Update volume for tracking
                 }}
                 break;
                 
+            case 0xC: // Set volume — instant update
+                if (tick0) {{
+                    const newVol = Math.min(64, param);
+                    state.volume = newVol;
+                    state.currentVolume = newVol;
+                    state.targetVolume2 = newVol;
+                    state.volumeRamping = false;
+                }}
+                break;
+                
+            case 0xB: // Position Jump
+                if (tick0) {{
+                    this._jumpPending = true;
+                    this._jumpTarget = Math.min(param, modData.songLength - 1);
+                }}
+                break;
+
+            case 0xD: // Pattern Break — jump to row xx of next pattern (param is BCD)
+                if (tick0) {{
+                    this._patBreakPending = true;
+                    this._patBreakRow = ((param >> 4) & 0xF) * 10 + (param & 0xF);
+                }}
+                break;
+
             case 0xF: // Set speed/tempo
                 if (tick0) {{
                     if (param < 0x20) {{
@@ -1182,18 +1338,86 @@ class MODPlayer {{
                     }}
                 }}
                 break;
+
+            case 0xE: // Extended effects (Exy — high nibble=sub-command, low nibble=value)
+                {{
+                    const sub = (param >> 4) & 0xF;
+                    const val = param & 0xF;
+                    switch (sub) {{
+                        case 0x6: // E6x — Pattern Loop
+                            if (tick0) {{
+                                if (val === 0) {{
+                                    // Set loop start
+                                    state.loopbackPoint = this.currentRow;
+                                }} else {{
+                                    // Loop val times
+                                    if (!state.loopCount) state.loopCount = val;
+                                    if (state.loopCount > 0) {{
+                                        state.loopCount--;
+                                        if (state.loopCount > 0) {{
+                                            this._patLoopRow = state.loopbackPoint || 0;
+                                            this._patLoopPending = true;
+                                        }} else {{
+                                            state.loopCount = 0;
+                                        }}
+                                    }}
+                                }}
+                            }}
+                            break;
+                        case 0x9: // E9x — Retrigger note every x ticks
+                            if (!tick0 && val > 0 && (this.currentTick % val) === 0) {{
+                                state.samplePos = 0.0;
+                                state.mixVol = 0;
+                            }}
+                            break;
+                        case 0xC: // ECx — Note cut after x ticks
+                            if (!tick0 && this.currentTick === val) {{
+                                state.currentVolume = 0;
+                                state.volume = 0;
+                            }}
+                            break;
+                        case 0xD: // EDx — Note delay: trigger note x ticks late
+                            if (!tick0 && this.currentTick === val && state._delayedNote) {{
+                                const dn = state._delayedNote;
+                                state._delayedNote = null;
+                                const info = modData.sampleMap[dn.sample - 1];
+                                state.sample = dn.sample - 1;
+                                state.volume = info.volume;
+                                state.currentVolume = info.volume;
+                                state.active = true;
+                                state.samplePos = 0.0;
+                                state.mixVol = 0;
+                                if (dn.period > 0) {{
+                                    state.period = dn.period;
+                                    state.basePeriod = dn.period;
+                                }}
+                            }}
+                            break;
+                        case 0xE: // EEx — Pattern delay: extra ticks per row
+                            if (tick0 && !this._patDelayActive) {{
+                                this._patDelayTicks = val * this.speed;
+                                this._patDelayActive = true;
+                            }}
+                            break;
+                        default:
+                            break;
+                    }}
+                }}
+                break;
         }}
     }}
     
     getArpeggioPeriod(basePeriod, semitones) {{
-        // Approximate semitone calculation
-        const freq = this.periodToFreq(basePeriod);
-        const newFreq = freq * Math.pow(2, semitones / 12);
-        return Math.floor(7093789.2 / (newFreq * 2));
+        // Arpeggio shifts pitch up by N semitones → period = basePeriod / 2^(N/12)
+        // Finetune cancels in the ratio, so it's not needed here
+        return Math.round(basePeriod / Math.pow(2, semitones / 12));
     }}
     
     getEffectivePeriod(ch) {{
-        // Calculate the actual period to use for playback, with effects applied
+        // ProTracker-authentic 32-entry sine table for vibrato
+        // amplitude = (VibratoTable[pos & 31] * depth) >> 7  (mikIT formula)
+        const VibTab = [0,24,49,74,97,120,141,161,180,197,212,224,235,244,250,253,
+                        255,253,250,244,235,224,212,197,180,161,141,120,97,74,49,24];
         const state = this.channels[ch];
         let effectivePeriod = state.period;
         
@@ -1212,11 +1436,17 @@ class MODPlayer {{
             }}
         }}
         
-        // Apply vibrato effect (4xy)
-        if (state.effect === 0x4) {{
-            const depth = state.effectParam & 0x0F;
-            const vibratoValue = Math.sin(state.vibratoPos * Math.PI / 32) * depth;
-            effectivePeriod += Math.floor(vibratoValue);
+        // Apply vibrato effect (4xy or 6xy — VolSlide+Vibrato)
+        if (state.effect === 0x4 || state.effect === 0x6) {{
+            const depth = state.vibratoDepth || 0;
+            if (depth > 0) {{
+                // ProTracker formula: (VibTab[pos & 31] * depth) >> 7
+                // Sign: pos 0-31 = positive, 32-63 = negative  (like a full sine cycle)
+                const pos = state.vibratoPos & 63;
+                const tabVal = VibTab[pos & 31];
+                const vibDelta = (tabVal * depth) >> 7;
+                effectivePeriod += (pos < 32) ? vibDelta : -vibDelta;
+            }}
         }}
         
         return Math.max(113, Math.min(856, effectivePeriod));
@@ -1233,104 +1463,81 @@ class MODPlayer {{
                 this.updateUI();
             }}
             
-            // Mix channels
-            let mixL = 0, mixR = 0;
+            // Mix channels — split into surround bus (ch0,ch3 = outer L pair)
+            // and center bus (ch1,ch2 = inner R pair).
+            // Only3D is applied to surround bus only → ch1&4 get 3D, ch2&3 stay dry center.
+            let mixL = 0, mixR = 0;     // center bus  (ch1, ch2)
+            let surrL = 0, surrR = 0;  // surround bus (ch0, ch3)
             
-            // Simple panning pattern (can be made more sophisticated)
-            const getPan = (ch) => {{
-                // Amiga/ProTracker hard panning: L, R, R, L (repeating)
-                // Ch 0,3 → hard LEFT (0.0), Ch 1,2 → hard RIGHT (1.0)
-                const pattern = [0.0, 1.0, 1.0, 0.0];
-                return pattern[ch % 4];
-            }};
+            // Amiga stereo: 75% separation — L channels 87.5%L/12.5%R, R channels inverse
+            const SEP = 0.75;
+            const panL_left  = 0.5 + SEP * 0.5;   // 0.875
+            const panL_right = 0.5 - SEP * 0.5;   // 0.125
+            const chPanLeft  = [panL_left, panL_right, panL_right, panL_left];
+            const chPanRight = [panL_right, panL_left, panL_left, panL_right];
             
             for (let ch = 0; ch < this.numChannels; ch++) {{
-                const pan = getPan(ch);
-                
-                // OPTIMIZATION 2: Mix dying channel first (fading out)
-                const dying = this.dyingChannels[ch];
-                if (dying.active && dying.samplesLeft > 0) {{
-                    const dyingSample = this.getSampleData(dying.sample, dying.samplePos);
-                    const dyingVol = (dying.volume / 64.0) * dying.volumeFade;
-                    const fadedSample = dyingSample * dyingVol;
-                    
-                    mixL += fadedSample * (1.0 - pan);
-                    mixR += fadedSample * pan;
-                    
-                    // Advance dying channel
-                    const freq = this.periodToFreq(dying.period) / modData.downsample;
-                    dying.samplePos += freq / this.sampleRate;
-                    
-                    // Update fade
-                    dying.volumeFade += dying.volumeFadeInc;
-                    dying.samplesLeft--;
-                    
-                    if (dying.samplesLeft <= 0 || dying.volumeFade <= 0) {{
-                        dying.active = false;
-                    }}
-                }}
-                
-                // Mix active channel (may be fading in)
                 const state = this.channels[ch];
+            // Surround channel pair (1-indexed, matches GLSL surr_channels).
+            // [1,4] = outer LEFT pair (ch0,ch3); [2,3] = inner RIGHT pair (ch1,ch2)
+            const surroundPair = [1, 4];
+            const isSurrCh = (surroundPair.includes((ch % 4) + 1));
+                
                 if (state.active && state.period > 0) {{
                     const sample = this.getSampleData(state.sample, state.samplePos);
+                    state.mixVol += state.volInc;
+                    if (state.volInc > 0 && state.mixVol > state.currentVolume) {{
+                        state.mixVol = state.currentVolume; state.volInc = 0;
+                    }} else if (state.volInc < 0 && state.mixVol < state.currentVolume) {{
+                        state.mixVol = state.currentVolume; state.volInc = 0;
+                    }}
+                    const cv = state.mixVol / 64.0;
+                    const s  = sample * cv;
                     
-                    // Determine effective volume
-                    let effectiveVolume = state.currentVolume;
-                    
-                    // ANTI-CLICK: Apply volume ramping (but NOT during sample crossfade)
-                    if (state.volumeRamping && state.volumeFadeInc === 0) {{
-                        // Only ramp when NOT crossfading
-                        state.currentVolume += state.volumeRampInc;
-                        
-                        const rampDone = (state.volumeRampInc > 0 && state.currentVolume >= state.targetVolume2) ||
-                                        (state.volumeRampInc < 0 && state.currentVolume <= state.targetVolume2);
-                        
-                        if (rampDone) {{
-                            state.currentVolume = state.targetVolume2;
-                            state.volumeRamping = false;
-                        }}
-                        effectiveVolume = state.currentVolume;
+                    if (isSurrCh) {{
+                        surrL += s * chPanLeft[ch % 4];
+                        surrR += s * chPanRight[ch % 4];
+                    }} else {{
+                        mixL += s * chPanLeft[ch % 4];
+                        mixR += s * chPanRight[ch % 4];
                     }}
                     
-                    // Apply volume (0-64 range)
-                    let channelVolume = effectiveVolume / 64.0;
-                    
-                    // OPTIMIZATION 2: Apply sample crossfade (multiplies with volume)
-                    if (state.volumeFadeInc !== 0) {{
-                        channelVolume *= state.volumeFade;
-                        
-                        state.volumeFade += state.volumeFadeInc;
-                        
-                        // Lock when done
-                        if (state.volumeFadeInc > 0 && state.volumeFade >= state.targetVolume) {{
-                            state.volumeFade = state.targetVolume;
-                            state.volumeFadeInc = 0;
-                        }} else if (state.volumeFadeInc < 0 && state.volumeFade <= 0) {{
-                            state.volumeFade = 0;
-                            state.volumeFadeInc = 0;
-                        }}
+                    // PhatBass: bass-named instruments get Hilbert allpass enhancement
+                    const isBass = modData.bassSamples.length > 0
+                        ? modData.bassSamples.includes(state.sample + 1)
+                        : state.period >= 300;
+                    if (this._phatBass && this._phatBassDepth > 0 && isBass) {{
+                        // Add to whichever bus this channel feeds
+                        if (isSurrCh) [surrL, surrR] = this._phatBass.process(s, surrL, surrR);
+                        else          [mixL, mixR]   = this._phatBass.process(s, mixL, mixR);
                     }}
                     
-                    const fadedSample = sample * channelVolume;
-                    
-                    mixL += fadedSample * (1.0 - pan);
-                    mixR += fadedSample * pan;
-                    
-                    // Advance sample position
                     const effectivePeriod = this.getEffectivePeriod(ch);
-                    const freq = this.periodToFreq(effectivePeriod) / modData.downsample;
+                    const smpFt = (modData.sampleMap[state.sample] || {{}}).finetune || 0;
+                    const freq = this.periodToFreq(effectivePeriod, smpFt) / modData.downsample;
                     state.samplePos += freq / this.sampleRate;
                 }}
             }}
             
-            // Normalize based on channel count
-            // Hard panning: each side only gets numChannels/2 channels, so
-            // normFactor = 0.5 / (numChannels/2) = 1.0 / numChannels
-            const normFactor = 1.0 / this.numChannels;
+            const normFactor = 2.0 / this.numChannels;
             const vol = this._volume !== undefined ? this._volume : 0.8;
-            leftChannel[offset + i] = mixL * normFactor * vol;
-            rightChannel[offset + i] = mixR * normFactor * vol;
+            
+            // Apply Only3D to surround bus (ch0 + ch3 = outer LEFT pair = "Surround L/R")
+            let sL = surrL * normFactor * vol;
+            let sR = surrR * normFactor * vol;
+            if (this._only3d && this._only3dDepth > 0) {{
+                [sL, sR] = this._only3d.process(sL, sR);
+            }}
+            
+            // Center bus (ch1 + ch2 = inner RIGHT pair) passes through dry
+            const cL = mixL * normFactor * vol;
+            const cR = mixR * normFactor * vol;
+            
+            let outL = sL + cL;
+            let outR = sR + cR;
+            
+            leftChannel[offset + i]  = outL;
+            rightChannel[offset + i] = outR;
             
             // Advance sample counter
             this.sampleCounter++;
@@ -1502,6 +1709,22 @@ player.stop=function(){{
 document.getElementById('volSlider').addEventListener('input',function(){{
   player._volume = parseFloat(this.value);
 }});
+document.getElementById('surroundSlider').addEventListener('input',function(){{
+  const d = parseFloat(this.value);
+  player._only3dDepth = d;
+  if (player._only3d) player._only3d.depth = d;
+}});
+document.getElementById('surroundModeBtn').addEventListener('click',function(){{
+  player._only3dMode = player._only3dMode === 0 ? 1 : 0;
+  this.textContent = player._only3dMode === 0 ? '3D:MIX' : '3D:CH';
+  this.title = player._only3dMode === 0
+    ? 'Total mix mode — Only3D applied to full stereo output'
+    : 'Channel mode — Only3D applied to outer channels (ch0+ch3) only';
+}});
+document.getElementById('phatSlider').addEventListener('input',function(){{
+  player._phatBassDepth = parseFloat(this.value);
+  if (player._phatBass) player._phatBass.depth = parseFloat(this.value);
+}});
 
 
 // ── tracker pattern display ─────────────────────────────────────
@@ -1627,7 +1850,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
     """Generate ShaderToy GLSL code with texture-based OR embedded data"""
     
     # Configuration
-    MAX_TOTAL_SIZE = 120000  # 60KB max for embedded data (GLSL source limit)
+    MAX_TOTAL_SIZE = 160000  # 60KB max for embedded data (GLSL source limit)
     MAX_CHUNK_SIZE = 8192   # 4KB per chunk = 1024 int32s — fast GLSL compile
     
     # Derive PNG filename
@@ -1650,17 +1873,20 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
         else:
             print(f"   🖼️  Using PNG texture ({total_size} bytes > {MAX_TOTAL_SIZE} limit)")
     
-    # Prepare sample map
+    # Prepare sample map — each sample gets 32-byte zero-padding for cubic interpolation
     all_samples = []
     sample_map = []
     
     for sample in mod.samples:
         start_idx = len(all_samples)
+        raw_len = 0
         if sample['data'] is not None and len(sample['data']) > 0:
             all_samples.extend(sample['data'] / 128.0)
+            raw_len = len(sample['data'])
+            all_samples.extend([0.0] * 32)  # zero-padding: pos+1 and pos+2 always safe
         sample_map.append({
             'start': start_idx,
-            'length': len(sample['data']) if sample['data'] is not None else 0,
+            'length': raw_len,  # audio length only (not including padding)
             'repeat_point': sample['repeat_point'],
             'repeat_length': sample['repeat_length']
         })
@@ -1724,14 +1950,51 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
     if loop_target_songpos > 0:
         print(f"   🔁  Effect B: song loops back to position {loop_target_songpos}")
 
+    # ========== PRE-COMPUTE ROW OFFSETS (Effect D/B timeline) ==========
+    _num_ch = mod.num_channels if hasattr(mod, 'num_channels') else 4
+    _pat_row_offsets = []   # cumulative rows BEFORE each song position
+    _pat_start_rows  = []   # which pattern row each song position starts at
+    _cumul = 0
+    _next_start = 0
+    for _si, _pi in enumerate(mod.song_positions):
+        _pat_row_offsets.append(_cumul)
+        _pat_start_rows.append(_next_start)
+        _d_row = None; _d_param = 0
+        for _ri in range(_next_start, 64):
+            for _ch in range(_num_ch):
+                try:
+                    _n = mod.patterns[_pi][_ri][_ch]
+                    if _n.get('effect',0) == 0xD and _d_row is None:
+                        _d_row = _ri
+                        _d_param = ((_n['param']>>4)&0xF)*10 + (_n['param']&0xF)
+                except: pass
+        if _d_row is not None:
+            _cumul += _d_row - _next_start + 1
+            _next_start = _d_param
+            if _si == 0:
+                print(f"   ⏩  Effect D: pattern {_pi} breaks at row {_d_row} → songPos 1 starts at row {_d_param}")
+        else:
+            _cumul += 64 - _next_start
+            _next_start = 0
+    _pat_row_offsets.append(_cumul)   # sentinel (total rows)
+    _total_song_rows = _cumul
+    _has_d_effects = any(_pat_start_rows[i]!=0 or _pat_row_offsets[i+1]-_pat_row_offsets[i]!=64
+                         for i in range(len(mod.song_positions)))
+    # ---- build GLSL arrays ----
+    _row_off_str  = ', '.join(map(str, _pat_row_offsets))
+    _start_row_str = ', '.join(map(str, _pat_start_rows))
+    _intro_rows = _pat_row_offsets[loop_target_songpos] if loop_target_songpos else 0
+    _loop_rows  = _total_song_rows - _intro_rows
+
     # ========== COMMON TAB ==========
     data_source_comment = "Embedded data (no PNG required)" if use_embedded else f"All data in 1024×1024 RGBA PNG: {png_file}"
     common_glsl = f"""/* ============================================================================
-   COMMON - Stateless ProTracker MOD Player (c) 2026 Orblivius
+   COMMON - Stateless ProTracker MOD Player v1.1 (c) 2026 Orblivius
+            NEW: Real-time Surround Sound + FAT DSP processing
    iChannel0: alphabet texture
    Contact: subband@gmail.com or
             subband@protonmail.com
-   GIT:     https://github.com/mewza
+   GIT:     https://github.com/mewza/mod2glsl
   ============================================================================ */
 // Generated from: {mod.title}
 // {data_source_comment}
@@ -1749,6 +2012,16 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
 #define BPM {float(mod.initial_tempo)}
 #define SPEED {float(mod.initial_speed)}
 
+// ── Audio effects — toggle here in Common tab ─────────────────────────────────
+// enable3D : Only3D surround widening on the surr_channels pair
+// enableFAT: PhatBass Hilbert allpass enhancement on bass instruments
+// surr_channels: 1-indexed channel pair that gets Only3D (the other two = dry center)
+//   ivec2(1,4) = outer LEFT pair (ch0,ch3) — default Amiga layout
+//   ivec2(2,3) = inner RIGHT pair (ch1,ch2) — swap surround and center
+const bool  enable3D     = true;
+const bool  enableFAT    = true;
+const ivec2 surr_channels = ivec2(1, 4);  // 1-indexed; change to ivec2(2,3) to flip
+
 // Channel panning (0=left, 0.5=center, 1.0=right)
 const float channelPan[32] = float[]({', '.join([
     f'{[0.0,1.0,1.0,0.0][i%4]:.1f}' if i < mod.num_channels else '0.5'
@@ -1757,6 +2030,13 @@ const float channelPan[32] = float[]({', '.join([
 
 // Song positions
 const int songPositions[{len(mod.song_positions)}] = int[]({', '.join(map(str, mod.song_positions))});
+
+// Row offsets — accounts for Effect D (pattern break) early exits
+// patRowOffset[i] = cumulative rows before song position i starts
+// patStartRow[i]  = which pattern row song position i begins at (non-zero after D with row > 0)
+const int patRowOffset[{len(mod.song_positions)+1}] = int[]({_row_off_str});
+const int patStartRow[{len(mod.song_positions)}]    = int[]({_start_row_str});
+#define TOTAL_SONG_ROWS {_total_song_rows}
 
 // RLE seek table — one entry per row, value = compressed stream offset at row start.
 // Rows never straddle RLE run boundaries, so this is an exact O(1) jump.
@@ -1894,33 +2174,39 @@ struct Position {{
 
 Position getPosition(float time) {{
     Position pos;
-    // ProTracker CIA timer: ticksPerSec = BPM * 2 / 5
     float ticksPerSec = BPM * 2.0 / 5.0;
     float rowTime = SPEED / ticksPerSec;
-    
-    // Calculate song duration and loop playback
-    float songDuration = float(SONG_LENGTH) * 64.0 * rowTime;
-    // Mid-song loop: first pass plays full song, then loops from SONG_LOOP_POS
+
+    // Song duration using pre-computed row offsets (accounts for Effect D breaks)
+    float songDuration = float(TOTAL_SONG_ROWS) * rowTime;
     float loopedTime;
     if (SONG_LOOP_POS == 0) {{
         loopedTime = mod(time, songDuration);
     }} else {{
-        float introDur = float(SONG_LOOP_POS) * 64.0 * rowTime;
-        float loopDur  = float(SONG_LENGTH - SONG_LOOP_POS) * 64.0 * rowTime;
+        float introDur = float({_intro_rows}) * rowTime;
+        float loopDur  = float({_loop_rows})  * rowTime;
         if (time < songDuration) {{
-            loopedTime = time;                                    // first pass
+            loopedTime = time;
         }} else {{
-            loopedTime = introDur + mod(time - songDuration, loopDur); // loop section
+            loopedTime = introDur + mod(time - songDuration, loopDur);
         }}
     }}
-    
+
     float totalRows = loopedTime / rowTime;
-    pos.row = int(mod(totalRows, 64.0));
-    pos.pattern = int(totalRows / 64.0);
-    pos.songPos = min(pos.pattern, SONG_LENGTH - 1);
-    pos.tick = fract(totalRows) * SPEED;  // ticksPerRow = SPEED
+
+    // Binary search through patRowOffset to find song position
+    int sp = SONG_LENGTH - 1;
+    for (int i = 0; i < SONG_LENGTH; i++) {{
+        if (float(patRowOffset[i + 1]) > totalRows) {{ sp = i; break; }}
+    }}
+    pos.songPos = sp;
+    pos.pattern = songPositions[sp];
+    float rowsIntoPos = totalRows - float(patRowOffset[sp]);
+    pos.row     = patStartRow[sp] + int(rowsIntoPos);
+    pos.row     = min(pos.row, 63);
+    pos.tick    = fract(rowsIntoPos) * float(SPEED);
     pos.rowTime = rowTime;
-    
+
     return pos;
 }}
 
@@ -1985,6 +2271,22 @@ float getSample(int index) {{
 #endif
 }}
 
+// 4-point cubic Hermite (Catmull-Rom) interpolation.
+// getSample() reads one integer-indexed byte; getSampleF() interpolates between 4.
+float getSampleF(int base, float fpos, int smpLen) {{
+    int i  = int(fpos);
+    float t = fpos - float(i);
+    // p0 = i-1 clamped to sample start; p1,p2,p3 safe via 32-byte zero-padding
+    float p0 = getSample(base + max(0, i - 1));
+    float p1 = getSample(base + i);
+    float p2 = getSample(base + min(i + 1, smpLen + 31));
+    float p3 = getSample(base + min(i + 2, smpLen + 31));
+    float a = -0.5*p0 + 1.5*p1 - 1.5*p2 + 0.5*p3;
+    float b =      p0 - 2.5*p1 + 2.0*p2 - 0.5*p3;
+    float c = -0.5*p0           + 0.5*p2;
+    return ((a * t + b) * t + c) * t + p1;
+}}
+
 Note getNote(int songPos, int row, int channel) {{
     int pattern = songPositions[songPos];
     int baseIdx = ((pattern * 64) + row) * NUM_CHANNELS * 5 + channel * 5;
@@ -2013,8 +2315,12 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
         for (int lb = 1; lb < 64; lb++) {{
             scanRow--;
             if (scanRow < 0) {{
-                if (scanPat > 0) {{ scanPat--; scanRow = 63; }}
-                else             {{ break; }}
+                if (scanPat > 0) {{
+                    scanPat--;
+                    // last row played in previous song position = startRow + rowCount - 1
+                    int _rowCount = patRowOffset[scanPat+1] - patRowOffset[scanPat];
+                    scanRow = patStartRow[scanPat] + _rowCount - 1;
+                }} else {{ break; }}
             }}
             Note prev = getNote(scanPat, scanRow, ch);
             if (prev.instrument > 0 || prev.period > 0) {{
@@ -2030,60 +2336,115 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     SampleInfo smp = samples[trigNote.instrument - 1];
     if (smp.length == 0) return 0.0;
 
-    float triggerTime = float(trigPat * 64 + trigRow) * rowTime;
-    float currentTime = float(pos.songPos * 64 + pos.row) * rowTime + mod(time, rowTime);
+    // Use patRowOffset so timing is correct even when patterns end early (Effect D)
+    float triggerTime = (float(patRowOffset[trigPat]) + float(trigRow - patStartRow[trigPat])) * rowTime;
+    float currentTime = (float(patRowOffset[pos.songPos]) + float(pos.row - patStartRow[pos.songPos])) * rowTime + mod(time, rowTime);
     float elapsed = currentTime - triggerTime;
     if (elapsed < 0.0) return 0.0;
 
-    float freq       = periodToFreq(trigNote.period);
-    int   iSamplePos = int(elapsed * freq);
+    // ── Vibrato period modulation (Effect 4 or 6) ────────────────────────────
+    // Phase is derived from elapsed ticks since trigger — stateless approximation.
+    // For bare vibrato rows after the trigger, we use the trigger note's speed/depth.
+    float effectivePeriod = float(trigNote.period);
+    {{
+        int _vibSpeed = 0, _vibDepth = 0;
+        if (trigNote.effect == 0x4 || trigNote.effect == 0x6) {{
+            _vibSpeed = (trigNote.param >> 4) & 0xF;
+            _vibDepth = trigNote.param & 0xF;
+        }}
+        // Also check for bare vibrato rows between trigger and current
+        if (trigPat == pos.songPos || _vibDepth == 0) {{
+            // Quick scan for any bare 4xx between trigRow+1 and pos.row
+            for (int _vi=1; _vi<=16; _vi++) {{
+                int _vr = trigRow + _vi;
+                if (_vr >= 64 || _vr >= pos.row) break;
+                Note _vn = getNote(trigPat, _vr, ch);
+                if (_vn.instrument>0 || _vn.period>0) break;  // new note
+                if ((_vn.effect==0x4 || _vn.effect==0x6) && _vn.param!=0) {{
+                    _vibSpeed = (_vn.param >> 4) & 0xF;
+                    _vibDepth = _vn.param & 0xF;
+                }}
+            }}
+        }}
+        if (_vibDepth > 0) {{
+            // Total ticks elapsed since trigger (vibrato resets on note trigger)
+            float _vibTicks = elapsed * float(SPEED) / rowTime;
+            int   _vibPos   = int(_vibTicks) * _vibSpeed & 63;
+            // ProTracker VibratoTable: 32-entry sine, amplitude=(tab[pos&31]*depth)>>7
+            float _vibTab[32]; 
+            _vibTab[ 0]=  0.0; _vibTab[ 1]= 24.0; _vibTab[ 2]= 49.0; _vibTab[ 3]= 74.0;
+            _vibTab[ 4]= 97.0; _vibTab[ 5]=120.0; _vibTab[ 6]=141.0; _vibTab[ 7]=161.0;
+            _vibTab[ 8]=180.0; _vibTab[ 9]=197.0; _vibTab[10]=212.0; _vibTab[11]=224.0;
+            _vibTab[12]=235.0; _vibTab[13]=244.0; _vibTab[14]=250.0; _vibTab[15]=253.0;
+            _vibTab[16]=255.0; _vibTab[17]=253.0; _vibTab[18]=250.0; _vibTab[19]=244.0;
+            _vibTab[20]=235.0; _vibTab[21]=224.0; _vibTab[22]=212.0; _vibTab[23]=197.0;
+            _vibTab[24]=180.0; _vibTab[25]=161.0; _vibTab[26]=141.0; _vibTab[27]=120.0;
+            _vibTab[28]= 97.0; _vibTab[29]= 74.0; _vibTab[30]= 49.0; _vibTab[31]= 24.0;
+            float _vibDelta = (_vibTab[_vibPos & 31] * float(_vibDepth)) / 128.0;
+            effectivePeriod += (_vibPos < 32) ? _vibDelta : -_vibDelta;
+        }}
+    }}
+
+    float freq       = periodToFreq(max(1, int(effectivePeriod)));
+    float fSamplePos = elapsed * freq;
 
     if (smp.loopLen > 2) {{
-        if (iSamplePos >= smp.loopStart + smp.loopLen)
-            iSamplePos = smp.loopStart + ((iSamplePos - smp.loopStart) % smp.loopLen);
-    }} else if (iSamplePos >= smp.length) {{
+        if (fSamplePos >= float(smp.loopStart + smp.loopLen))
+            fSamplePos = float(smp.loopStart) + mod(fSamplePos - float(smp.loopStart), float(smp.loopLen));
+    }} else if (fSamplePos >= float(smp.length)) {{
         return 0.0;
     }}
-    if (iSamplePos < 0 || iSamplePos >= smp.length) return 0.0;
+    if (fSamplePos < 0.0) return 0.0;
 
-    float s = getSample(smp.start + iSamplePos);
+    float s = getSampleF(smp.start, fSamplePos, smp.length);
 
     // ── Volume: forward scan trigger→current to honour Cxx cuts & Axx slides ─
-    // Without this, bare C00 (note cut) rows are ignored and notes blare on;
-    // Effect A (volume slide) is also applied here row-by-row.
+    // ProTracker volume slide (Effect A/6) SKIPS tick 0 → applies (SPEED-1) ticks per row.
     int volume = smp.volume;
     // Trigger-row effect
     if (trigNote.effect == 0xC) {{
         volume = min(trigNote.param, 64);
     }} else if (trigNote.effect == 0xA || trigNote.effect == 0x6) {{
         int _su=(trigNote.param>>4)&0xF, _sd=trigNote.param&0xF;
-        volume = clamp(volume + (_su>0?_su:-_sd)*int(SPEED), 0, 64);
+        volume = clamp(volume + (_su>0?_su:-_sd)*(int(SPEED)-1), 0, 64);
     }}
     // Forward scan through non-note rows from trigRow+1 to pos.row-1
+    // Effect D can shorten patterns — skip phantom rows by using patRowOffset boundaries
     if (trigPat != pos.songPos || trigRow != pos.row) {{
         int _fp=trigPat, _fr=trigRow+1;
-        if (_fr >= 64) {{ _fr=0; _fp++; }}
+        // If _fr is past the actual end of this song position (Effect D), jump to next
+        if (_fr >= patRowOffset[_fp+1] - patRowOffset[_fp] + patStartRow[_fp])
+            {{ _fr=patStartRow[_fp+1]; _fp++; }}
+        else if (_fr >= 64) {{ _fr=0; _fp++; }}
         for (int _fi=0; _fi<64; _fi++) {{
             if (_fp > pos.songPos || (_fp==pos.songPos && _fr>=pos.row)) break;
             if (_fp >= SONG_LENGTH) break;
+            // Skip phantom rows: rows >= patStartRow + rowCount for this position
+            int _posRows = patRowOffset[_fp+1] - patRowOffset[_fp];
+            if (_fr >= patStartRow[_fp] + _posRows) {{
+                _fp++; _fr = (_fp < SONG_LENGTH) ? patStartRow[_fp] : 0;
+                continue;
+            }}
             Note _fn = getNote(_fp, _fr, ch);
             if (_fn.instrument>0 || _fn.period>0) break; // new note = different trigger
             if (_fn.effect==0xC)
                 volume = min(_fn.param, 64);
             else if (_fn.effect==0xA || _fn.effect==0x6) {{
                 int _su=(_fn.param>>4)&0xF, _sd=_fn.param&0xF;
-                volume = clamp(volume+(_su>0?_su:-_sd)*int(SPEED), 0, 64);
+                volume = clamp(volume+(_su>0?_su:-_sd)*(int(SPEED)-1), 0, 64);
             }}
-            _fr++; if (_fr>=64){{ _fr=0; _fp++; }}
+            _fr++;
+            if (_fr >= 64) {{ _fr=0; _fp++; }}
         }}
-        // Current row: apply Cxx fully, Axx for elapsed ticks
+        // Current row: Cxx fully, Axx for elapsed ticks (tick 0 skipped)
         Note _cr = getNote(pos.songPos, pos.row, ch);
         if (_cr.instrument<=0 && _cr.period<=0) {{
             if (_cr.effect==0xC)
                 volume = min(_cr.param, 64);
             else if (_cr.effect==0xA || _cr.effect==0x6) {{
                 int _su=(_cr.param>>4)&0xF, _sd=_cr.param&0xF;
-                volume = clamp(volume+(_su>0?_su:-_sd)*int(pos.tick), 0, 64);
+                int _ticks = max(0, int(pos.tick) - 1);  // tick 0 skipped
+                volume = clamp(volume+(_su>0?_su:-_sd)*_ticks, 0, 64);
             }}
         }}
     }}
@@ -2093,13 +2454,25 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     
     # ========== SOUND TAB ==========
     # ========== SOUND TAB ==========
+    # Build bass sample boolean array for GLSL (1-indexed samples named "bass")
+    bass_sample_flags = [
+        'true' if (i < len(mod.samples) and mod.samples[i]['length'] > 0 and 
+                   'bass' in mod.samples[i]['name'].lower()) else 'false'
+        for i in range(31)
+    ]
+    bass_flags_str = ', '.join(bass_sample_flags)
+    
     sound_glsl = f"""/* ============================================================================
-   SOUND - Stateless ProTracker MOD Player (c) 2026 Orblivius
+   SOUND - Stateless ProTracker MOD Player v1.1 (c) 2026 Orblivius
+            NEW: Real-time Surround Sound + FAT DSP processing
    Contact: subband@gmail.com or
             subband@protonmail.com
-   GIT:     https://github.com/mewza
+   GIT:     https://github.com/mewza/mod2glsl
   ============================================================================ */
 // getByte / getPatternByte / getSample / getNote / getChannelOutput are in Common.
+
+// Bass sample flags (true = instrument name contains "bass") — for PhatBass
+const bool isBass[31] = bool[]({bass_flags_str});
 
 vec2 mainSound(int samp, float time) {{
 #if !USE_EMBEDDED_DATA
@@ -2113,55 +2486,98 @@ vec2 mainSound(int samp, float time) {{
     bool hasSignature = (magicR == 77 && magicG == 79 && magicB == 68);
     
     if (!hasSignature) {{
-        // Waiting mode - diagnostic tones
         float t = mod(time, 3.0);
         float debugFreq = (t < 1.0) ? 300.0 + float(magicR) :
                           (t < 2.0) ? 300.0 + float(magicG) :
                                       300.0 + float(magicB);
-        
         float localT = mod(time, 1.0);
         float ping = sin(6.2831 * debugFreq * localT) * exp(-3.0 * localT) * 0.5;
         return vec2(ping);
     }}
     
-    // Valid PNG - apply loop mode
     float playbackTime = time;
     if (loopMode == 255) {{
-        float songDuration = float(SONG_LENGTH) * 64.0 * SPEED / (BPM * 2.0 / 5.0);
+        float songDuration = float(TOTAL_SONG_ROWS) * SPEED / (BPM * 2.0 / 5.0);
         playbackTime = mod(time, min(10.0, songDuration));
     }}
 #else
-    // Embedded mode - no signature check needed
     float playbackTime = time;
 #endif
     
     Position pos = getPosition(playbackTime);
-    
-    // Calculate row timing
-    // ProTracker CIA timer: ticksPerSec = BPM * 2 / 5
     float ticksPerSec = BPM * 2.0 / 5.0;
     float rowTime = SPEED / ticksPerSec;
     
-    // Mix channels with panning
-    float mixL = 0.0;
-    float mixR = 0.0;
+    // 75% Amiga stereo separation
+    const float SEP = 0.75;
+    float chL[4], chR[4];
+    chL[0]=0.5+SEP*0.5; chL[1]=0.5-SEP*0.5; chL[2]=0.5-SEP*0.5; chL[3]=0.5+SEP*0.5;
+    chR[0]=0.5-SEP*0.5; chR[1]=0.5+SEP*0.5; chR[2]=0.5+SEP*0.5; chR[3]=0.5-SEP*0.5;
+    
+    // Split into surround bus (ch0,ch3 = outer LEFT pair → Surround L/R)
+    // and center bus (ch1,ch2 = inner RIGHT pair → dry center)
+    float surrL = 0.0, surrR = 0.0;
+    float centL = 0.0, centR = 0.0;
     
     for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
         float s = getChannelOutput(ch, playbackTime, pos, rowTime);
-        
-        // Apply panning
-        float pan = channelPan[ch];
-        mixL += s * (1.0 - pan);
-        mixR += s * pan;
+        int cm = ch % 4;
+        int ch1 = cm + 1;  // 1-indexed
+        bool isSurr = (ch1 == surr_channels.x || ch1 == surr_channels.y);
+        if (isSurr) {{ surrL += s * chL[cm]; surrR += s * chR[cm]; }}
+        else        {{ centL += s * chL[cm]; centR += s * chR[cm]; }}
     }}
     
-    // Normalize: hard panning puts numChannels/2 channels per side
-    // so use 1.0/numChannels (not 0.5) to get proper level
-    float normFactor = 1.0 / float(NUM_CHANNELS);
-    mixL = clamp(mixL * normFactor, -1.0, 1.0);
-    mixR = clamp(mixR * normFactor, -1.0, 1.0);
+    float normFactor = 2.0 / float(NUM_CHANNELS);
+    surrL *= normFactor; surrR *= normFactor;
+    centL *= normFactor; centR *= normFactor;
     
-    return vec2(mixL, mixR);
+    // ── Only3D — surround bus only (ch0+ch3 = outer LEFT pair, ch1+ch2 = dry center) ─
+    const float ONLY3D_DELAY = 0.000431;  // 19 samples @ 44100Hz
+    const float ONLY3D_DEPTH = 0.5;
+    if (enable3D) {{
+        float tW = playbackTime - ONLY3D_DELAY;
+        Position posW = getPosition(tW);
+        float wL = 0.0, wR = 0.0;
+        for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
+            int cm = ch % 4;
+            int ch1 = cm + 1;
+            if (ch1 == surr_channels.x || ch1 == surr_channels.y) {{
+                float sw = getChannelOutput(ch, tW, posW, rowTime);
+                wL += sw * chL[cm]; wR += sw * chR[cm];
+            }}
+        }}
+        wL *= normFactor; wR *= normFactor;
+        float diff = (wL - wR) * ONLY3D_DEPTH;
+        surrL += diff;
+        surrR -= diff;
+    }}
+    
+    // ── PhatBass — bass-named instruments on center bus ────────────────────────
+    const float PHAT_DELAY = 0.001814;  // 80 samples @ 44100Hz
+    const float PHAT_DEPTH = 0.5;
+    if (enableFAT) {{
+        float tP = playbackTime - PHAT_DELAY;
+        Position posP = getPosition(tP);
+        float pbL = 0.0, pbR = 0.0;
+        for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
+            Note n = getNote(pos.songPos, pos.row, ch);
+            int inst = n.instrument;
+            bool bass = (inst >= 1 && inst <= 31) ? isBass[inst - 1] : false;
+            if (bass) {{
+                float sp = getChannelOutput(ch, tP, posP, rowTime);
+                int cm = ch % 4;
+                pbL += sp * chR[cm];  // cross-pan: PHASESHIFT90→L, PHASESHIFT0→R
+                pbR += sp * chL[cm];
+            }}
+        }}
+        centL += pbL * normFactor * PHAT_DEPTH;
+        centR += pbR * normFactor * PHAT_DEPTH;
+    }}
+    
+    float outL = surrL + centL;
+    float outR = surrR + centR;
+    return vec2(clamp(outL, -1.0, 1.0), clamp(outR, -1.0, 1.0));
 }}
 """
     
@@ -2177,11 +2593,12 @@ vec2 mainSound(int samp, float time) {{
     spd_val_len   = len(str(int(mod.initial_speed)))
 
     image_glsl = f"""/* ============================================================================
-   IMAGE - Stateless ProTracker MOD Player (c) 2026 Orblivius
+   IMAGE - Stateless ProTracker MOD Player v1.1 (c) 2026 Orblivius
+            NEW: Real-time Surround Sound + FAT DSP processing
    iChannel0: alphabet texture  (shadertoy.com/view/4sf3RB)
    Contact: subband@gmail.com or
             subband@protonmail.com
-   GIT:     https://github.com/mewza
+   GIT:     https://github.com/mewza/mod2glsl
   ============================================================================ */
 
 
@@ -2956,11 +3373,13 @@ def main():
     
     base_name = os.path.splitext(os.path.basename(args.modfile))[0]
     
-    # Collect all samples into one array
+    # Collect all samples into one array, with 32-byte zero-padding after each
+    # (mikIT technique: safe to read pos+1 and pos+2 for cubic interpolation)
     all_samples = []
     for sample in mod.samples:
         if sample['data'] is not None and len(sample['data']) > 0:
             all_samples.extend(sample['data'])
+            all_samples.extend([0] * 32)  # zero-padding for cubic interpolation
     
     # RLE compression helper
     def rle_compress_with_row_breaks(data, row_size):
