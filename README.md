@@ -1,4 +1,4 @@
-# MOD to ShaderToy Converter
+# MOD2GLSL - Amiga MOD file converted to GLSL / ShaderToy
 
 Convert Amiga ProTracker MOD(and soon S3M/XM and IT) files 
 into ShaderToy shaders.
