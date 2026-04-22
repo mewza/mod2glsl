@@ -1,7 +1,12 @@
 # MOD2GLSL - Amiga MOD file converted to GLSL / ShaderToy
 
 Convert Amiga ProTracker MOD(and soon S3M/XM and IT) files 
-into ShaderToy shaders.
+into ShaderToy shaders. 
+
+Please donate $ to support this project,
+to be honest, I never received any $ from anybody for open source
+projects, so if this time it is different, it'd probably make
+me happier and more optimistic about our future. 
 
 ## Overview
 
@@ -236,13 +241,14 @@ Based on ProTracker specification and ShaderToy audio API.
 Free for non-commercial use. Ask author for more information
 Contact:
     Dmitry Boldyrev <subband@gmail.com> or
-                    <subband@protonmail.com>
+    Donate PayPal to <subband@protonmail.com>
 
 ## Links
 
 - [ShaderToy](https://www.shadertoy.com/)
 - [The Mod Archive](https://modarchive.org/)
 - [ProTracker Spec](http://16-bits.org/mod/)
+
 
 ---
 
