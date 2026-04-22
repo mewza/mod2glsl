@@ -11,11 +11,17 @@ maybe this time it will be different, and how
 much time I donated to support developers on #macdev, 
 and released source code for all to leran from from my
 35 years software engineering career, with a break for 15 years
-admittedly, due to serious health issues. It'd probably make me 
-happier and more optimistic about youth and the future,
-and I am a life long committed audio guy, you can count 
-on that. I write putty tunes, but my own, and original
-you can find them on my SoundCloud page at:
+admittedly, due to serious health issues. It'd probably make 
+me happier and more optimistic about youth and the future.
+
+Donate PayPal to <subband@protonmail.com><br>
+
+I am a life long committed audio guy from the start, at 6 years
+old they picked me from the crowd and said, you - must do music,
+so since 6 to 16 I was learning to play piano and learning music
+theory. I do write some small putty tunes, nothing too amazing,
+but at least I can call my own creation, you can find them on 
+my SoundCloud page at:
 
  https://soundcloud.com/analogintelligence
 
@@ -252,7 +258,7 @@ Based on ProTracker specification and ShaderToy audio API.
 Free for non-commercial use. Ask author for more information
 
 Contact:<br>
-    Dmitry Boldyrev <subband@gmail.com> or<br>
+    Dmitry Boldyrev <subband@gmail.com> and<br>
     Donate PayPal to <subband@protonmail.com><br>
 
 ## Links
