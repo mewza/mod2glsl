@@ -259,7 +259,7 @@ Free for non-commercial use. Ask author for more information
 
 Contact:<br>
    Dmitry Boldyrev : <subband@gmail.com><br>
-   Tele : @hrooster<br>
+   [![Telegram](https://img.shields.io/badge/Telegram-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/@hrooster)
 <br>
    Donate PayPal : <subband@protonmail.com><br>
    
