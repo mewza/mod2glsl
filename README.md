@@ -7,6 +7,9 @@ and export them as ShaderToy shaders.
 
 Live Demo: https://www.shadertoy.com/view/scBXzy
 
+<img width="1232" height="694" alt="image" src="https://github.com/user-attachments/assets/99465105-535a-46eb-b8db-e673a27eeb8b" />
+
+
 Please please please donate $ to support this project, 
 I am (still) not rich, and just like you trying to make
 ends meet, and to be honest, I never received any $ from 
