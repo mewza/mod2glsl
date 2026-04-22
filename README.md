@@ -3,10 +3,18 @@
 Convert Amiga ProTracker MOD(and soon S3M/XM and IT) files 
 into ShaderToy shaders. 
 
-Please donate $ to support this project,
-to be honest, I never received any $ from anybody for open source
-projects, so if this time it is different, it'd probably make
-me happier and more optimistic about our future. 
+Please please please donate $ to support this project, 
+I am (still) not rich, and just like you trying to make
+ends meet, and to be honest, I never received any $ from 
+anybody for open source  projects, I don't mind, but 
+maybe this time it will be different, and how
+much time I donated to support developers on #macdev, 
+and released source code for all to leran from from my
+35 years softwrae engineering career, with a break or 15 years
+admittedly, due to serious health issues. It'd probably make me 
+happier and more optimistic about youth and the future,
+and I am a life long committed audio guy, you can count 
+on that.
 
 ## Overview
 
