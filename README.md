@@ -250,9 +250,10 @@ Based on ProTracker specification and ShaderToy audio API.
 ## License
 
 Free for non-commercial use. Ask author for more information
-Contact:
-    Dmitry Boldyrev <subband@gmail.com> or
-    Donate PayPal to <subband@protonmail.com>
+
+Contact:<br>
+    Dmitry Boldyrev <subband@gmail.com> or<br>
+    Donate PayPal to <subband@protonmail.com><br>
 
 ## Links
 
