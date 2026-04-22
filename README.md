@@ -10,7 +10,7 @@ anybody for open source  projects, I don't mind, but
 maybe this time it will be different, and how
 much time I donated to support developers on #macdev, 
 and released source code for all to leran from from my
-35 years softwrae engineering career, with a break or 15 years
+35 years software engineering career, with a break or 15 years
 admittedly, due to serious health issues. It'd probably make me 
 happier and more optimistic about youth and the future,
 and I am a life long committed audio guy, you can count 
