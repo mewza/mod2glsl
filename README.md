@@ -1,8 +1,8 @@
 ## MOD2GLSL - Amiga MOD Player v1.1 for ShaderToy/GLSL<br>(c) 2026 Orblivius. All rights reserved.
 
-`NEW`: • 3D Surround Sound
-       • Cubic resampling
-       • FAT Bass
+`NEW`: • 3D Surround Sound<br>
+       • Cubic resampling<br>
+       • FAT Bass<br>
 
 Convert Amiga ProTracker MOD(and soon S3M/XM and IT) files 
 and export them as ShaderToy shaders. 
