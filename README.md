@@ -101,14 +101,6 @@ The shader:
 - Mixes 4 channels
 - (Framework for) processes effects
 
-## ShaderToy Setup
-
-1. Create a new **Sound** shader on ShaderToy
-2. Upload `*_samples.png` as **iChannel0**
-3. Upload `*_patterns.png` as **iChannel1** (if available)
-4. Paste the GLSL code from `*_player.glsl`
-5. Click play!
-
 ## Technical Details
 
 ### MOD Format
@@ -144,7 +136,9 @@ Middle C (period 428) ≈ 8287 Hz
 
 ### Limitations
 
-- ShaderToy has shader size limits (~64KB)
+- ShaderToy has shader size limits (~64KB but you win some with RLE
+  pattern compression, and packing data into an ivec4 you get 8x byte storage,
+  so multiply that 64k by 8 potentially or more)
 - Large MODs may need pattern data in texture, not code
 - Effects need manual implementation
 - No support for extended MOD formats (8-channel, etc.)
@@ -239,7 +233,10 @@ Based on ProTracker specification and ShaderToy audio API.
 
 ## License
 
-Public domain / MIT - Use freely!
+Free for non-commercial use. Ask author for more information
+Contact:
+    Dmitry Boldyrev <subband@gmail.com> or
+                    <subband@protonmail.com>
 
 ## Links
 
@@ -249,23 +246,3 @@ Public domain / MIT - Use freely!
 
 ---
 
-**Example Output:**
-
-```
-Loading: 12th_warrior.mod
-
-Title: 12th warrior
-Patterns: 13
-Length: 12 positions
-
-Saved: 12th_warrior_samples.png (1024x143)
-Saved: 12th_warrior_patterns.png (1024x13)
-Saved: 12th_warrior_player.glsl
-Saved: 12th_warrior_info.json
-
-SHADERTOY SETUP:
-1. Upload 12th_warrior_samples.png as iChannel0
-2. Upload 12th_warrior_patterns.png as iChannel1
-3. Copy shader code
-4. Click Play!
-```
