@@ -1,5 +1,4 @@
-## MOD2GLSL - Amiga MOD Player v1.1 for ShaderToy/GLSL<br>
-(c) 2026 Orblivius. All rights reserved.
+## MOD2GLSL - Amiga MOD Player v1.1 for ShaderToy/GLSL<br>(c) 2026 Orblivius. All rights reserved.
 
 ## NEW: Real-time Surround Sound + FAT DSP processing
 
