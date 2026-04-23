@@ -585,97 +585,6 @@ if (modData.compressed) {
     delete modData.compressedPatterns;
     console.log('✅ Decompression complete!');
 }
-
-
-// ── tracker pattern display ─────────────────────────────────────
-(function(){
-  const ROWS_ABOVE = 4, ROWS_BELOW = 4, TOTAL = ROWS_ABOVE+1+ROWS_BELOW;
-  const CH_COLORS = ['ch0-color','ch1-color','ch2-color','ch3-color'];
-  const PT=[856,808,762,720,678,640,604,570,538,508,480,453,
-            428,404,381,360,339,320,302,285,269,254,240,226,
-            214,202,190,180,170,160,151,143,135,127,120,113];
-  const NN=['C-','C#','D-','D#','E-','F-','F#','G-','G#','A-','A#','B-'];
-  function p2n(p){
-    if(!p) return '---';
-    let b=0,bd=1e9;
-    for(let i=0;i<PT.length;i++){const d=Math.abs(PT[i]-p);if(d<bd){bd=d;b=i;}}
-    return NN[b%12]+(Math.floor(b/12)+1);
-  }
-  function hex2(n){ return n.toString(16).toUpperCase().padStart(2,'0'); }
-
-  // Build header
-  const hdr = document.getElementById('trkHeader');
-  const nc = modData.numChannels||4;
-  hdr.innerHTML = '<div class="trk-col-hdr">ROW</div>' +
-    Array.from({length:nc},(_,i)=>`<div class="trk-col-hdr">TRACK #${i+1}</div>`).join('');
-
-  // Pre-build row elements
-  const body = document.getElementById('trkBody');
-  const rowEls = [];
-  for(let r=0;r<TOTAL;r++){
-    const row = document.createElement('div');
-    row.className = 'trk-row';
-    const rn = document.createElement('div');
-    rn.className = 'trk-rownum';
-    row.appendChild(rn);
-    const cells = [];
-    for(let c=0;c<nc;c++){
-      const cell = document.createElement('div');
-      cell.className = 'trk-cell';
-      row.appendChild(cell);
-      cells.push(cell);
-    }
-    body.appendChild(row);
-    rowEls.push({row, rn, cells});
-  }
-
-  function updateTracker(){
-    if(!player.isPlaying) return;
-    // patterns is a FLAT array: index = (patNum * 64 + row) * nc + channel
-    const pat = modData.songPositions[player.currentPattern]||0;
-    const curRow = player.currentRow;
-    if(!modData.patterns) return;
-
-    for(let ri=0;ri<TOTAL;ri++){
-      const rowIdx = curRow - ROWS_ABOVE + ri;
-      const {row, rn, cells} = rowEls[ri];
-      row.className = 'trk-row' + (ri===ROWS_ABOVE ? ' current' : '');
-      const r = ((rowIdx % 64) + 64) % 64;
-      rn.textContent = r.toString().padStart(2,'0');
-
-      for(let c=0;c<nc;c++){
-        const idx = (pat * 64 + r) * nc + c;
-        const n   = modData.patterns[idx]||{};
-        const period = n.period||0;
-        const sample = n.sample||0;
-        const effect = n.effect||0;
-        const param  = n.param ||0;
-        const cell = cells[c];
-        const cc = CH_COLORS[c%4];
-        if(!period && !sample && !effect && !param){
-          cell.innerHTML = `<span class="trk-empty">--- -- ---</span>`;
-        } else {
-          const note = p2n(period);
-          const smp  = sample ? hex2(sample) : '--';
-          const eff  = (effect||param) ? hex2(effect)+hex2(param) : '---';
-          cell.innerHTML =
-            `<span class="${cc}">${note}</span> ` +
-            `<span class="trk-samp">${smp}</span> ` +
-            `<span class="trk-eff">${eff}</span>`;
-        }
-      }
-    }
-  }
-
-  // Hook into the animation frame
-  const _df = drawFrame;
-  window.drawFrame = function(){
-    _df();
-    updateTracker();
-  };
-  // Also override the requestAnimationFrame ref
-  window._trackerUpdate = updateTracker;
-})();
 console.log('MOD Player Ready!');
 """
     else:
@@ -783,7 +692,7 @@ body{{background:var(--bg0);color:var(--text);font-family:var(--font);display:fl
 .trk-col-hdr:first-child {{ flex:0 0 44px; }}
 .trk-row {{ display:flex; border-bottom:1px solid #0f0f18; }}
 .trk-row.current {{
-  background:#152040 !important; border-left:3px solid var(--accent);
+  background:rgba(255,255,255,0.07) !important; border-left:3px solid var(--accent);
 }}
 .trk-row:nth-child(even) {{ background:#0d0d14; }}
 .trk-row:nth-child(odd)  {{ background:#101018; }}
@@ -1989,12 +1898,12 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
     # ========== COMMON TAB ==========
     data_source_comment = "Embedded data (no PNG required)" if use_embedded else f"All data in 1024×1024 RGBA PNG: {png_file}"
     common_glsl = f"""/* ============================================================================
-   COMMON - Stateless ProTracker MOD Player v1.1 (c) 2026 Orblivius
-            NEW: Real-time Surround Sound + FAT DSP processing
-   iChannel0: alphabet texture
+   ProTracker MOD Player v1.1 (c) 2026 Orblivius
+   New: 3D Surround, FAT Bass, and cubic resampling
+   COMMON TAB
    Contact: subband@gmail.com or
             subband@protonmail.com
-   GIT:     https://github.com/mewza/mod2glsl
+   GIT:     https://github.com/mewza
   ============================================================================ */
 // Generated from: {mod.title}
 // {data_source_comment}
@@ -2463,11 +2372,12 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     bass_flags_str = ', '.join(bass_sample_flags)
     
     sound_glsl = f"""/* ============================================================================
-   SOUND - Stateless ProTracker MOD Player v1.1 (c) 2026 Orblivius
-            NEW: Real-time Surround Sound + FAT DSP processing
+   ProTracker MOD Player v1.1 (c) 2026 Orblivius
+   New: 3D Surround, FAT Bass, and cubic resampling
+   SOUND TAB
    Contact: subband@gmail.com or
             subband@protonmail.com
-   GIT:     https://github.com/mewza/mod2glsl
+   GIT:     https://github.com/mewza
   ============================================================================ */
 // getByte / getPatternByte / getSample / getNote / getChannelOutput are in Common.
 
@@ -2593,12 +2503,12 @@ vec2 mainSound(int samp, float time) {{
     spd_val_len   = len(str(int(mod.initial_speed)))
 
     image_glsl = f"""/* ============================================================================
-   IMAGE - Stateless ProTracker MOD Player v1.1 (c) 2026 Orblivius
-            NEW: Real-time Surround Sound + FAT DSP processing
-   iChannel0: alphabet texture  (shadertoy.com/view/4sf3RB)
+   ProTracker MOD Player v1.1 (c) 2026 Orblivius
+   New: 3D Surround, FAT Bass, and cubic resampling
+   IMAGE TAB — iChannel0: alphabet texture (shadertoy.com/view/4sf3RB)
    Contact: subband@gmail.com or
             subband@protonmail.com
-   GIT:     https://github.com/mewza/mod2glsl
+   GIT:     https://github.com/mewza
   ============================================================================ */
 
 
@@ -2795,10 +2705,13 @@ float vline(vec2 fp,float x,float y0,float y1){{
     return abs(fp.x-x)<.6&&fp.y>y0&&fp.y<y1?1.:0.;
 }}
 
-// === Zuvuya Visualizer (c) 2026 Orblivius — 1:1, MAX_MARCH 100 ===
+// === Zuvuya Visualizer (c) 2026 Orblivius — 1:1 ===
 #define _SCROLL 2.8
 #define _SPEED  3.4
 #define _PI     3.1415926
+#define FFT_N   256
+#define WAVE_BASE 70
+#define WAVE_ROWS 64
 float _rand(vec2 st){{return fract(sin(dot(st,vec2(12.9898,78.233)))*43758.5453);}}
 float _mypow(float src,float x){{return src-(src-src*src)*(-x);}}
 vec2  _rotate(vec2 st,float angle){{mat2 m=mat2(cos(angle),-sin(angle),sin(angle),cos(angle));return m*st;}}
@@ -2880,44 +2793,44 @@ void mainImage(out vec4 O, vec2 C) {{
     // actually initialises the arrays. Once done, normal display begins.
     const int LOADING_FRAMES = 16;
 
-    // ── Zuvuya: original tilt+mirror transform → waves on LEFT/RIGHT sides ──
-    // waveMem = per-channel oscilloscope history from Buffer A rows 3-66
+    // ── Zuvuya backdrop 1:1 ───────────────────────────────────────────────────
     vec2 _s = (C*2.0-iResolution.xy)/iResolution.y;
-    float _tilt = radians(-45.0), _ct=cos(_tilt), _st=sin(_tilt);
-    _s = vec2(_s.x*_ct-_s.y*_st, _s.x*_st+_s.y*_ct);
-    _s = vec2(_s.x*_ct-_s.y*_st, _s.x*_st+_s.y*_ct);
-    vec2 _sv=_s; float _ang=atan(_sv.y,_sv.x);
-    if(abs(_ang)>0.0){{float _r=length(_sv);_sv=vec2(cos(-_ang),sin(-_ang))*_r;}}
+    float _tilt=radians(-45.0),_ct=cos(_tilt),_st=sin(_tilt);
+    _s=vec2(_s.x*_ct-_s.y*_st,_s.x*_st+_s.y*_ct);
+    _s=vec2(_s.x*_ct-_s.y*_st,_s.x*_st+_s.y*_ct);
+    vec2 _sv=_s;
+    float _mirrorAngle=radians(0.0);
+    float _ang=atan(_sv.y,_sv.x);
+    if(abs(_ang)>_mirrorAngle){{float _r=length(_sv);float _folded=sign(_ang)*2.0*_mirrorAngle-_ang;_sv=vec2(cos(_folded),sin(_folded))*_r;}}
     _s=_sv;
-    float _per=2.0/max(abs(_s.y),0.08);
+    float _per=2.0/max(abs(_s.y),0.08);  // 0.08 matches original — caps _per at 25, prevents wave aliasing near center
     vec3 _vis=vec3(0.0);
     for(float z=0.0;z<1.0;z+=0.05){{
         float _d=1.0+z;
         vec2 _p=vec2(_s.x*_d,_s.y+_d)*_per;
         _p.y+=_SCROLL*iTime;
-        // per-channel history: z-band → channel, p.y depth → history row
-        int _wch=int(z*4.0)%NUM_CHANNELS;
-        int _ro=clamp(int(fract(_p.y*0.1)*63.0),0,63);
+        // waveMem: Zuvuya scroll memory in Buffer A rows 70-133 (.a channel)
+        // x = z mapped to full screen width (same as original freqX = int(z*res.x))
+        // y = scrolling history row (same as original historyRow logic)
+        int _freqX   = clamp(int(z * float(int(iResolution.x))), 0, int(iResolution.x)-1);
+        int _rowOff  = (WAVE_ROWS-1) - clamp(int(fract(_p.y * 0.1) * float(WAVE_ROWS)), 0, WAVE_ROWS-1);
+        int _waveRow = WAVE_BASE + _rowOff;
         float waveMem=(iChannelResolution[1].x>1.0)
-            ? texelFetch(iChannel1,ivec2(_wch,_ro+3),0).a
+            ? texelFetch(iChannel1,ivec2(_freqX,_waveRow),0).a
             : 0.3;
         float _shift=cos(z/0.06),_side=sin(_p.y*_PI*3.0);
         _p.x+=_shift+waveMem*_side*z*2.0;
         _p.y+=waveMem*2.0*z;
-        float _w=_p.x,_l=sin(_p.y*0.5+z/0.08+_SPEED*iTime);
+        float _w=_p.x,_l=sin(_p.y*0.5+z/0.08+_SPEED*_d*iTime);
         float heat=clamp((waveMem-0.5)*2.0,0.0,1.0);
         float thickness=mix(0.3,0.05,heat);
         float intensity=exp(min(_l,-_l/thickness/(1.0+4.0*_w*_w)));
-        float hue=float(_wch)*0.25+0.05,sat=mix(0.6,1.0,heat),val=mix(0.5,1.4,heat);
+        float hue=mix(0.62,0.0,heat) + z*0.20,sat=mix(0.75,1.0,heat),val=mix(0.6,1.5,heat);
         vec3 tint=_hsv2rgb(vec3(hue,sat,val));
         tint+=vec3(0.15,0.0,0.25)*smoothstep(0.3,0.7,sin(z*30.0+iTime*0.7))*(1.0-heat);
         _vis+=intensity*tint/(abs(_w)+0.01*_per)*_per;}}
     _vis=tanh(_vis/4e1);
-    // original blend formula: curtain² + scene background
     vec3 col=_vis*_vis+_mainScene(C);
-    vec2 _uv=(C*2.-iResolution.xy)/iResolution.y;
-    float _cx=abs(_uv.x)/(iResolution.x/iResolution.y);
-    col*=mix(0.04,1.0,smoothstep(0.10,0.52,_cx));
     if (iFrame < LOADING_FRAMES) {{
         vec2 res = iResolution.xy;
         float prog = float(iFrame) / float(LOADING_FRAMES - 1);
@@ -2926,7 +2839,7 @@ void mainImage(out vec4 O, vec2 C) {{
 
         // Header
         col += CYAN   * printHdr   (pUV(fp, ML, 6., CH));
-        col += WHITE  * printCredit(pUV(fp, res.x - ML - 17.*CW, 6., CH*0.75));
+        col += WHITE  * printCredit(pUV(fp, res.x - ML - 16.*CW*0.75, 6., CH*0.75));
         col += YELLOW * printTitle (pUV(fp, ML, CH+9., CH));
 
         // "LOADING..." label
@@ -2955,7 +2868,7 @@ void mainImage(out vec4 O, vec2 C) {{
     // Accumulate tracker UI into separate buffer so it overlays pure (no curtain tint)
     vec3 trk = vec3(0.0);
     trk += CYAN   * printHdr   (pUV(fp, ML,  6., CH));
-    trk += WHITE  * printCredit(pUV(fp, iResolution.x - ML - 17.*CW, 6., CH*0.75));
+    trk += WHITE  * printCredit(pUV(fp, iResolution.x - ML - 16.*CW*0.75, 6., CH*0.75));
     trk += YELLOW * printTitle (pUV(fp, ML, CH+9., CH));
     trk += DIM    * hline(fp, CH*2.+13., ML, iResolution.x-ML);
 
@@ -3005,7 +2918,7 @@ void mainImage(out vec4 O, vec2 C) {{
     // Current-row highlight bar (full width)
     float curY = tTop+float(HVR)*CH;
     if(fp.y>=curY && fp.y<curY+CH)
-        col = mix(BG, vec3(0.0,0.04,0.22), 0.9);
+        col *= 0.35;  // darken background, keep Zuvuya colors showing through
 
     if(fp.y>=tTop && fp.y<tBot) {{
         int ri_abs=int((fp.y-tTop)/CH);
@@ -3095,7 +3008,6 @@ void mainImage(out vec4 O, vec2 C) {{
             // Buffer A must be set up: Image iChannel1 = Buffer A output
             if (iChannelResolution[1].x > 1.0) {{
                 // Buffer A connected — read DFT magnitudes
-                const int FFT_N = 256;
                 float xf   = C.x / iResolution.x;
                 float logX = pow(xf, 0.5);  // perceptual log-scale
                 int   bin  = clamp(int(logX * float(FFT_N / 2)), 0, FFT_N/2 - 1);
@@ -3207,7 +3119,9 @@ void mainImage(out vec4 O, vec2 C) {{
     # Setup: Buffer A iChannel0 = Buffer A (self-ref)
     #        Image   iChannel1 = Buffer A output
     buffer_a_glsl = f"""/* ============================================================================
-   BUFFER A  (c) 2026 Orblivius
+   ProTracker MOD Player v1.1 (c) 2026 Orblivius
+   New: 3D Surround, FAT Bass, and cubic resampling
+   BUFFER A TAB
    Row 0      : FFT_N mixed audio samples      (getChannelOutput sum, per px)
    Row 1      : FFT_N/2 DFT magnitudes         (phasor-rotation DFT)
    Row 2      : UI state px0=specMode px1=prevMouse
@@ -3216,13 +3130,16 @@ void mainImage(out vec4 O, vec2 C) {{
                 waveMem for Zuvuya curtain reads from here via Image iChannel1.
    ShaderToy setup:
      Buffer A → iChannel0 = Buffer A  (self-reference)
+      Buffer A → iChannel1 = Sound tab output  (audio waveform for Zuvuya)
      Image    → iChannel1 = Buffer A
 ============================================================================ */
 
-#define FFT_N   256
-#define FFT_SR  8192.0
+#define FFT_N     256
+#define FFT_SR    8192.0
 #define HIST_ROWS 64      // rows 3..(3+HIST_ROWS-1)
 #define HIST_BASE 3
+#define WAVE_BASE 70      // rows 70..(70+WAVE_ROWS-1) — Zuvuya waveform scroll memory
+#define WAVE_ROWS 64      // 64 rows of history, full-width x
 
 void mainImage(out vec4 O, vec2 C) {{
     int px = int(C.x), py = int(C.y);
@@ -3272,20 +3189,36 @@ void mainImage(out vec4 O, vec2 C) {{
 
     }} else if (py >= HIST_BASE && py < HIST_BASE + HIST_ROWS && px < NUM_CHANNELS) {{
         // ── Rows 3–66: per-channel oscilloscope history ─────────────────────
-        // px = channel index (0..NUM_CHANNELS-1)
-        // py = HIST_BASE → newest,  py = HIST_BASE+HIST_ROWS-1 → oldest
         if (py == HIST_BASE) {{
-            // Newest row: sample each channel's current audio amplitude
             float ticksPerSec = float(BPM) * 2.0 / 5.0;
             float rowTime = float(SPEED) / ticksPerSec;
             Position pos = getPosition(iTime);
             float s = getChannelOutput(px, iTime, pos, rowTime);
-            // Store abs amplitude mapped to [0,1]; 0.5 = silence
             O = vec4(0., 0., 0., abs(s) * 0.5 + 0.5);
         }} else {{
-            // Older rows: scroll — copy from the row above (one frame younger)
             O = texelFetch(iChannel0, ivec2(px, py - 1), 0);
         }}
+
+    }} else if (py == WAVE_BASE) {{
+        // ── Row 70: newest waveform row ──────────────────────────────────────
+        // TODO: once you connect Buffer A iChannel1 = Sound tab in ShaderToy,
+        // replace this with: snd = texture(iChannel1, vec2(mu*0.5, 0)).r * 1.5
+        float u  = float(px) / float(iResolution.x);
+        float mu = 1.0 - abs(u * 2.0 - 1.0);
+        float t  = iTime - mu * 0.5;  // 500ms window: z=0→current, z=0.5→250ms ago, z=0.95→475ms ago
+        float ticksPerSec = float(BPM) * 2.0 / 5.0;
+        float rowTime = float(SPEED) / ticksPerSec;
+        Position pos = getPosition(t);
+        float s = 0.0;
+        for (int ch = 0; ch < NUM_CHANNELS; ch++)
+            s = max(s, abs(getChannelOutput(ch, t, pos, rowTime)));
+        float fresh = clamp(s * 2.0, 0.0, 1.0);
+        float prev = texelFetch(iChannel0, ivec2(px, WAVE_BASE), 0).a;
+        O = vec4(0.0, 0.0, 0.0, max(fresh, prev * 0.88));
+
+    }} else if (py > WAVE_BASE && py < WAVE_BASE + WAVE_ROWS) {{
+        // ── Rows 71-133: scroll — copy row above (one frame younger) ────────
+        O = texelFetch(iChannel0, ivec2(px, py - 1), 0);
     }}
 }}
 """
@@ -3314,10 +3247,11 @@ void mainImage(out vec4 O, vec2 C) {{
     print(f"      Buffer A: {bufA_file}  (FFT spectrum + click toggle state)")
     print()
     print(f"   🔗 ShaderToy channel setup:")
-    print(f"      Image   → iChannel0 = Alphabet texture (shadertoy.com/view/4sf3RB)")
-    print(f"      Image   → iChannel1 = Buffer A")
+    print(f"      Image    → iChannel0 = Alphabet texture (shadertoy.com/view/4sf3RB)")
+    print(f"      Image    → iChannel1 = Buffer A")
     print(f"      Buffer A → iChannel0 = Buffer A  (self-reference)")
-    print(f"      Sound   → (no channels needed)")
+    print(f"      Buffer A → iChannel1 = Sound tab  (audio waveform for Zuvuya)")
+    print(f"      Sound    → (no channels needed)")
     print()
     print(f"   🖱️  Click anywhere to toggle oscilloscope ↔ spectrum view")
 
