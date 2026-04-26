@@ -2,6 +2,7 @@
 
 `NEW in v1.2`<br>
        • RVQ advanced sample compression (27.7 dB yield)<br>
+       • Downsample feature (--downsample 2. 4, 8)
        • 3D Surround Sound<br>
        • Cubic resampling<br>
        • FAT Bass (Hilbert)<br>
