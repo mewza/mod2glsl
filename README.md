@@ -7,7 +7,7 @@
        • FAT Bass<br>
 
 Convert Amiga ProTracker MOD(and soon S3M/XM and IT) files 
-and export them as ShaderToy shaders. 
+to ShaderToy shader with visualization and note/effect overlay.
 
 Live Demo: https://www.shadertoy.com/view/scBXzy
 
