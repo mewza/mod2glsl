@@ -11,7 +11,7 @@ to ShaderToy shader with visualization and note/effect overlay.
 
 Live Demo: [https://www.shadertoy.com/view/scBXzy](https://www.shadertoy.com/view/fcSXRc)
 
-<img width="50%" height="50%" alt="image" src="https://github.com/user-attachments/assets/35e05c2a-0dfd-41c4-a243-71e20d21befe" />
+<img width="50%" height="50%" alt="image" src="https://github.com/user-attachments/assets/8b86d2b2-5734-4376-94c7-3b04f5608d4d" />
 <br>
 
 Please please please donate $ to support this project, 
