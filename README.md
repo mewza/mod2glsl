@@ -15,18 +15,7 @@ Live Demo: [https://www.shadertoy.com/view/scBXzy](https://www.shadertoy.com/vie
 <img width="50%" height="50%" alt="image" src="https://github.com/user-attachments/assets/8b86d2b2-5734-4376-94c7-3b04f5608d4d" />
 <br>
 
-Please please please donate $ to support this project, 
-I am (still) not rich, and just like you trying to make
-ends meet, and to be honest, I never received any $ from 
-anybody for open source  projects, I don't mind, but 
-maybe this time it will be different, and how
-much time I donated to support developers on #macdev, 
-and released source code for all to leran from from my
-35 years software engineering career, with a break for 15 years
-admittedly, due to serious health issues. It'd probably make 
-me happier and more optimistic about youth and the future.
-
-Donate PayPal to <subband@protonmail.com><br>
+If you feel like it donate PayPal to <subband@protonmail.com><br>
 
 I am a life long committed audio guy from the start, at 6 years
 old they picked me from the crowd and said, you - must do music,
