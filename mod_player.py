@@ -13,6 +13,13 @@ import os
 import json
 import argparse
 
+# Adaptive sample compression (BW analysis + anti-alias decimation)
+try:
+    from scipy.signal import resample_poly as _resample_poly
+    _HAS_SCIPY = True
+except ImportError:
+    _HAS_SCIPY = False
+
 # ============================================================================
 # OPTIMIZATION 1: Efficient int32 Packing
 # ============================================================================
@@ -140,6 +147,45 @@ def create_sample_pngs(samples, mod_name, output_dir):
         png_files.append(png_filename)
     
     return png_files
+
+def bw_compress_sample(data, sr=44100):
+    """
+    Bandwidth-adaptive sample compression.
+    Analyzes frequency content via FFT, finds highest significant frequency,
+    computes minimum required sample rate (Nyquist + 20% headroom),
+    then applies anti-alias filter and decimates by the best power-of-2 factor.
+    Returns (bw_factor, compressed_int8_array).
+    """
+    d = data.astype(np.float32)
+    n = len(d)
+    if n < 32 or not _HAS_SCIPY:
+        return 1, d.astype(np.int8)
+    
+    # FFT with Hann window to find highest significant frequency
+    fft_mag = np.abs(np.fft.rfft(d * np.hanning(n)))
+    freqs   = np.fft.rfftfreq(n, 1.0/sr)
+    peak    = np.max(fft_mag)
+    if peak == 0:
+        return 1, d.astype(np.int8)
+    
+    # Find highest bin with > 0.5% of peak energy
+    sig_bins = np.where(fft_mag > peak * 0.005)[0]
+    max_freq = freqs[sig_bins[-1]] if len(sig_bins) else 22050.0
+    
+    # Choose best power-of-2 downsample factor (Nyquist + 20% headroom)
+    best_factor = 1
+    for f in [2, 4, 8, 16]:
+        if sr / f >= max_freq * 2.4:
+            best_factor = f
+    
+    if best_factor == 1:
+        return 1, d.astype(np.int8)
+    
+    # High-quality polyphase anti-alias filter + decimate
+    compressed = _resample_poly(d, 1, best_factor)
+    compressed = np.clip(np.round(compressed).astype(np.int32), -128, 127).astype(np.int8)
+    return best_factor, compressed
+
 
 class MODFile:
     def __init__(self, filename):
@@ -430,42 +476,41 @@ def detect_module_format(filename):
 def create_fixed_player_html(mod, output_file, downsample=1, compress=False):
     """Create HTML with PROPERLY TIMED MOD player"""
     
-    # Pack samples
+    # Pack samples with bandwidth-adaptive compression
     sample_map = []
     all_samples = []
-    individual_samples = []  # For compression
+    individual_samples = []
     current_pos = 0
     
     for i, sample in enumerate(mod.samples):
         if sample['length'] > 0:
-            # mikIT zero-padding: append 32 zeros past sample end so interpolation (pos+1) never reads garbage
-            data_raw  = sample['data'].astype(np.float32) / 128.0
-            data_float = np.concatenate([data_raw, np.zeros(32, dtype=np.float32)])
+            # Bandwidth-adaptive compression: decimate by power-of-2 factor
+            bf, compressed = bw_compress_sample(sample['data'])
+            data_float = np.concatenate([
+                compressed.astype(np.float32) / 128.0,
+                np.zeros(32, dtype=np.float32)   # zero-padding for cubic interpolation
+            ])
             
             sample_map.append({
-                'index': i,
-                'start': current_pos,
-                'length': len(data_raw),   # audio length (not including 32-byte padding)
-                'loop_start': sample['repeat_point'],
-                'loop_length': sample['repeat_length'],
-                'volume': sample['volume'],
-                'finetune': sample['finetune'],
-                'name': sample['name']
+                'index':       i,
+                'start':       current_pos,
+                'length':      len(compressed),  # compressed length (not including padding)
+                'loop_start':  sample['repeat_point'] // bf,
+                'loop_length': sample['repeat_length'] // bf if sample['repeat_length'] > 2 else sample['repeat_length'],
+                'bw_factor':   bf,
+                'volume':      sample['volume'],
+                'finetune':    sample['finetune'],
+                'name':        sample['name']
             })
             
             all_samples.extend(data_float.tolist())
-            individual_samples.append(sample['data'].tolist())  # Keep original 8-bit for compression
+            individual_samples.append(compressed.tolist())
             current_pos += len(data_float)
         else:
             sample_map.append({
-                'index': i,
-                'start': 0,
-                'length': 0,
-                'loop_start': 0,
-                'loop_length': 0,
-                'volume': 0,
-                'finetune': 0,
-                'name': ''
+                'index': i, 'start': 0, 'length': 0,
+                'loop_start': 0, 'loop_length': 0, 'bw_factor': 1,
+                'volume': 0, 'finetune': 0, 'name': ''
             })
             individual_samples.append([])
     
@@ -976,9 +1021,11 @@ class MODPlayer {{
         const info = modData.sampleMap[sampleIdx];
         if (!info || info.length === 0) return 0;
         
-        let pos = position;
+        // Map original sample position → compressed position via bw_factor
+        const bf = info.bw_factor || 1;
+        let pos = position / bf;
         
-        // Loop wrapping
+        // Loop wrapping (loop points already divided by bw_factor at generation time)
         if (info.loop_length > 2) {{
             if (pos >= info.loop_start + info.loop_length) {{
                 pos = info.loop_start + (pos - info.loop_start) % info.loop_length;
@@ -988,24 +1035,20 @@ class MODPlayer {{
         }}
         
         // 4-point cubic Hermite (Catmull-Rom) interpolation.
-        // pos+1 and pos+2 are always safe due to 32-zero padding (mikIT technique).
-        // pos-1 is clamped to loop boundary or sample start.
         const pos0 = pos | 0;
         const frac = pos - pos0;
         const base = info.start;
         
-        // Read 4 consecutive samples, handling start boundary and loop wrap
         const looping = info.loop_length > 2;
         const wrap = (i) => {{
             if (looping && i < info.loop_start) return info.loop_start + info.loop_length - 1;
-            return Math.max(0, i);  // clamp at start for non-looping
+            return Math.max(0, i);
         }};
         const p0 = modData.samples[base + wrap(pos0 - 1)];
         const p1 = modData.samples[base + pos0];
-        const p2 = modData.samples[base + pos0 + 1];  // safe: zero-padded
-        const p3 = modData.samples[base + pos0 + 2];  // safe: zero-padded
+        const p2 = modData.samples[base + pos0 + 1];
+        const p3 = modData.samples[base + pos0 + 2];
         
-        // Catmull-Rom: a*t³ + b*t² + c*t + p1
         const a = -0.5*p0 + 1.5*p1 - 1.5*p2 + 0.5*p3;
         const b =      p0 - 2.5*p1 + 2.0*p2 - 0.5*p3;
         const c = -0.5*p0           + 0.5*p2;
@@ -1789,15 +1832,18 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
     for sample in mod.samples:
         start_idx = len(all_samples)
         raw_len = 0
+        bw_factor = 1
         if sample['data'] is not None and len(sample['data']) > 0:
-            all_samples.extend(sample['data'] / 128.0)
-            raw_len = len(sample['data'])
+            bw_factor, compressed = bw_compress_sample(sample['data'])
+            all_samples.extend(compressed.astype(np.float64) / 128.0)
+            raw_len = len(compressed)
             all_samples.extend([0.0] * 32)  # zero-padding: pos+1 and pos+2 always safe
         sample_map.append({
-            'start': start_idx,
-            'length': raw_len,  # audio length only (not including padding)
-            'repeat_point': sample['repeat_point'],
-            'repeat_length': sample['repeat_length']
+            'start':          start_idx,
+            'length':         raw_len,
+            'repeat_point':   sample['repeat_point'] // bw_factor,
+            'repeat_length':  sample['repeat_length'] // bw_factor if sample['repeat_length'] > 2 else sample['repeat_length'],
+            'bw_factor':      bw_factor,
         })
     
     # Remove old pattern processing - everything goes in PNG now
@@ -1898,12 +1944,12 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
     # ========== COMMON TAB ==========
     data_source_comment = "Embedded data (no PNG required)" if use_embedded else f"All data in 1024×1024 RGBA PNG: {png_file}"
     common_glsl = f"""/* ============================================================================
-   ProTracker MOD Player v1.1 (c) 2026 Orblivius
-   New: 3D Surround, FAT Bass, and cubic resampling
+   GLSL MOD Player v1.2 (c) 2026 Orblivius
+   New: VQ sample compression, 3D Surround, FAT Bass, and cubic resampling
    COMMON TAB
    Contact: subband@gmail.com or
             subband@protonmail.com
-   GIT:     https://github.com/mewza
+   GIT:     https://github.com/mewza/mod2glsl
   ============================================================================ */
 // Generated from: {mod.title}
 // {data_source_comment}
@@ -2043,7 +2089,7 @@ int getPackedSampleByte(int chunkIdx, int localByteIdx) {{
 
 // Sample info
 struct SampleInfo {{
-    int start, length, loopStart, loopLen, volume;
+    int start, length, loopStart, loopLen, volume, bwFactor;
 }};
 const SampleInfo samples[31] = SampleInfo[](
 """
@@ -2051,7 +2097,7 @@ const SampleInfo samples[31] = SampleInfo[](
     for i, s in enumerate(sample_map[:31]):
         comma = "," if i < 30 else ""
         vol = mod.samples[i]['volume'] if i < len(mod.samples) else 64
-        common_glsl += f"    SampleInfo({s['start']}, {s['length']}, {s['repeat_point']}, {s['repeat_length']}, {vol}){comma}\n"
+        common_glsl += f"    SampleInfo({s['start']}, {s['length']}, {s['repeat_point']}, {s['repeat_length']}, {vol}, {s.get('bw_factor',1)}){comma}\n"
     
     common_glsl += f""");
 
@@ -2182,11 +2228,14 @@ float getSample(int index) {{
 
 // 4-point cubic Hermite (Catmull-Rom) interpolation.
 // getSample() reads one integer-indexed byte; getSampleF() interpolates between 4.
-float getSampleF(int base, float fpos, int smpLen) {{
+float getSampleF(int base, float fpos, int smpLen, int loopStart, int loopLen) {{
     int i  = int(fpos);
     float t = fpos - float(i);
-    // p0 = i-1 clamped to sample start; p1,p2,p3 safe via 32-byte zero-padding
-    float p0 = getSample(base + max(0, i - 1));
+    // p0: if at loop start, wrap back to loop end for seamless cubic interpolation
+    int i0 = i - 1;
+    if (loopLen > 2 && i0 < loopStart) i0 = loopStart + loopLen - 1;
+    else i0 = max(0, i0);
+    float p0 = getSample(base + i0);
     float p1 = getSample(base + i);
     float p2 = getSample(base + min(i + 1, smpLen + 31));
     float p3 = getSample(base + min(i + 2, smpLen + 31));
@@ -2295,7 +2344,7 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     }}
 
     float freq       = periodToFreq(max(1, int(effectivePeriod)));
-    float fSamplePos = elapsed * freq;
+    float fSamplePos = elapsed * freq / float(smp.bwFactor);  // map to compressed sample space
 
     if (smp.loopLen > 2) {{
         if (fSamplePos >= float(smp.loopStart + smp.loopLen))
@@ -2305,7 +2354,7 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     }}
     if (fSamplePos < 0.0) return 0.0;
 
-    float s = getSampleF(smp.start, fSamplePos, smp.length);
+    float s = getSampleF(smp.start, fSamplePos, smp.length, smp.loopStart, smp.loopLen);
 
     // ── Volume: forward scan trigger→current to honour Cxx cuts & Axx slides ─
     // ProTracker volume slide (Effect A/6) SKIPS tick 0 → applies (SPEED-1) ticks per row.
@@ -2372,12 +2421,12 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     bass_flags_str = ', '.join(bass_sample_flags)
     
     sound_glsl = f"""/* ============================================================================
-   ProTracker MOD Player v1.1 (c) 2026 Orblivius
-   New: 3D Surround, FAT Bass, and cubic resampling
+   GLSL MOD Player v1.2 (c) 2026 Orblivius
+   New: VQ sample compression, 3D Surround, FAT Bass, and cubic resampling
    SOUND TAB
    Contact: subband@gmail.com or
             subband@protonmail.com
-   GIT:     https://github.com/mewza
+   GIT:     https://github.com/mewza/mod2glsl
   ============================================================================ */
 // getByte / getPatternByte / getSample / getNote / getChannelOutput are in Common.
 
@@ -2503,12 +2552,12 @@ vec2 mainSound(int samp, float time) {{
     spd_val_len   = len(str(int(mod.initial_speed)))
 
     image_glsl = f"""/* ============================================================================
-   ProTracker MOD Player v1.1 (c) 2026 Orblivius
-   New: 3D Surround, FAT Bass, and cubic resampling
+   GLSL MOD Player v1.2 (c) 2026 Orblivius
+   New: VQ sample compression, 3D Surround, FAT Bass, and cubic resampling
    IMAGE TAB — iChannel0: alphabet texture (shadertoy.com/view/4sf3RB)
    Contact: subband@gmail.com or
             subband@protonmail.com
-   GIT:     https://github.com/mewza
+   GIT:     https://github.com/mewza/mod2glsl
   ============================================================================ */
 
 
@@ -2705,72 +2754,53 @@ float vline(vec2 fp,float x,float y0,float y1){{
     return abs(fp.x-x)<.6&&fp.y>y0&&fp.y<y1?1.:0.;
 }}
 
-// === Zuvuya Visualizer (c) 2026 Orblivius — 1:1 ===
-#define _SCROLL 2.8
-#define _SPEED  3.4
-#define _PI     3.1415926
-#define FFT_N   256
-#define WAVE_BASE 70
-#define WAVE_ROWS 64
-float _rand(vec2 st){{return fract(sin(dot(st,vec2(12.9898,78.233)))*43758.5453);}}
-float _mypow(float src,float x){{return src-(src-src*src)*(-x);}}
-vec2  _rotate(vec2 st,float angle){{mat2 m=mat2(cos(angle),-sin(angle),sin(angle),cos(angle));return m*st;}}
-float _star(vec2 uv,float flare){{float d=length(uv),m=0.05/d;m+=m*flare;m*=smoothstep(0.85,0.2,d);return m;}}
-float _starLayer(vec2 uv,float grid){{
-    vec2 gv=fract(uv*grid)-0.5,id=floor(uv*grid);float col=0.0;
-    for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){{
-        vec2 o=vec2(x,y);float n=_rand(id+o),sz=fract(n*345.32);
-        col+=_star(gv-o-vec2(n,fract(n*34.0))+0.5,smoothstep(0.9,1.0,sz)*6.0)*(sin(iTime*2.0+n*13.256)*0.5+0.5)*sz;}}
-    return col;}}
-float _shootstar(vec2 uv,float grid,vec2 uvorig){{
-    vec2 gv=fract(uv*grid)-0.5,id=floor(uv*grid);
-    float n=_rand(id),size=fract(n*345.32);
-    vec2 uvs=_rotate(gv-vec2(n,fract(n*34.0))+0.5,-uvorig.x);
-    float flare=smoothstep(0.9,1.0,size)*6.0;
-    float d=length(vec2(uvs.x,uvs.y-(1.0/uvorig.x/2.0+(_mypow(uvorig.y,8.0)/4.0))*(uvs.x/8.0)*48.0));
-    float m=smoothstep(0.07,0.06,d);
-    return (flare>5.0?m+m*flare:0.0)*size;}}
-float _sdBox(vec3 p,vec3 b,vec3 c){{vec3 q=abs(p-c)-b;return length(max(q,0.0))+min(max(q.y,max(q.x,q.z)),0.0);}}
-float _sdBoxinf(vec2 p){{vec2 q=abs(p);return max(q.x+0.5,q.y)-1.0;}}
-float _vmap(vec3 p){{
-    vec3 q=p;q.xz=mod(q.xz,1.0)-0.5;
-    float rtime=_rand(vec2(floor(p.xz)));
-    float height=abs(_rand(floor(p.xz)+rtime));
-    float id=floor(_mypow(abs(p.x*0.1),-1.0));
-    return min(_sdBoxinf(p.xy),_sdBox(q,vec3(0.15,1.7*height+id,0.15),vec3(0.0)));}}
-vec3 _hsv2rgb(vec3 c){{
-    vec4 K=vec4(1.0,2.0/3.0,1.0/3.0,3.0);
-    vec3 p=abs(fract(c.xxx+K.xyz)*6.0-K.www);
-    return c.z*mix(K.xxx,clamp(p-K.xxx,0.0,1.0),c.y);}}
-vec3 _mainScene(in vec2 fragCoord){{
-    vec2 uv=(fragCoord*2.0-iResolution.xy)/min(iResolution.x,iResolution.y);
-    vec3 camPos=vec3(0.0,1.5,1.0-iTime),camDir=normalize(vec3(0.0,0.0,-1.0));
-    vec3 camUp=normalize(vec3(0.0,1.0,0.0)),camSide=cross(camDir,camUp);
-    vec3 dir=normalize(camSide*uv.x+camUp*uv.y+camDir*1.8),ray=camPos;
-    int march=0;float d=0.0,rLen=0.0,total_d=0.0;
-    const int MAX_MARCH=100;const float MAX_DIST=100.0;
-    for(int i=0;i<MAX_MARCH;++i){{
-        d=_vmap(ray);march=i;total_d+=d;
-        if(d<0.001)break;
-        if(total_d>MAX_DIST){{total_d=MAX_DIST;march=MAX_MARCH-1;break;}}
-        rLen+=min(min(min((step(0.0,dir.x)-fract(ray.x))/dir.x,(step(0.0,dir.y)-fract(ray.y))/dir.y)+0.01,
-                      (step(0.0,dir.z)-fract(ray.z))/dir.z)+0.01,d);
-        ray=camPos+dir*rLen;}}
-    float fog=min(1.0,(1.0/float(MAX_MARCH))*float(march));
-    vec3 fog2=vec3(1.0)*total_d*0.01;
-    vec3 raycol=vec3(0.05,0.5,2.0)*fog+fog2*vec3(0.0,0.5,0.1);
-    vec3 starscol=vec3(0.0);
-    for(float i=0.0;i<=1.0;i+=0.25){{
-        float depth=fract(i+iTime*0.2),scale=mix(20.0,0.5,depth);
-        float fade=depth*smoothstep(1.0,0.9,depth);
-        starscol+=vec3(_starLayer(uv*scale+i*432.0,1.0)*fade);
-        fade=depth*smoothstep(0.85,0.6,depth);
-        starscol+=vec3(_shootstar(uv*scale+i*321.0,1.0,uv)*fade);}}
-    starscol*=abs(uv.y*0.5)*vec3(0.5,0.5,1.0);
-    return mix(raycol,starscol,clamp(fog2*1.5,0.0,1.0))*fog;}}
-// ============================================================
+// === Zuvuya Visualizer (c) 2026 Orblivius ===
+#define FFT_N 256
+float _vrand(vec2 s){{return fract(sin(dot(s,vec2(12.9898,78.233)))*43758.5453);}}
+float _vpow(float s,float x){{return s-(s-s*s)*(-x);}}
+float _vstar(vec2 uv,float fl){{float d=length(uv),m=.05/d;m+=m*fl;m*=smoothstep(.85,.2,d);return m;}}
+float _vsl(vec2 uv){{vec2 gv=fract(uv)-.5,id=floor(uv);float c=0.;
+    for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){{vec2 o=vec2(x,y);float n=_vrand(id+o),sz=fract(n*345.32);
+    c+=_vstar(gv-o-vec2(n,fract(n*34.))+.5,smoothstep(.9,1.,sz)*6.)*(sin(iTime*2.+n*13.256)*.5+.5)*sz;}}return c;}}
+float _vboxinf(vec2 p){{vec2 q=abs(p);return max(q.x+.5,q.y)-1.;}}
+float _vbox(vec3 p,vec3 b){{vec3 q=abs(p)-b;return length(max(q,0.))+min(max(q.y,max(q.x,q.z)),0.);}}
+float _vmap(vec3 p){{vec3 q=p;q.xz=mod(q.xz,1.)-.5;float h=abs(_vrand(floor(p.xz)+_vrand(floor(p.xz))));
+    float id=floor(_vpow(abs(p.x*.1),-1.));return min(_vboxinf(p.xy),_vbox(q,vec3(.15,1.7*h+id,.15)));}}
+vec3 _vhsv(vec3 c){{vec4 K=vec4(1.,2./3.,1./3.,3.);vec3 p=abs(fract(c.xxx+K.xyz)*6.-K.www);
+    return c.z*mix(K.xxx,clamp(p-K.xxx,0.,1.),c.y);}}
+vec3 _visBG(vec2 fc){{
+    vec2 uv=(fc*2.-iResolution.xy)/min(iResolution.x,iResolution.y);
+    vec3 ray=vec3(0.,1.5,1.-iTime),dir=normalize(cross(vec3(0.,0.,-1.),vec3(0.,1.,0.))*uv.x+
+             vec3(0.,1.,0.)*uv.y+vec3(0.,0.,-1.)*1.8);
+    int march=0;float rLen=0.,tot=0.;
+    for(int i=0;i<38;++i){{float d=_vmap(ray);march=i;tot+=d;if(d<.001||tot>60.)break;
+        rLen+=min(min(min((step(0.,dir.x)-fract(ray.x))/dir.x,(step(0.,dir.y)-fract(ray.y))/dir.y)+.01,
+                      (step(0.,dir.z)-fract(ray.z))/dir.z)+.01,d);ray=vec3(0.,1.5,1.-iTime)+dir*rLen;}}
+    float fog=float(march)/108.;vec3 fog2=vec3(tot*.01);
+    vec3 city=vec3(.05,.5,2.)*fog+fog2*vec3(0.,.5,.1),stars=vec3(0.);
+    for(float i=0.;i<=1.;i+=.25){{float depth=fract(i+iTime*.2),sc=mix(20.,.5,depth);
+        float fade=depth*smoothstep(1.,.9,depth);
+        stars+=vec3(_vsl(uv*sc+i*432.)*fade);}}
+    stars*=abs(uv.y*.5)*vec3(.5,.5,1.);
+    return mix(city,stars,clamp(fog2*1.5,0.,1.))*fog;}}
+vec3 _visCurtain(vec2 s,float a0,float a1,float a2,float a3){{
+    float chA[4];chA[0]=a0;chA[1]=a1;chA[2]=a2;chA[3]=a3;
+    float per=2./max(abs(s.y),.12);vec3 col=vec3(0.);
+    for(float z=0.;z<1.;z+=.1){{
+        int ch=int(z*4.)%NUM_CHANNELS;
+        float wm=chA[ch]*abs(sin(z*9.42+iTime*2.1+float(ch)*1.57));
+        vec2 p=vec2(s.x*(1.+z),s.y+(1.+z))*per;p.y+=2.8*iTime;
+        p.x+=cos(z/.06)+wm*sin(p.y*3.14159*3.)*z*2.;p.y+=wm*2.*z;
+        float w=p.x,l=sin(p.y*.5+z/.08+3.4*iTime);
+        float heat=clamp(wm*2.,0.,1.);
+        float intensity=exp(min(l,-l/mix(.3,.05,heat)/(1.+4.*w*w)));
+        vec3 tint=_vhsv(vec3(float(ch)*.25+.05,mix(.6,1.,heat),mix(.5,1.4,heat)));
+        tint+=vec3(.15,0.,.25)*smoothstep(.3,.7,sin(z*30.+iTime*.7))*(1.-heat);
+        col+=intensity*tint/(abs(w)+.01*per)*per;}}
+    return tanh(col*col/2e3);}}
+
 void mainImage(out vec4 O, vec2 C) {{
-    vec2 fp = vec2(C.x, iResolution.y - C.y); // y from TOP
+    vec2 fp = vec2(C.x, iResolution.y - C.y);
 
     const vec3 BG     = vec3(0.00,0.00,0.08);
     const vec3 CYAN   = vec3(0.20,0.90,1.00);
@@ -2786,51 +2816,18 @@ void mainImage(out vec4 O, vec2 C) {{
     const vec3 TC3    = vec3(1.00,0.55,0.10);
 
     const float CH=28., CW=25., ML=10.;
-
-    // ── Loading screen ───────────────────────────────────────────────────────
-    // Show a progress bar for the first LOADING_FRAMES frames.
-    // Each frame we "touch" a slice of pattern+sample data so the GPU
-    // actually initialises the arrays. Once done, normal display begins.
     const int LOADING_FRAMES = 16;
 
-    // ── Zuvuya backdrop 1:1 ───────────────────────────────────────────────────
-    vec2 _s = (C*2.0-iResolution.xy)/iResolution.y;
-    float _tilt=radians(-45.0),_ct=cos(_tilt),_st=sin(_tilt);
-    _s=vec2(_s.x*_ct-_s.y*_st,_s.x*_st+_s.y*_ct);
-    _s=vec2(_s.x*_ct-_s.y*_st,_s.x*_st+_s.y*_ct);
-    vec2 _sv=_s;
-    float _mirrorAngle=radians(0.0);
-    float _ang=atan(_sv.y,_sv.x);
-    if(abs(_ang)>_mirrorAngle){{float _r=length(_sv);float _folded=sign(_ang)*2.0*_mirrorAngle-_ang;_sv=vec2(cos(_folded),sin(_folded))*_r;}}
-    _s=_sv;
-    float _per=2.0/max(abs(_s.y),0.08);  // 0.08 matches original — caps _per at 25, prevents wave aliasing near center
-    vec3 _vis=vec3(0.0);
-    for(float z=0.0;z<1.0;z+=0.05){{
-        float _d=1.0+z;
-        vec2 _p=vec2(_s.x*_d,_s.y+_d)*_per;
-        _p.y+=_SCROLL*iTime;
-        // waveMem: Zuvuya scroll memory in Buffer A rows 70-133 (.a channel)
-        // x = z mapped to full screen width (same as original freqX = int(z*res.x))
-        // y = scrolling history row (same as original historyRow logic)
-        int _freqX   = clamp(int(z * float(int(iResolution.x))), 0, int(iResolution.x)-1);
-        int _rowOff  = (WAVE_ROWS-1) - clamp(int(fract(_p.y * 0.1) * float(WAVE_ROWS)), 0, WAVE_ROWS-1);
-        int _waveRow = WAVE_BASE + _rowOff;
-        float waveMem=(iChannelResolution[1].x>1.0)
-            ? texelFetch(iChannel1,ivec2(_freqX,_waveRow),0).a
-            : 0.3;
-        float _shift=cos(z/0.06),_side=sin(_p.y*_PI*3.0);
-        _p.x+=_shift+waveMem*_side*z*2.0;
-        _p.y+=waveMem*2.0*z;
-        float _w=_p.x,_l=sin(_p.y*0.5+z/0.08+_SPEED*_d*iTime);
-        float heat=clamp((waveMem-0.5)*2.0,0.0,1.0);
-        float thickness=mix(0.3,0.05,heat);
-        float intensity=exp(min(_l,-_l/thickness/(1.0+4.0*_w*_w)));
-        float hue=mix(0.62,0.0,heat) + z*0.20,sat=mix(0.75,1.0,heat),val=mix(0.6,1.5,heat);
-        vec3 tint=_hsv2rgb(vec3(hue,sat,val));
-        tint+=vec3(0.15,0.0,0.25)*smoothstep(0.3,0.7,sin(z*30.0+iTime*0.7))*(1.0-heat);
-        _vis+=intensity*tint/(abs(_w)+0.01*_per)*_per;}}
-    _vis=tanh(_vis/4e1);
-    vec3 col=_vis*_vis+_mainScene(C);
+    // ── Per-channel amplitudes → Zuvuya curtain ───────────────────────────
+    float _tps=float(BPM)*2./5., _rt=float(SPEED)/_tps;
+    Position _pos=getPosition(iTime);
+    float _a0=abs(getChannelOutput(0,iTime,_pos,_rt));
+    float _a1=abs(getChannelOutput(1,iTime,_pos,_rt));
+    float _a2=abs(getChannelOutput(2,iTime,_pos,_rt));
+    float _a3=abs(getChannelOutput(3,iTime,_pos,_rt));
+    vec2 _uv=(C*2.-iResolution.xy)/iResolution.y;
+    vec3 col = _visCurtain(vec2(_uv.y,abs(_uv.x)),_a0,_a1,_a2,_a3) + _visBG(C);
+
     if (iFrame < LOADING_FRAMES) {{
         vec2 res = iResolution.xy;
         float prog = float(iFrame) / float(LOADING_FRAMES - 1);
@@ -2839,7 +2836,7 @@ void mainImage(out vec4 O, vec2 C) {{
 
         // Header
         col += CYAN   * printHdr   (pUV(fp, ML, 6., CH));
-        col += WHITE  * printCredit(pUV(fp, res.x - ML - 16.*CW*0.75, 6., CH*0.75));
+        col += WHITE  * printCredit(pUV(fp, res.x - ML - 250., 6., CH*0.75));
         col += YELLOW * printTitle (pUV(fp, ML, CH+9., CH));
 
         // "LOADING..." label
@@ -2868,7 +2865,7 @@ void mainImage(out vec4 O, vec2 C) {{
     // Accumulate tracker UI into separate buffer so it overlays pure (no curtain tint)
     vec3 trk = vec3(0.0);
     trk += CYAN   * printHdr   (pUV(fp, ML,  6., CH));
-    trk += WHITE  * printCredit(pUV(fp, iResolution.x - ML - 16.*CW*0.75, 6., CH*0.75));
+    trk += WHITE  * printCredit(pUV(fp, iResolution.x - ML - 250., 6., CH*0.75));
     trk += YELLOW * printTitle (pUV(fp, ML, CH+9., CH));
     trk += DIM    * hline(fp, CH*2.+13., ML, iResolution.x-ML);
 
@@ -2915,24 +2912,39 @@ void mainImage(out vec4 O, vec2 C) {{
     float tTop = ty+CH+3.;
     float tBot = tTop+float(2*HVR+1)*CH;
 
-    // Current-row highlight bar (full width)
-    float curY = tTop+float(HVR)*CH;
-    if(fp.y>=curY && fp.y<curY+CH)
-        col *= 0.35;  // darken background, keep Zuvuya colors showing through
+    // Page mode: show a fixed page of rows, frame moves line by line within it
+    // Page flips when frame hits bottom → jumps to top of next page
+    int pageSize = 2*HVR+1;                             // e.g. 9 rows visible
+    int pageStart = (pos.row / pageSize) * pageSize;    // first row of current page
+    int frameRow  = pos.row - pageStart;                // frame position within page (0..pageSize-1)
+
+    // ── Tracker background: highlight row = solid blue (inset 2px), others = zebra ─
+    float _inset = 2.0;
+    float _hX0 = ML - _inset;
+    float _hX1 = iResolution.x - ML + _inset;
+    if(fp.y>=tTop && fp.y<tBot) {{
+        int ri_z = int((fp.y-tTop)/CH);
+        float _rowY0 = tTop + float(ri_z)*CH + _inset;
+        float _rowY1 = tTop + float(ri_z+1)*CH - _inset;
+        if(ri_z == frameRow && fp.y>=_rowY0 && fp.y<_rowY1 && fp.x>=_hX0 && fp.x<_hX1) {{
+            col = vec3(0.12, 0.38, 0.72);            // solid blue inset highlight
+        }} else if((ri_z & 1) == 0) {{
+            col = mix(col, vec3(0.0), 0.38);         // zebra darker rows
+        }}
+    }}
 
     if(fp.y>=tTop && fp.y<tBot) {{
         int ri_abs=int((fp.y-tTop)/CH);
-        int ri=ri_abs-HVR;
+        int ri=ri_abs - frameRow;
 
-        // Row number
+        // Row number — digits tightened together (CW*0.75 spacing)
         {{
-            int rn=pos.row+ri;
+            int rn = pageStart + ri_abs;
             if(rn<0)   rn+=64;
             if(rn>=64) rn-=64;
-            // Highlight every 4th row
             bool on4 = (rn%4)==0;
-            vec3 rnc = ri==0 ? WHITE : (on4 ? YELLOW*0.7 : RED*0.7);
-            trk += rnc * drawNum(rn, 2, ML+rNW-CW*.5, tTop+float(ri_abs)*CH, CW,CH,fp);
+            vec3 rnc = ri_abs==frameRow ? WHITE : (on4 ? YELLOW*0.7 : RED*0.7);
+            trk += rnc * drawNum(rn, 2, ML+rNW-CW*1.2, tTop+float(ri_abs)*CH, CW*0.75,CH,fp);
         }}
 
         // Per-track note data
@@ -2941,8 +2953,8 @@ void mainImage(out vec4 O, vec2 C) {{
             int tc =int(xInT/TW);
             int ci =int((xInT-float(tc)*TW)/CW);
             if(ci<9) {{
-                int rn=pos.row+ri;
-                int sp=pos.songPos;
+                int rn = pageStart + ri_abs;
+                int sp = pos.songPos;
                 if(rn<0)  {{ rn+=64; sp=max(0,sp-1); }}
                 if(rn>=64){{ rn-=64; sp=min(SONG_LENGTH-1,sp+1); }}
                 Note n=getNote(sp,rn,tc);
@@ -2963,8 +2975,7 @@ void mainImage(out vec4 O, vec2 C) {{
     }}
     trk += DIM*hline(fp, tBot+3., ML, iResolution.x-ML);
 
-    // ── Composite tracker over background without tint ─────────────────────
-    col = mix(col, vec3(0.0), clamp(dot(trk, vec3(0.299,0.587,0.114))*2.5, 0.0, 0.85));
+    // ── Composite: text always on top at full color ────────────────────────
     col += trk;
 
     // ============ OSCILLOSCOPE ============
@@ -3119,20 +3130,23 @@ void mainImage(out vec4 O, vec2 C) {{
     # Setup: Buffer A iChannel0 = Buffer A (self-ref)
     #        Image   iChannel1 = Buffer A output
     buffer_a_glsl = f"""/* ============================================================================
-   ProTracker MOD Player v1.1 (c) 2026 Orblivius
-   New: 3D Surround, FAT Bass, and cubic resampling
+   GLSL MOD Player v1.2 (c) 2026 Orblivius
+   New: VQ sample compression, 3D Surround, FAT Bass, and cubic resampling
+   Contact: subband@gmail.com or
+            subband@protonmail.com
+   GIT:     https://github.com/mewza/mod2glsl
    BUFFER A TAB
    Row 0      : FFT_N mixed audio samples      (getChannelOutput sum, per px)
    Row 1      : FFT_N/2 DFT magnitudes         (phasor-rotation DFT)
    Row 2      : UI state px0=specMode px1=prevMouse
-   Rows 3–66  : Per-channel oscilloscope history  (4 px wide, one per channel)
+   Rows 3-66  : Per-channel oscilloscope history  (4 px wide, one per channel)
                 Row 3 = newest frame, rows scroll downward each frame.
                 waveMem for Zuvuya curtain reads from here via Image iChannel1.
    ShaderToy setup:
-     Buffer A → iChannel0 = Buffer A  (self-reference)
-      Buffer A → iChannel1 = Sound tab output  (audio waveform for Zuvuya)
-     Image    → iChannel1 = Buffer A
-============================================================================ */
+     Buffer A -> iChannel0 = Buffer A  (self-reference)
+     Buffer A -> iChannel1 = Sound tab output  (audio waveform for Zuvuya)
+     Image    -> iChannel1 = Buffer A
+   ============================================================================ */
 
 #define FFT_N     256
 #define FFT_SR    8192.0
@@ -3200,21 +3214,22 @@ void mainImage(out vec4 O, vec2 C) {{
         }}
 
     }} else if (py == WAVE_BASE) {{
-        // ── Row 70: newest waveform row ──────────────────────────────────────
-        // TODO: once you connect Buffer A iChannel1 = Sound tab in ShaderToy,
-        // replace this with: snd = texture(iChannel1, vec2(mu*0.5, 0)).r * 1.5
+        // ── Row 70: newest row — RAW BIPOLAR audio, no abs, no envelope ──────
+        // Different x-columns sample different audio phases via mu*0.5 time offset.
+        // Positive phase → waveMem near 1.0 (hot), negative → 0.0 (cold blue).
+        // This is what makes z-bands independent: each band samples a different
+        // audio phase, giving genuinely different waveMem → different displacement.
         float u  = float(px) / float(iResolution.x);
         float mu = 1.0 - abs(u * 2.0 - 1.0);
-        float t  = iTime - mu * 0.5;  // 500ms window: z=0→current, z=0.5→250ms ago, z=0.95→475ms ago
+        float t  = iTime - mu * 0.5;
         float ticksPerSec = float(BPM) * 2.0 / 5.0;
         float rowTime = float(SPEED) / ticksPerSec;
         Position pos = getPosition(t);
         float s = 0.0;
         for (int ch = 0; ch < NUM_CHANNELS; ch++)
-            s = max(s, abs(getChannelOutput(ch, t, pos, rowTime)));
-        float fresh = clamp(s * 2.0, 0.0, 1.0);
-        float prev = texelFetch(iChannel0, ivec2(px, WAVE_BASE), 0).a;
-        O = vec4(0.0, 0.0, 0.0, max(fresh, prev * 0.88));
+            s += getChannelOutput(ch, t, pos, rowTime);
+        s /= float(NUM_CHANNELS);
+        O = vec4(0.0, 0.0, 0.0, clamp(s * 1.5 + 0.5, 0.0, 1.0));
 
     }} else if (py > WAVE_BASE && py < WAVE_BASE + WAVE_ROWS) {{
         // ── Rows 71-133: scroll — copy row above (one frame younger) ────────
@@ -3255,6 +3270,791 @@ void mainImage(out vec4 O, vec2 C) {{
     print()
     print(f"   🖱️  Click anywhere to toggle oscilloscope ↔ spectrum view")
 
+
+# Embedded VQ encoder (base64-encoded to avoid string escaping issues).
+# Contains vq_encoder_v2 + getchanneloutput.glsl bundled — no external files needed.
+_VQ_ENCODER_B64 = (
+    "IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiIKTU9EIOKGkiBTaGFkZXJUb3kgQ29tbW9uIHRhYiBlbmNv"
+    "ZGVyIHdpdGg6CiAgLSBQYXR0ZXJuIGNydW5jaDogYml0bWFwICsgZGljdGlvbmFyeSArIG5pYmJsZS1w"
+    "YWNrZWQgcm93IHNlZWsKICAtIFNhbXBsZSBjcnVuY2g6IDMtYml0IGxpbmVhciBwYWNrZWQgKHVuaWZv"
+    "cm0gbm9pc2UgZmxvb3Ig4oCUIHN0YWJsZSBhY3Jvc3MgYWxsIHBsYXliYWNrIHBpdGNoZXMpClRhcmdl"
+    "dDog4omkIDY0IEtCIHRvdGFsIHByaXZhdGUgY29uc3QgZGF0YSAoTWFjIEFOR0xFL01ldGFsIHNhZmUg"
+    "em9uZSkKIiIiCmltcG9ydCBzdHJ1Y3QsIHN5cywgb3MKCmNsYXNzIE1PREZpbGU6CiAgICBkZWYgX19p"
+    "bml0X18oc2VsZiwgcGF0aCk6CiAgICAgICAgd2l0aCBvcGVuKHBhdGgsICdyYicpIGFzIGY6CiAgICAg"
+    "ICAgICAgIHNlbGYuZGF0YSA9IGYucmVhZCgpCiAgICAgICAgc2VsZi5wYXJzZSgpCgogICAgZGVmIHBh"
+    "cnNlKHNlbGYpOgogICAgICAgIGQgPSBzZWxmLmRhdGEKICAgICAgICBzZWxmLnRpdGxlID0gZFswOjIw"
+    "XS5yc3RyaXAoYidceDAwJykuZGVjb2RlKCdsYXRpbjEnLCAncmVwbGFjZScpCiAgICAgICAgc2VsZi5z"
+    "YW1wbGVzX2luZm8gPSBbXQogICAgICAgIGZvciBpIGluIHJhbmdlKDMxKToKICAgICAgICAgICAgYmFz"
+    "ZSA9IDIwICsgaSozMAogICAgICAgICAgICBuYW1lID0gZFtiYXNlOmJhc2UrMjJdLnJzdHJpcChiJ1x4"
+    "MDAnKS5kZWNvZGUoJ2xhdGluMScsICdyZXBsYWNlJykKICAgICAgICAgICAgbGVuZ3RoX3cgICAgID0g"
+    "c3RydWN0LnVucGFjaygnPkgnLCBkW2Jhc2UrMjI6YmFzZSsyNF0pWzBdCiAgICAgICAgICAgIGZpbmV0"
+    "dW5lICAgICA9IGRbYmFzZSsyNF0gJiAweDBGCiAgICAgICAgICAgIHZvbHVtZSAgICAgICA9IGRbYmFz"
+    "ZSsyNV0KICAgICAgICAgICAgbG9vcF9zdGFydF93ID0gc3RydWN0LnVucGFjaygnPkgnLCBkW2Jhc2Ur"
+    "MjY6YmFzZSsyOF0pWzBdCiAgICAgICAgICAgIGxvb3BfbGVuX3cgICA9IHN0cnVjdC51bnBhY2soJz5I"
+    "JywgZFtiYXNlKzI4OmJhc2UrMzBdKVswXQogICAgICAgICAgICBzZWxmLnNhbXBsZXNfaW5mby5hcHBl"
+    "bmQoZGljdCgKICAgICAgICAgICAgICAgIG5hbWU9bmFtZSwgbGVuZ3RoPWxlbmd0aF93KjIsIGZpbmV0"
+    "dW5lPWZpbmV0dW5lLAogICAgICAgICAgICAgICAgdm9sdW1lPXZvbHVtZSwgbG9vcF9zdGFydD1sb29w"
+    "X3N0YXJ0X3cqMiwgbG9vcF9sZW49bG9vcF9sZW5fdyoyKSkKICAgICAgICBzZWxmLnNvbmdfbGVuZ3Ro"
+    "ID0gZFs5NTBdCiAgICAgICAgc2VsZi5wYXR0ZXJuX29yZGVyID0gbGlzdChkWzk1Mjo5NTIrMTI4XSkK"
+    "ICAgICAgICBzZWxmLm1hZ2ljID0gZFsxMDgwOjEwODRdCiAgICAgICAgc2VsZi5udW1fcGF0dGVybnMg"
+    "PSBtYXgoc2VsZi5wYXR0ZXJuX29yZGVyWzpzZWxmLnNvbmdfbGVuZ3RoXSkgKyAxCiAgICAgICAgIyBQ"
+    "YXR0ZXJucwogICAgICAgIHNlbGYucGF0dGVybnMgPSBbXQogICAgICAgIG9mZiA9IDEwODQKICAgICAg"
+    "ICBmb3IgcCBpbiByYW5nZShzZWxmLm51bV9wYXR0ZXJucyk6CiAgICAgICAgICAgIHNlbGYucGF0dGVy"
+    "bnMuYXBwZW5kKGRbb2ZmOm9mZisxMDI0XSkKICAgICAgICAgICAgb2ZmICs9IDEwMjQKICAgICAgICAj"
+    "IFNhbXBsZXMgKHJhdyBzaWduZWQgOC1iaXQgYnl0ZXMpCiAgICAgICAgc2VsZi5zYW1wbGVfYnl0ZXMg"
+    "PSBbXQogICAgICAgIGZvciBzIGluIHNlbGYuc2FtcGxlc19pbmZvOgogICAgICAgICAgICBzZWxmLnNh"
+    "bXBsZV9ieXRlcy5hcHBlbmQoZFtvZmY6b2ZmK3NbJ2xlbmd0aCddXSkKICAgICAgICAgICAgb2ZmICs9"
+    "IHNbJ2xlbmd0aCddCgojIOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKV"
+    "kOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKV"
+    "kOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKV"
+    "kOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkAojIFBBVFRF"
+    "Uk4gQ1JVTkNIOiBiaXRtYXAgKyBkaWN0ICsgbmliYmxlLXNlZWsKIyDilZDilZDilZDilZDilZDilZDi"
+    "lZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDi"
+    "lZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDi"
+    "lZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDi"
+    "lZDilZDilZDilZDilZDilZAKCkVNUFRZX05PVEUgPSBiJ1x4MDBceDAwXHgwMFx4MDAnCgpkZWYgZW5j"
+    "b2RlX3BhdHRlcm5zKG1vZCk6CiAgICAiIiJSZXR1cm5zIGRpY3Qgb2YgYWxsIHBhdHRlcm4gZGF0YSBz"
+    "dHJ1Y3R1cmVzLiIiIgogICAgIyBCdWlsZCBmbGF0IGxpc3Qgb2YgNC1ieXRlIG5vdGVzIGluIG9yZGVy"
+    "OiBwYXQgMC4uTi0xLCByb3cgMC4uNjMsIGNoIDAuLjMKICAgIG5vdGVzID0gW10KICAgIGZvciBwYXQg"
+    "aW4gcmFuZ2UobW9kLm51bV9wYXR0ZXJucyk6CiAgICAgICAgcGRhdGEgPSBtb2QucGF0dGVybnNbcGF0"
+    "XQogICAgICAgIGZvciByb3cgaW4gcmFuZ2UoNjQpOgogICAgICAgICAgICBmb3IgY2ggaW4gcmFuZ2Uo"
+    "NCk6CiAgICAgICAgICAgICAgICBiYXNlID0gcm93KjE2ICsgY2gqNAogICAgICAgICAgICAgICAgbm90"
+    "ZXMuYXBwZW5kKHBkYXRhW2Jhc2U6YmFzZSs0XSkKICAgIHRvdGFsX25vdGVzID0gbGVuKG5vdGVzKQog"
+    "ICAgbnVtX3Jvd3MgICAgPSBtb2QubnVtX3BhdHRlcm5zICogNjQKCiAgICAjIFVuaXF1ZSBub24tZW1w"
+    "dHkgbm90ZXMg4oaSIGRpY3Rpb25hcnkKICAgIHVuaXEgPSBzb3J0ZWQoc2V0KG4gZm9yIG4gaW4gbm90"
+    "ZXMgaWYgbiAhPSBFTVBUWV9OT1RFKSkKICAgIGlkeF9ieXRlcyA9IDEgaWYgbGVuKHVuaXEpIDw9IDI1"
+    "NiBlbHNlIDIKICAgIGFzc2VydCBsZW4odW5pcSkgPD0gNjU1MzYsIGYidG9vIG1hbnkgdW5pcXVlIG5v"
+    "dGVzOiB7bGVuKHVuaXEpfSIKICAgIG5vdGVfdG9faWR4ID0ge246aSBmb3IgaSxuIGluIGVudW1lcmF0"
+    "ZSh1bmlxKX0KCiAgICAjIEJpdG1hcCAoMSBiaXQgcGVyIG5vdGUsIExTQi1maXJzdCB3aXRoaW4gZWFj"
+    "aCBieXRlKQogICAgYml0bWFwID0gYnl0ZWFycmF5KCh0b3RhbF9ub3RlcyArIDcpIC8vIDgpCiAgICBm"
+    "b3IgaSwgbiBpbiBlbnVtZXJhdGUobm90ZXMpOgogICAgICAgIGlmIG4gIT0gRU1QVFlfTk9URToKICAg"
+    "ICAgICAgICAgYml0bWFwW2kgPj4gM10gfD0gMSA8PCAoaSAmIDcpCgogICAgIyBJbmRleCBzdHJlYW0g"
+    "KDEgb3IgMiBieXRlcyBwZXIgbm9uLWVtcHR5IG5vdGUsIGxpdHRsZS1lbmRpYW4gaWYgMkIpCiAgICBp"
+    "ZHhfc3RyZWFtID0gYnl0ZWFycmF5KCkKICAgIGZvciBuIGluIG5vdGVzOgogICAgICAgIGlmIG4gIT0g"
+    "RU1QVFlfTk9URToKICAgICAgICAgICAgaSA9IG5vdGVfdG9faWR4W25dCiAgICAgICAgICAgIGlmIGlk"
+    "eF9ieXRlcyA9PSAxOgogICAgICAgICAgICAgICAgaWR4X3N0cmVhbS5hcHBlbmQoaSkKICAgICAgICAg"
+    "ICAgZWxzZToKICAgICAgICAgICAgICAgIGlkeF9zdHJlYW0uYXBwZW5kKGkgJiAweEZGKQogICAgICAg"
+    "ICAgICAgICAgaWR4X3N0cmVhbS5hcHBlbmQoKGkgPj4gOCkgJiAweEZGKQoKICAgICMgUGVyLXJvdyBj"
+    "b3VudDogY291bnQgb2Ygbm9uLWVtcHR5IG5vdGVzIElOIHRoaXMgcm93ICgwLi40KS4KICAgIHBlcl9y"
+    "b3dfY291bnQgPSBbXQogICAgZm9yIHJvdyBpbiByYW5nZShudW1fcm93cyk6CiAgICAgICAgY291bnQg"
+    "PSBzdW0oMSBmb3IgY2ggaW4gcmFuZ2UoNCkgaWYgbm90ZXNbcm93KjQgKyBjaF0gIT0gRU1QVFlfTk9U"
+    "RSkKICAgICAgICBwZXJfcm93X2NvdW50LmFwcGVuZChjb3VudCkKCiAgICAjIFByZWZpeCBzdW06IHBy"
+    "ZWZpeFtyb3ddID0gbm9uLWVtcHR5IGNvdW50IGluIHJvd3MgWzAsIHJvdykgPSByYW5rIGF0IHN0YXJ0"
+    "IG9mIHJvdy4KICAgICMgU3RvcmVkIGFzIDE2LWJpdCBMRSB3b3JkcyBzbyBkZWNvZGVyIGlzIE8oMSku"
+    "CiAgICAjIFJhbmdlOiAwIHRvIH50b3RhbF9ub25fZW1wdHkgKOKJpCA1ODg4IGZvciAyMy1wYXQgTU9E"
+    "KSDihpIgZml0cyBlYXNpbHkgaW4gMTYgYml0cy4KICAgIHByZWZpeCA9IFswXSAqIG51bV9yb3dzCiAg"
+    "ICBydW5uaW5nID0gMAogICAgZm9yIHJvdyBpbiByYW5nZShudW1fcm93cyk6CiAgICAgICAgcHJlZml4"
+    "W3Jvd10gPSBydW5uaW5nCiAgICAgICAgcnVubmluZyArPSBwZXJfcm93X2NvdW50W3Jvd10KCiAgICBy"
+    "b3dfc2Vla19ieXRlcyA9IGJ5dGVhcnJheSgpCiAgICBmb3IgdiBpbiBwcmVmaXg6CiAgICAgICAgYXNz"
+    "ZXJ0IDAgPD0gdiA8IDY1NTM2LCBmInByZWZpeCB7dn0gb3ZlcmZsb3dzIDE2IGJpdHMiCiAgICAgICAg"
+    "cm93X3NlZWtfYnl0ZXMuYXBwZW5kKHYgJiAweEZGKQogICAgICAgIHJvd19zZWVrX2J5dGVzLmFwcGVu"
+    "ZCgodiA+PiA4KSAmIDB4RkYpCgogICAgcmV0dXJuIGRpY3QoCiAgICAgICAgdG90YWxfbm90ZXM9dG90"
+    "YWxfbm90ZXMsIG51bV9yb3dzPW51bV9yb3dzLAogICAgICAgIHVuaXE9dW5pcSwgbm90ZV90b19pZHg9"
+    "bm90ZV90b19pZHgsIGlkeF9ieXRlcz1pZHhfYnl0ZXMsCiAgICAgICAgYml0bWFwPWJpdG1hcCwgaWR4"
+    "X3N0cmVhbT1pZHhfc3RyZWFtLAogICAgICAgIHJvd19zZWVrX2J5dGVzPXJvd19zZWVrX2J5dGVzLCBw"
+    "cmVmaXg9cHJlZml4LAogICAgKQoKIyDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDi"
+    "lZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDi"
+    "lZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDi"
+    "lZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZAK"
+    "IyAzLUJJVCBMSU5FQVIgU0FNUExFIENSVU5DSAojIOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKV"
+    "kOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKV"
+    "kOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKV"
+    "kOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKV"
+    "kOKVkOKVkAoKZGVmIGVuY29kZV9zYW1wbGVzX3BhY2tlZChtb2QsIGJpdHM9Myk6CiAgICAiIiJDb25j"
+    "YXRlbmF0ZSBhbGwgc2FtcGxlcywgZW5jb2RlIGVhY2ggdG8gYGJpdHNgIGJpdHMgKHJvdW5kZWQpLgog"
+    "ICAgU3VwcG9ydHMgMy1iaXQgYW5kIDQtYml0IGxpbmVhciBxdWFudGl6YXRpb24uCiAgICAgIDMtYml0"
+    "OiBjb2RlIDAuLjcsIGxldmVscyAoY29kZSozMiAtIDExMiksIHN0ZXAgMzIvMjU2ID0gMTIuNSUKICAg"
+    "ICAgNC1iaXQ6IGNvZGUgMC4uMTUsIGxldmVscyAoY29kZSoxNiAtIDEyMCksIHN0ZXAgMTYvMjU2ID0g"
+    "Ni4yNSUgKCs2IGRCIFNOUikKICAgIFJldHVybnMgcGFja2VkIGJ5dGVzICsgcGVyLXNhbXBsZSBzdGFy"
+    "dCBpbmRpY2VzIChsb2dpY2FsIHNhbXBsZSB1bml0cykuIiIiCiAgICBpZiBiaXRzIG5vdCBpbiAoMywg"
+    "NCk6CiAgICAgICAgcmFpc2UgVmFsdWVFcnJvcihmImJpdHMgbXVzdCBiZSAzIG9yIDQsIGdvdCB7Yml0"
+    "c30iKQoKICAgIGNvbmNhdF9zaWduZWQgPSBbXQogICAgc3RhcnRzID0gW10KICAgIGZvciBzIGluIG1v"
+    "ZC5zYW1wbGVfYnl0ZXM6CiAgICAgICAgc3RhcnRzLmFwcGVuZChsZW4oY29uY2F0X3NpZ25lZCkpCiAg"
+    "ICAgICAgZm9yIGIgaW4gczoKICAgICAgICAgICAgY29uY2F0X3NpZ25lZC5hcHBlbmQoYiAtIDI1NiBp"
+    "ZiBiID49IDEyOCBlbHNlIGIpCiAgICAgICAgY29uY2F0X3NpZ25lZC5leHRlbmQoWzBdICogMTYpCgog"
+    "ICAgdG90YWxfc2FtcGxlcyA9IGxlbihjb25jYXRfc2lnbmVkKQogICAgY29kZXMgPSBieXRlYXJyYXko"
+    "KQogICAgbWF4X2NvZGUgPSAoMSA8PCBiaXRzKSAtIDEKICAgIHNoaWZ0ID0gOCAtIGJpdHMKICAgIGZv"
+    "ciBzdiBpbiBjb25jYXRfc2lnbmVkOgogICAgICAgIHVuc2lnbmVkX29mZnNldCA9IHN2ICsgMTI4ICAj"
+    "IFswLCAyNTVdCiAgICAgICAgY29kZSA9IHVuc2lnbmVkX29mZnNldCA+PiBzaGlmdAogICAgICAgIGlm"
+    "IGNvZGUgPiBtYXhfY29kZTogY29kZSA9IG1heF9jb2RlCiAgICAgICAgY29kZXMuYXBwZW5kKGNvZGUp"
+    "CgogICAgdG90YWxfYml0cyA9IHRvdGFsX3NhbXBsZXMgKiBiaXRzCiAgICB0b3RhbF9ieXRlcyA9ICh0"
+    "b3RhbF9iaXRzICsgNykgLy8gOAogICAgcGFja2VkID0gYnl0ZWFycmF5KHRvdGFsX2J5dGVzKQoKICAg"
+    "IGlmIGJpdHMgPT0gNDoKICAgICAgICAjIE5pYmJsZSBwYWNraW5nOiAyIGNvZGVzIHBlciBieXRlLCBs"
+    "b3cgbmliYmxlIGZpcnN0CiAgICAgICAgZm9yIGksIGMgaW4gZW51bWVyYXRlKGNvZGVzKToKICAgICAg"
+    "ICAgICAgYnl0ZV9wb3MgPSBpID4+IDEKICAgICAgICAgICAgaWYgaSAmIDE6CiAgICAgICAgICAgICAg"
+    "ICBwYWNrZWRbYnl0ZV9wb3NdIHw9IChjICYgMHhGKSA8PCA0CiAgICAgICAgICAgIGVsc2U6CiAgICAg"
+    "ICAgICAgICAgICBwYWNrZWRbYnl0ZV9wb3NdIHw9IGMgJiAweEYKICAgIGVsc2U6ICAjIGJpdHMgPT0g"
+    "MwogICAgICAgIGZvciBpLCBjIGluIGVudW1lcmF0ZShjb2Rlcyk6CiAgICAgICAgICAgIGJpdF9wb3Mg"
+    "ICA9IGkgKiAzCiAgICAgICAgICAgIGJ5dGVfcG9zICA9IGJpdF9wb3MgPj4gMwogICAgICAgICAgICBi"
+    "aXRfc2hpZnQgPSBiaXRfcG9zICYgNwogICAgICAgICAgICB2YWwgPSAoYyAmIDcpIDw8IGJpdF9zaGlm"
+    "dAogICAgICAgICAgICBwYWNrZWRbYnl0ZV9wb3NdIHw9IHZhbCAmIDB4RkYKICAgICAgICAgICAgaWYg"
+    "Yml0X3NoaWZ0ID4gNSBhbmQgYnl0ZV9wb3MgKyAxIDwgdG90YWxfYnl0ZXM6CiAgICAgICAgICAgICAg"
+    "ICBwYWNrZWRbYnl0ZV9wb3MgKyAxXSB8PSAodmFsID4+IDgpICYgMHhGRgoKICAgIHJldHVybiBwYWNr"
+    "ZWQsIHN0YXJ0cywgdG90YWxfc2FtcGxlcwoKIyBCYWNrd2FyZC1jb21wYXQgYWxpYXMKZGVmIGVuY29k"
+    "ZV9zYW1wbGVzXzNiaXQobW9kKToKICAgIHJldHVybiBlbmNvZGVfc2FtcGxlc19wYWNrZWQobW9kLCBi"
+    "aXRzPTMpCgoKZGVmIGNvbXB1dGVfcm93X3NwZWVkX3RhYmxlKG1vZCk6CiAgICAiIiJTaW11bGF0ZSB0"
+    "aGUgc29uZyB0byBmaW5kIHBlci1yb3cgU1BFRUQgKGhvbm91cmluZyBGeHggZWZmZWN0cykuCiAgICBS"
+    "ZXR1cm5zIHJvd1NwZWVkW251bV9zb25nX3Jvd3NdIGFuZCByb3dTdGFydFRpY2tbbnVtX3Nvbmdfcm93"
+    "cysxXS4iIiIKICAgIHNwZWVkID0gNiAgIyBQcm9UcmFja2VyIGRlZmF1bHQKICAgIGJwbSAgID0gMTI1"
+    "CiAgICByb3dTcGVlZCA9IFtdCiAgICBicG1fY2hhbmdlcyA9IEZhbHNlCiAgICBmb3IgcG9zIGluIHJh"
+    "bmdlKG1vZC5zb25nX2xlbmd0aCk6CiAgICAgICAgcGF0X2lkeCA9IG1vZC5wYXR0ZXJuX29yZGVyW3Bv"
+    "c10KICAgICAgICBwZGF0YSA9IG1vZC5wYXR0ZXJuc1twYXRfaWR4XQogICAgICAgIGZvciByb3cgaW4g"
+    "cmFuZ2UoNjQpOgogICAgICAgICAgICAjIFNjYW4gYWxsIDQgY2hhbm5lbHMgZm9yIEZ4eCBvbiB0aGlz"
+    "IHJvdyDigJQgYXBwbGllcyBhdCB0aWNrIDAKICAgICAgICAgICAgZm9yIGNoIGluIHJhbmdlKDQpOgog"
+    "ICAgICAgICAgICAgICAgYmFzZSA9IHJvdyAqIDE2ICsgY2ggKiA0CiAgICAgICAgICAgICAgICBiMCwg"
+    "YjEsIGIyLCBiMyA9IHBkYXRhW2Jhc2U6YmFzZSs0XQogICAgICAgICAgICAgICAgZWZmZWN0ID0gYjIg"
+    "JiAweDBGCiAgICAgICAgICAgICAgICBwYXJhbSA9IGIzCiAgICAgICAgICAgICAgICBpZiBlZmZlY3Qg"
+    "PT0gMHhGIGFuZCBwYXJhbSA+IDA6CiAgICAgICAgICAgICAgICAgICAgaWYgcGFyYW0gPCAweDIwOgog"
+    "ICAgICAgICAgICAgICAgICAgICAgICBzcGVlZCA9IHBhcmFtCiAgICAgICAgICAgICAgICAgICAgZWxz"
+    "ZToKICAgICAgICAgICAgICAgICAgICAgICAgaWYgYnBtICE9IHBhcmFtOgogICAgICAgICAgICAgICAg"
+    "ICAgICAgICAgICAgYnBtX2NoYW5nZXMgPSBUcnVlCiAgICAgICAgICAgICAgICAgICAgICAgIGJwbSA9"
+    "IHBhcmFtCiAgICAgICAgICAgIHJvd1NwZWVkLmFwcGVuZChzcGVlZCkKICAgIHJvd1N0YXJ0VGljayA9"
+    "IFswXQogICAgZm9yIHMgaW4gcm93U3BlZWQ6CiAgICAgICAgcm93U3RhcnRUaWNrLmFwcGVuZChyb3dT"
+    "dGFydFRpY2tbLTFdICsgcykKICAgIHJldHVybiByb3dTcGVlZCwgcm93U3RhcnRUaWNrLCBicG1fY2hh"
+    "bmdlcwoKCmRlZiBlbmNvZGVfc2FtcGxlc192cTJkKG1vZCwgSz0yNTYsIHdlaWdodGVkPVRydWUpOgog"
+    "ICAgIiIiMi1zdGFnZSBSZXNpZHVhbCBWUSBlbmNvZGluZyAoUlZRKS4KICAgIFN0YWdlIDE6IEsxPTY0"
+    "ICg2LWJpdCBjb2RlcyksIFN0YWdlIDI6IEsyPTMyICg1LWJpdCBjb2Rlcykgb24gcmVzaWR1YWwuCiAg"
+    "ICBCb3RoIHN0YWdlcyBlbmNvZGUgMi1zYW1wbGUgdmVjdG9ycy4gR0xTTCBkZWNvZGVyOgogICAgICAg"
+    "IHNhbXBsZSA9IGNvZGVib29rMVtjb2RlMV1bbGFuZV0gKyBjb2RlYm9vazJbY29kZTJdW2xhbmVdCiAg"
+    "ICBCaXQgcGFja2luZzogMTEgYml0cyBwZXIgdmVjdG9yICg2KzUpIHBhY2tlZCBMU0ItZmlyc3QuCiAg"
+    "ICBSZXR1cm5zIChjb2Rlc19ieXRlcywgY29kZWJvb2tfYnl0ZXMsIHN0YXJ0cywgdG90YWxfc2FtcGxl"
+    "cywgYml0c19wZXJfY29kZSkuCiAgICBjb2RlYm9va19ieXRlcyBsYXlvdXQ6IFtLMcOXMiBieXRlcyBm"
+    "b3Igc3RhZ2UxXVtLMsOXMiBieXRlcyBmb3Igc3RhZ2UyXQogICAgU05SOiB+MjcuNyBkQiBAIDc5Ljcg"
+    "S0IgICgrNC41IGRCIHZzIFZRIEs9MjU2KQogICAgIiIiCiAgICBpbXBvcnQgbnVtcHkgYXMgbnAKICAg"
+    "IGZyb20gc2tsZWFybi5jbHVzdGVyIGltcG9ydCBNaW5pQmF0Y2hLTWVhbnMKCiAgICBLMSA9IDY0ICAg"
+    "IyBzdGFnZSAxIOKAlCA2LWJpdCBjb2RlcwogICAgSzIgPSAzMiAgICMgc3RhZ2UgMiDigJQgNS1iaXQg"
+    "Y29kZXMKICAgIEJJVFMxID0gNgogICAgQklUUzIgPSA1CiAgICBCSVRTX1RPVEFMID0gQklUUzEgKyBC"
+    "SVRTMiAgIyAxMSBiaXRzIHBlciB2ZWN0b3IKCiAgICBjb25jYXQgPSBbXQogICAgc3RhcnRzID0gW10K"
+    "ICAgIGZvciBzIGluIG1vZC5zYW1wbGVfYnl0ZXM6CiAgICAgICAgc3RhcnRzLmFwcGVuZChsZW4oY29u"
+    "Y2F0KSkKICAgICAgICBmb3IgYiBpbiBzOgogICAgICAgICAgICBjb25jYXQuYXBwZW5kKGIgLSAyNTYg"
+    "aWYgYiA+PSAxMjggZWxzZSBiKQogICAgICAgIHdoaWxlIGxlbihjb25jYXQpICUgMjogY29uY2F0LmFw"
+    "cGVuZCgwKQogICAgICAgIGNvbmNhdC5leHRlbmQoWzBdICogMTYpCiAgICB3aGlsZSBsZW4oY29uY2F0"
+    "KSAlIDI6IGNvbmNhdC5hcHBlbmQoMCkKICAgIHRvdGFsX3NhbXBsZXMgPSBsZW4oY29uY2F0KQoKICAg"
+    "IHZlY3RvcnMgPSBucC5hcnJheShjb25jYXQsIGR0eXBlPW5wLmZsb2F0MzIpLnJlc2hhcGUoLTEsIDIp"
+    "CgogICAgIyBTdGFnZSAxIHdpdGggcmluZy13ZWlnaHRlZCB0cmFpbmluZwogICAgd2VpZ2h0cyA9IE5v"
+    "bmUKICAgIGlmIHdlaWdodGVkOgogICAgICAgIHNsb3BlcyA9IG5wLmFicyh2ZWN0b3JzWzosIDFdIC0g"
+    "dmVjdG9yc1s6LCAwXSkKICAgICAgICB3ZWlnaHRzID0gKHNsb3BlcyArIDEuMCkKICAgICAgICB3ZWln"
+    "aHRzIC89IHdlaWdodHMubWVhbigpCgogICAgcHJpbnQoZiIgIFJWUSBTdGFnZSAxOiBLPXtLMX0gb24g"
+    "e2xlbih2ZWN0b3JzKX0gMi12ZWN0b3JzLi4uIiwgZmx1c2g9VHJ1ZSkKICAgIGttMSA9IE1pbmlCYXRj"
+    "aEtNZWFucyhuX2NsdXN0ZXJzPUsxLCBuX2luaXQ9NSwgbWF4X2l0ZXI9NjAsIGJhdGNoX3NpemU9NDA5"
+    "NiwKICAgICAgICAgICAgICAgICAgICAgICAgICByYW5kb21fc3RhdGU9MCwgcmVhc3NpZ25tZW50X3Jh"
+    "dGlvPTAuMDEpCiAgICBrbTEuZml0KHZlY3RvcnMsIHNhbXBsZV93ZWlnaHQ9d2VpZ2h0cykKICAgIGNv"
+    "ZGVzMSA9IGttMS5wcmVkaWN0KHZlY3RvcnMpLmFzdHlwZShucC5pbnQzMikKICAgIGNiMSAgICA9IG5w"
+    "LmNsaXAobnAucm91bmQoa20xLmNsdXN0ZXJfY2VudGVyc18pLCAtMTI4LCAxMjcpLmFzdHlwZShucC5p"
+    "bnQzMikKICAgIHJlc2lkdWFsID0gdmVjdG9ycyAtIGttMS5jbHVzdGVyX2NlbnRlcnNfW2NvZGVzMV0K"
+    "CiAgICBzbnIxID0gMTAqbnAubG9nMTAobnAubWVhbih2ZWN0b3JzKioyKSAvIChucC5tZWFuKHJlc2lk"
+    "dWFsKioyKSArIDFlLTkpKQogICAgcHJpbnQoZiIgIFN0YWdlIDEgU05SOiB7c25yMTouMmZ9IGRCIiwg"
+    "Zmx1c2g9VHJ1ZSkKCiAgICAjIFN0YWdlIDIgb24gcmVzaWR1YWwgKG5vIHdlaWdodGluZykKICAgIHBy"
+    "aW50KGYiICBSVlEgU3RhZ2UgMjogSz17SzJ9IG9uIHJlc2lkdWFsLi4uIiwgZmx1c2g9VHJ1ZSkKICAg"
+    "IGttMiA9IE1pbmlCYXRjaEtNZWFucyhuX2NsdXN0ZXJzPUsyLCBuX2luaXQ9NSwgbWF4X2l0ZXI9NjAs"
+    "IGJhdGNoX3NpemU9NDA5NiwKICAgICAgICAgICAgICAgICAgICAgICAgICByYW5kb21fc3RhdGU9MSwg"
+    "cmVhc3NpZ25tZW50X3JhdGlvPTAuMDEpCiAgICBrbTIuZml0KHJlc2lkdWFsKQogICAgY29kZXMyID0g"
+    "a20yLnByZWRpY3QocmVzaWR1YWwpLmFzdHlwZShucC5pbnQzMikKICAgIGNiMiAgICA9IG5wLmNsaXAo"
+    "bnAucm91bmQoa20yLmNsdXN0ZXJfY2VudGVyc18pLCAtMTI4LCAxMjcpLmFzdHlwZShucC5pbnQzMikK"
+    "ICAgIGZpbmFsX3Jlc2lkdWFsID0gcmVzaWR1YWwgLSBrbTIuY2x1c3Rlcl9jZW50ZXJzX1tjb2RlczJd"
+    "CgogICAgc25yMiA9IDEwKm5wLmxvZzEwKG5wLm1lYW4odmVjdG9ycyoqMikgLyAobnAubWVhbihmaW5h"
+    "bF9yZXNpZHVhbCoqMikgKyAxZS05KSkKICAgIHByaW50KGYiICBSVlEgdG90YWwgU05SOiB7c25yMjou"
+    "MmZ9IGRCICgre3NucjItc25yMTouMmZ9IGRCIGZyb20gc3RhZ2UgMikiLCBmbHVzaD1UcnVlKQoKICAg"
+    "ICMgUGFjayAxMS1iaXQgY29kZXMgTFNCLWZpcnN0OiBbY29kZTEgbG93IDYgYml0c11bY29kZTIgbG93"
+    "IDUgYml0c10KICAgIG5fdmVjcyA9IGxlbih2ZWN0b3JzKQogICAgdG90YWxfYml0cyAgPSBuX3ZlY3Mg"
+    "KiBCSVRTX1RPVEFMCiAgICB0b3RhbF9ieXRlcyA9ICh0b3RhbF9iaXRzICsgNykgLy8gOAogICAgY29k"
+    "ZXNfYnl0ZXMgPSBieXRlYXJyYXkodG90YWxfYnl0ZXMpCiAgICBmb3IgaSBpbiByYW5nZShuX3ZlY3Mp"
+    "OgogICAgICAgIGNvbWJpbmVkID0gKGludChjb2RlczFbaV0pICYgMHgzRikgfCAoKGludChjb2RlczJb"
+    "aV0pICYgMHgxRikgPDwgQklUUzEpCiAgICAgICAgYml0X3BvcyAgID0gaSAqIEJJVFNfVE9UQUwKICAg"
+    "ICAgICBieXRlX3BvcyAgPSBiaXRfcG9zID4+IDMKICAgICAgICBiaXRfc2hpZnQgPSBiaXRfcG9zICYg"
+    "NwogICAgICAgIHZhbCA9IGNvbWJpbmVkIDw8IGJpdF9zaGlmdAogICAgICAgIGNvZGVzX2J5dGVzW2J5"
+    "dGVfcG9zXSAgICAgfD0gdmFsICYgMHhGRgogICAgICAgIGlmIGJ5dGVfcG9zKzEgPCB0b3RhbF9ieXRl"
+    "czogY29kZXNfYnl0ZXNbYnl0ZV9wb3MrMV0gfD0gKHZhbCA+PiAgOCkgJiAweEZGCiAgICAgICAgaWYg"
+    "Ynl0ZV9wb3MrMiA8IHRvdGFsX2J5dGVzOiBjb2Rlc19ieXRlc1tieXRlX3BvcysyXSB8PSAodmFsID4+"
+    "IDE2KSAmIDB4RkYKCiAgICAjIENvZGVib29rIGJ5dGVzOiBbc3RhZ2UxOiBLMcOXMiBieXRlc11bc3Rh"
+    "Z2UyOiBLMsOXMiBieXRlc10gKHVuc2lnbmVkOiB2YWx1ZSsxMjgpCiAgICBjYl9ieXRlcyA9IGJ5dGVh"
+    "cnJheSgpCiAgICBmb3IgZW50cnkgaW4gY2IxOgogICAgICAgIGZvciB2IGluIGVudHJ5OiBjYl9ieXRl"
+    "cy5hcHBlbmQoKGludCh2KSsyNTYpICYgMHhGRikKICAgIGZvciBlbnRyeSBpbiBjYjI6CiAgICAgICAg"
+    "Zm9yIHYgaW4gZW50cnk6IGNiX2J5dGVzLmFwcGVuZCgoaW50KHYpKzI1NikgJiAweEZGKQoKICAgIHJl"
+    "dHVybiBjb2Rlc19ieXRlcywgY2JfYnl0ZXMsIHN0YXJ0cywgdG90YWxfc2FtcGxlcywgQklUU19UT1RB"
+    "TAoKCiMg4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ"
+    "4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ"
+    "4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ"
+    "4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQCiMgR0xTTCBFTUlUVEVSUwoj"
+    "IOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKV"
+    "kOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKV"
+    "kOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKV"
+    "kOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkAoKZGVmIGJ5dGVzX3RvX2ludDMyX2Jl"
+    "X2FycmF5KGRhdGEsIGNodW5rX2l2ZWM0PTUxMik6CiAgICAiIiJQYWNrIGJ5dGVzIGludG8gaXZlYzQg"
+    "YXJyYXlzIChiaWctZW5kaWFuOiBieXRlIDAgPSBNU0Igb2YgaW50LngpLiIiIgogICAgIyBQYWQgdG8g"
+    "bXVsdGlwbGUgb2YgMTYgKHNpbmNlIGVhY2ggaXZlYzQgaG9sZHMgMTYgYnl0ZXMpCiAgICBwYWRkZWQg"
+    "PSBieXRlcyhkYXRhKSArIGInXHgwMCcgKiAoKDE2IC0gbGVuKGRhdGEpICUgMTYpICUgMTYpCiAgICBp"
+    "bnRzID0gW10KICAgIGZvciBpIGluIHJhbmdlKDAsIGxlbihwYWRkZWQpLCA0KToKICAgICAgICB2ID0g"
+    "c3RydWN0LnVucGFjaygnPkknLCBwYWRkZWRbaTppKzRdKVswXQogICAgICAgICMgY29udmVydCB0byBz"
+    "aWduZWQgaW50MzIgZm9yIEdMU0wgKGhhbmRsZXMgdmFsdWVzID49IDJeMzEpCiAgICAgICAgaWYgdiA+"
+    "PSAoMSA8PCAzMSk6CiAgICAgICAgICAgIHYgLT0gKDEgPDwgMzIpCiAgICAgICAgaW50cy5hcHBlbmQo"
+    "dikKICAgICMgU3BsaXQgaW50byBpdmVjNCBhcnJheSBjaHVua3Mgb2YgY2h1bmtfaXZlYzQgaXZlYzQg"
+    "ZW50cmllcyBlYWNoCiAgICBjaHVua3MgPSBbXQogICAgY3VyID0gW10KICAgIGZvciBpIGluIHJhbmdl"
+    "KDAsIGxlbihpbnRzKSwgNCk6CiAgICAgICAgY3VyLmFwcGVuZCh0dXBsZShpbnRzW2k6aSs0XSkpCiAg"
+    "ICAgICAgaWYgbGVuKGN1cikgPT0gY2h1bmtfaXZlYzQ6CiAgICAgICAgICAgIGNodW5rcy5hcHBlbmQo"
+    "Y3VyKQogICAgICAgICAgICBjdXIgPSBbXQogICAgaWYgY3VyOgogICAgICAgIGNodW5rcy5hcHBlbmQo"
+    "Y3VyKQogICAgcmV0dXJuIGNodW5rcwoKZGVmIGVtaXRfaXZlYzRfYXJyYXkobmFtZSwgY2h1bmtzX29y"
+    "X3NpbmdsZSwgaXRlbXNfcGVyX2xpbmU9Mik6CiAgICAiIiJFbWl0IG9uZSBvciBtb3JlIGNvbnN0IGl2"
+    "ZWM0IGFycmF5cy4gYGNodW5rc19vcl9zaW5nbGVgIGlzIGEgbGlzdCBvZiBjaHVua3MuIiIiCiAgICBv"
+    "dXQgPSBbXQogICAgZm9yIGNpLCBjaHVuayBpbiBlbnVtZXJhdGUoY2h1bmtzX29yX3NpbmdsZSk6CiAg"
+    "ICAgICAgYXJyX25hbWUgPSBmIntuYW1lfXtjaX0iIGlmIGxlbihjaHVua3Nfb3Jfc2luZ2xlKSA+IDEg"
+    "ZWxzZSBmIntuYW1lfTAiCiAgICAgICAgb3V0LmFwcGVuZChmImNvbnN0IGl2ZWM0IHthcnJfbmFtZX1b"
+    "e2xlbihjaHVuayl9XSA9IGl2ZWM0W10oIikKICAgICAgICBsaW5lcyA9IFtdCiAgICAgICAgZm9yIHJv"
+    "d19zdGFydCBpbiByYW5nZSgwLCBsZW4oY2h1bmspLCBpdGVtc19wZXJfbGluZSk6CiAgICAgICAgICAg"
+    "IHJvdyA9IGNodW5rW3Jvd19zdGFydDpyb3dfc3RhcnQgKyBpdGVtc19wZXJfbGluZV0KICAgICAgICAg"
+    "ICAgcGFydHMgPSBbIml2ZWM0KHt9LHt9LHt9LHt9KSIuZm9ybWF0KCp0KSBmb3IgdCBpbiByb3ddCiAg"
+    "ICAgICAgICAgIGxpbmVzLmFwcGVuZCgiICAgICIgKyAiLCAiLmpvaW4ocGFydHMpKQogICAgICAgIG91"
+    "dC5hcHBlbmQoIixcbiIuam9pbihsaW5lcykpCiAgICAgICAgb3V0LmFwcGVuZCgiKTtcbiIpCiAgICBy"
+    "ZXR1cm4gIlxuIi5qb2luKG91dCkKCgojIOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKV"
+    "kOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKV"
+    "kOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKV"
+    "kOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKV"
+    "kAojIE1BSU4gQlVJTEQKIyDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDi"
+    "lZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDi"
+    "lZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDi"
+    "lZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZDilZAKCmRlZiBt"
+    "YWluKG1vZF9wYXRoLCBvdXRfcGF0aCwgSz0yNTYsIHdlaWdodGVkPVRydWUpOgogICAgbW9kID0gTU9E"
+    "RmlsZShtb2RfcGF0aCkKICAgIHByaW50KGYi8J+TpiBMb2FkZWQ6IHttb2QudGl0bGV9IikKICAgIHBy"
+    "aW50KGYiICAgUGF0dGVybnM6IHttb2QubnVtX3BhdHRlcm5zfSwgU29uZyBsZW5ndGg6IHttb2Quc29u"
+    "Z19sZW5ndGh9IikKCiAgICAjIFBhdHRlcm4gY3J1bmNoCiAgICBwID0gZW5jb2RlX3BhdHRlcm5zKG1v"
+    "ZCkKICAgIHByaW50KGYiXG7wn5ec77iPICBQQVRURVJOIENSVU5DSCIpCiAgICBwcmludChmIiAgIFRv"
+    "dGFsIG5vdGVzOiAgICAgICB7cFsndG90YWxfbm90ZXMnXX0iKQogICAgcHJpbnQoZiIgICBVbmlxdWUg"
+    "bm9uLWVtcHR5OiAge2xlbihwWyd1bmlxJ10pfSIpCiAgICBwcmludChmIiAgIERpY3Rpb25hcnk6ICAg"
+    "ICAgICB7bGVuKHBbJ3VuaXEnXSkqNH0gYnl0ZXMiKQogICAgcHJpbnQoZiIgICBCaXRtYXA6ICAgICAg"
+    "ICAgICAge2xlbihwWydiaXRtYXAnXSl9IGJ5dGVzIikKICAgIHByaW50KGYiICAgSW5kZXggc3RyZWFt"
+    "OiAgICAgIHtsZW4ocFsnaWR4X3N0cmVhbSddKX0gYnl0ZXMiKQogICAgcHJpbnQoZiIgICBSb3cgc2Vl"
+    "ayAoMTYtYml0IHByZWZpeCk6IHtsZW4ocFsncm93X3NlZWtfYnl0ZXMnXSl9IGJ5dGVzIikKICAgIHBh"
+    "dHRlcm5fdG90YWwgPSBsZW4ocFsndW5pcSddKSo0ICsgbGVuKHBbJ2JpdG1hcCddKSArIGxlbihwWydp"
+    "ZHhfc3RyZWFtJ10pICsgbGVuKHBbJ3Jvd19zZWVrX2J5dGVzJ10pCiAgICBwcmludChmIiAgIOKGkiBQ"
+    "YXR0ZXJuIHRvdGFsOiAgIHtwYXR0ZXJuX3RvdGFsOix9IGJ5dGVzIikKCiAgICAjIFNwZWVkL3RpY2sg"
+    "dGFibGUgZnJvbSBGeHggZWZmZWN0cwogICAgcm93U3BlZWQsIHJvd1N0YXJ0VGljaywgYnBtX2NoYW5n"
+    "ZXMgPSBjb21wdXRlX3Jvd19zcGVlZF90YWJsZShtb2QpCiAgICBwcmludChmIlxu4o+x77iPICBTUEVF"
+    "RCBUQUJMRSIpCiAgICBwcmludChmIiAgIFNvbmcgcm93czoge2xlbihyb3dTcGVlZCl9LCB0b3RhbCB0"
+    "aWNrczoge3Jvd1N0YXJ0VGlja1stMV19IikKICAgIHByaW50KGYiICAgVW5pcXVlIHNwZWVkczoge3Nv"
+    "cnRlZChzZXQocm93U3BlZWQpKX0iKQogICAgc3BlZWRfdGFibGVfYnl0ZXMgPSBsZW4ocm93U3RhcnRU"
+    "aWNrKSAqIDIKICAgIHByaW50KGYiICAgcm93U3RhcnRUaWNrOiB7c3BlZWRfdGFibGVfYnl0ZXN9IGJ5"
+    "dGVzICgxNi1iaXQgcGFja2VkKSIpCiAgICBpZiBicG1fY2hhbmdlczoKICAgICAgICBwcmludChmIiAg"
+    "IOKaoO+4jyAgQlBNIGNoYW5nZXMgZGV0ZWN0ZWQgKDEyVEguTU9EIGhhcyBub25lLCBidXQgb3RoZXIg"
+    "TU9EcyBtaWdodCkiKQoKICAgICMgU2FtcGxlIGVuY29kaW5nOiAyLXN0YWdlIFJlc2lkdWFsIFZRCiAg"
+    "ICBwcmludChmIlxu8J+XnO+4jyAgU0FNUExFIENSVU5DSCAoUlZRIEsxPTY0IEsyPTMyLCByaW5nLXdl"
+    "aWdodGVkIHN0YWdlIDEpIikKICAgIGNvZGVzX2J5dGVzLCBjYl9ieXRlcywgc3RhcnRzLCB0b3RhbF9z"
+    "YW1wbGVzLCBiaXRzX3Blcl9jb2RlID0gZW5jb2RlX3NhbXBsZXNfdnEyZChtb2QsIEssIHdlaWdodGVk"
+    "KQogICAgcHJpbnQoZiIgICBMb2dpY2FsIHNhbXBsZXM6ICAge3RvdGFsX3NhbXBsZXM6LH0iKQogICAg"
+    "cHJpbnQoZiIgICBDb2RlcyBwYWNrZWQ6ICAgICAge2xlbihjb2Rlc19ieXRlcyk6LH0gYnl0ZXMgICh7"
+    "Yml0c19wZXJfY29kZX0gYml0cy92ZWN0b3Igw5cge3RvdGFsX3NhbXBsZXMvLzJ9IHZlY3RvcnMpIikK"
+    "ICAgIHByaW50KGYiICAgQ29kZWJvb2tzOiAgICAgICAgIHtsZW4oY2JfYnl0ZXMpOix9IGJ5dGVzICAo"
+    "NjTDlzIgKyAzMsOXMiBieXRlcykiKQoKICAgIHRvdGFsX2J1ZGdldCA9IHBhdHRlcm5fdG90YWwgKyBs"
+    "ZW4oY29kZXNfYnl0ZXMpICsgbGVuKGNiX2J5dGVzKSArIDMxKjI0ICsgc3BlZWRfdGFibGVfYnl0ZXMK"
+    "ICAgIHByaW50KGYiXG7wn5OKIFRPVEFMIGNvbnN0IGRhdGEgYnVkZ2V0OiB+e3RvdGFsX2J1ZGdldDos"
+    "fSBieXRlcyAgKHt0b3RhbF9idWRnZXQvMTAyNDouMWZ9IEtCKSIpCgogICAgIyBDaHVuayBmb3IgR0xT"
+    "TAogICAgZGljdF9ieXRlcyA9IGInJy5qb2luKHBbJ3VuaXEnXSkKICAgIGRpY3RfY2h1bmtzICAgID0g"
+    "Ynl0ZXNfdG9faW50MzJfYmVfYXJyYXkoZGljdF9ieXRlcykKICAgIGJpdG1hcF9jaHVua3MgID0gYnl0"
+    "ZXNfdG9faW50MzJfYmVfYXJyYXkoYnl0ZXMocFsnYml0bWFwJ10pKQogICAgaWR4X2NodW5rcyAgICAg"
+    "PSBieXRlc190b19pbnQzMl9iZV9hcnJheShieXRlcyhwWydpZHhfc3RyZWFtJ10pKQogICAgcm93c2Vl"
+    "a19jaHVua3MgPSBieXRlc190b19pbnQzMl9iZV9hcnJheShieXRlcyhwWydyb3dfc2Vla19ieXRlcydd"
+    "KSkKICAgIGNvZGVzX2NodW5rcyAgID0gYnl0ZXNfdG9faW50MzJfYmVfYXJyYXkoYnl0ZXMoY29kZXNf"
+    "Ynl0ZXMpKQogICAgY2JfY2h1bmtzICAgICAgPSBieXRlc190b19pbnQzMl9iZV9hcnJheShieXRlcyhj"
+    "Yl9ieXRlcykpCgogICAgIyBQYWNrIHJvd1N0YXJ0VGljayBhcyAxNi1iaXQgTEUgYnl0ZXMg4oaSIGl2"
+    "ZWM0IGNodW5rcwogICAgdGlja19ieXRlcyA9IGJ5dGVhcnJheSgpCiAgICBmb3IgdCBpbiByb3dTdGFy"
+    "dFRpY2s6CiAgICAgICAgdGlja19ieXRlcy5hcHBlbmQodCAmIDB4RkYpCiAgICAgICAgdGlja19ieXRl"
+    "cy5hcHBlbmQoKHQgPj4gOCkgJiAweEZGKQogICAgdGlja19jaHVua3MgPSBieXRlc190b19pbnQzMl9i"
+    "ZV9hcnJheShieXRlcyh0aWNrX2J5dGVzKSkKCiAgICBzYW1wbGVzX2luZm9fbmV3ID0gW10KICAgIGZv"
+    "ciBpLCAocywgc3QpIGluIGVudW1lcmF0ZSh6aXAobW9kLnNhbXBsZXNfaW5mbywgc3RhcnRzKSk6CiAg"
+    "ICAgICAgc2FtcGxlc19pbmZvX25ldy5hcHBlbmQoZGljdCgKICAgICAgICAgICAgc3RhcnQ9c3QsIGxl"
+    "bmd0aD1zWydsZW5ndGgnXSwKICAgICAgICAgICAgbG9vcFN0YXJ0PXNbJ2xvb3Bfc3RhcnQnXSwgbG9v"
+    "cExlbj1zWydsb29wX2xlbiddLAogICAgICAgICAgICB2b2x1bWU9c1sndm9sdW1lJ10sIGZpbmV0dW5l"
+    "PXNbJ2ZpbmV0dW5lJ10sCiAgICAgICAgKSkKCiAgICBnbHNsID0gYnVpbGRfZ2xzbChtb2QsIHAsIGNv"
+    "ZGVzX2J5dGVzLCBzdGFydHMsIHRvdGFsX3NhbXBsZXMsCiAgICAgICAgICAgICAgICAgICAgIGRpY3Rf"
+    "Y2h1bmtzLCBiaXRtYXBfY2h1bmtzLCBpZHhfY2h1bmtzLCByb3dzZWVrX2NodW5rcywKICAgICAgICAg"
+    "ICAgICAgICAgICAgY29kZXNfY2h1bmtzLCBjYl9jaHVua3MsIHNhbXBsZXNfaW5mb19uZXcsIEssIGJp"
+    "dHNfcGVyX2NvZGUsCiAgICAgICAgICAgICAgICAgICAgIHRpY2tfY2h1bmtzLCByb3dTdGFydFRpY2sp"
+    "CiAgICB3aXRoIG9wZW4ob3V0X3BhdGgsICd3JykgYXMgZjoKICAgICAgICBmLndyaXRlKGdsc2wpCiAg"
+    "ICBwcmludChmIlxu4pyFIFdyb3RlOiB7b3V0X3BhdGh9ICAoe2xlbihnbHNsLmVuY29kZSgndXRmLTgn"
+    "KSk6LH0gYnl0ZXMpIikKCgpkZWYgYnVpbGRfZ2xzbChtb2QsIHAsIHBhY2tlZCwgc3RhcnRzLCB0b3Rh"
+    "bF9zYW1wbGVzLAogICAgICAgICAgICAgICBkaWN0X2NodW5rcywgYml0bWFwX2NodW5rcywgaWR4X2No"
+    "dW5rcywgcm93c2Vla19jaHVua3MsCiAgICAgICAgICAgICAgIGNvZGVzX2NodW5rcywgY2JfY2h1bmtz"
+    "LCBzYW1wbGVzX2luZm9fbmV3LCBLLCBiaXRzX3Blcl9jb2RlLAogICAgICAgICAgICAgICB0aWNrX2No"
+    "dW5rcywgcm93U3RhcnRUaWNrKToKCiAgICAjIOKUgOKUgCBTb25nIG1ldGFkYXRhCiAgICBzb25nX3Bv"
+    "c2l0aW9ucyA9IG1vZC5wYXR0ZXJuX29yZGVyWzptb2Quc29uZ19sZW5ndGhdCiAgICBwYXRfcm93X29m"
+    "ZnNldCA9IFtpKjY0IGZvciBpIGluIHJhbmdlKG1vZC5zb25nX2xlbmd0aCsxKV0KICAgIHBhdF9zdGFy"
+    "dF9yb3cgID0gWzBdKm1vZC5zb25nX2xlbmd0aAogICAgdG90YWxfc29uZ19yb3dzID0gbW9kLnNvbmdf"
+    "bGVuZ3RoICogNjQKICAgIG51bV9wYXR0ZXJucyA9IG1vZC5udW1fcGF0dGVybnMKCiAgICAjIOKUgOKU"
+    "gCBTYW1wbGVJbmZvIGVtaXNzaW9uICh1c2UgbmV3IGBzdGFydGAgPSBzYW1wbGUgaW5kZXggaW4gdGhl"
+    "IGNvbmNhdGVuYXRlZCBzdHJlYW0pCiAgICBkZWYgZm10X3NhbXBsZWluZm8ocyk6CiAgICAgICAgcmV0"
+    "dXJuIGYiU2FtcGxlSW5mbyh7c1snc3RhcnQnXX0sIHtzWydsZW5ndGgnXX0sIHtzWydsb29wU3RhcnQn"
+    "XX0sIHtzWydsb29wTGVuJ119LCB7c1sndm9sdW1lJ119LCAxKSIKICAgIHNpX2xpbmVzID0gW10KICAg"
+    "IGZvciBpLCBzIGluIGVudW1lcmF0ZShzYW1wbGVzX2luZm9fbmV3KToKICAgICAgICBzaV9saW5lcy5h"
+    "cHBlbmQoZiIgICAge2ZtdF9zYW1wbGVpbmZvKHMpfXsnLCcgaWYgaTwzMCBlbHNlICcnfSIpCiAgICBz"
+    "YW1wbGVzX2luZm9fZ2xzbCA9ICJjb25zdCBTYW1wbGVJbmZvIHNhbXBsZXNbMzFdID0gU2FtcGxlSW5m"
+    "b1tdKFxuIiArICJcbiIuam9pbihzaV9saW5lcykgKyAiXG4pOyIKCiAgICAjIOKUgOKUgCBjaGFubmVs"
+    "UGFuIChzYW1lIGFzIGV4aXN0aW5nOiBBbWlnYSBMUlJMIHdpdGggcmVzdCBjZW50ZXJlZCkKICAgIGNo"
+    "YW5fcGFuID0gWzAuMCwgMS4wLCAxLjAsIDAuMF0gKyBbMC41XSoyOAoKICAgICMg4pSA4pSAIENodW5r"
+    "IGFycmF5IGRlY2xhcmF0aW9ucwogICAgZGljdF9sZW4gICAgPSBzdW0obGVuKGMpIGZvciBjIGluIGRp"
+    "Y3RfY2h1bmtzKQogICAgYml0bWFwX2xlbiAgPSBzdW0obGVuKGMpIGZvciBjIGluIGJpdG1hcF9jaHVu"
+    "a3MpCiAgICBpZHhfbGVuICAgICA9IHN1bShsZW4oYykgZm9yIGMgaW4gaWR4X2NodW5rcykKICAgIHJv"
+    "d3NlZWtfbGVuID0gc3VtKGxlbihjKSBmb3IgYyBpbiByb3dzZWVrX2NodW5rcykKICAgIGNvZGVzX2xl"
+    "biAgID0gc3VtKGxlbihjKSBmb3IgYyBpbiBjb2Rlc19jaHVua3MpCiAgICBjYl9sZW4gICAgICA9IHN1"
+    "bShsZW4oYykgZm9yIGMgaW4gY2JfY2h1bmtzKQoKICAgIGhlYWRlciA9IGYiIiIvKiA9PT09PT09PT09"
+    "PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09"
+    "PT09PT09CiAgIEdMU0wgTU9EIFBsYXllciB2MS4yIChjKSAyMDI2IE9yYmxpdml1cwogICBOZXc6IFZR"
+    "IHNhbXBsZSBjb21wcmVzc2lvbiwgM0QgU3Vycm91bmQsIEZBVCBCYXNzLCBhbmQgY3ViaWMgcmVzYW1w"
+    "bGluZwogICBDb250YWN0OiBzdWJiYW5kQGdtYWlsLmNvbSBvcgogICAgICAgICAgICBzdWJiYW5kQHBy"
+    "b3Rvbm1haWwuY29tCiAgIEdJVDogICAgIGh0dHBzOi8vZ2l0aHViLmNvbS9tZXd6YS9tb2QyZ2xzbAog"
+    "ICBDT01NT04gVEFCCiAgIEdlbmVyYXRlZCBmcm9tOiB7bW9kLnRpdGxlfQogICAKICAgQ29tcHJlc3Np"
+    "b246CiAgICAg4oCiIFBhdHRlcm5zOiBiaXRtYXAgKyBkaWN0aW9uYXJ5ICsgMTYtYml0IHByZWZpeC1z"
+    "dW0gcm93IHNlZWsgKE8oMSkpCiAgICAg4oCiIFNhbXBsZXM6ICAyLXN0YWdlIFJlc2lkdWFsIFZRIChL"
+    "MT02NCwgSzI9MzIpLCAxMSBiaXRzL3BhaXIKICAgICAgICAgICAgICAgICByaW5nLXdlaWdodGVkIGst"
+    "bWVhbnMgdHJhaW5lZCBvbiB0aGlzIE1PRCdzIGNvbnRlbnQKICAgPT09PT09PT09PT09PT09PT09PT09"
+    "PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PSAqLwoK"
+    "I2RlZmluZSBVU0VfRU1CRURERURfREFUQSAxCiNkZWZpbmUgTlVNX1BBVFRFUk5TICAgICAge251bV9w"
+    "YXR0ZXJuc30KI2RlZmluZSBTT05HX0xFTkdUSCAgICAgICB7bW9kLnNvbmdfbGVuZ3RofQojZGVmaW5l"
+    "IFNPTkdfTE9PUF9QT1MgICAgIDAKI2RlZmluZSBOVU1fQ0hBTk5FTFMgICAgICA0CiNkZWZpbmUgQlBN"
+    "ICAgICAgICAgICAgICAgMTI1LjAKI2RlZmluZSBTUEVFRCAgICAgICAgICAgICA2LjAKI2RlZmluZSBU"
+    "T1RBTF9TT05HX1JPV1MgICB7dG90YWxfc29uZ19yb3dzfQoKLy8g4pSA4pSAIFBhdHRlcm4gY3J1bmNo"
+    "IGNvbnN0YW50cyDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDi"
+    "lIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDi"
+    "lIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKI2RlZmluZSBUT1RBTF9OT1RFUyAgICAgICB7cFsn"
+    "dG90YWxfbm90ZXMnXX0KI2RlZmluZSBUT1RBTF9ST1dTICAgICAgICB7cFsnbnVtX3Jvd3MnXX0KI2Rl"
+    "ZmluZSBESUNUX05PVEVTICAgICAgICB7bGVuKHBbJ3VuaXEnXSl9CiNkZWZpbmUgSURYX0JZVEVTX1BF"
+    "UiAgICAge3BbJ2lkeF9ieXRlcyddfQojZGVmaW5lIERJQ1RfSU5UUyAgICAgICAgIHtkaWN0X2xlbn0K"
+    "I2RlZmluZSBCSVRNQVBfSU5UUyAgICAgICB7Yml0bWFwX2xlbn0KI2RlZmluZSBJRFhfSU5UUyAgICAg"
+    "ICAgICB7aWR4X2xlbn0KI2RlZmluZSBST1dTRUVLX0lOVFMgICAgICB7cm93c2Vla19sZW59CgovLyDi"
+    "lIDilIAgUlZRIHNhbXBsZSBjb25zdGFudHMg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA"
+    "4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA"
+    "4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA"
+    "CiNkZWZpbmUgUlZRX0NPREVTX0JZVEVTICAge2xlbihwYWNrZWQpfQojZGVmaW5lIFJWUV9DQl9CWVRF"
+    "UyAgICAgIHs2NCoyICsgMzIqMn0KI2RlZmluZSBUT1RBTF9TQU1QTEVTICAgICB7dG90YWxfc2FtcGxl"
+    "c30KCiNkZWZpbmUgQklUTUFQX0JZVEVTICAgICAge2xlbihwWydiaXRtYXAnXSl9CiNkZWZpbmUgSURY"
+    "X0JZVEVTICAgICAgICAge2xlbihwWydpZHhfc3RyZWFtJ10pfQojZGVmaW5lIFJPV1NFRUtfQllURVMg"
+    "ICAgIHtsZW4ocFsncm93X3NlZWtfYnl0ZXMnXSl9CgovLyDilIDilIAgRnh4LWF3YXJlIHRpbWluZyDi"
+    "lIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDi"
+    "lIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDi"
+    "lIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKI2RlZmluZSBUT1RBTF9USUNL"
+    "UyAgICAgICB7cm93U3RhcnRUaWNrWy0xXX0KI2RlZmluZSBOVU1fU09OR19ST1dTICAgICB7bGVuKHJv"
+    "d1N0YXJ0VGljayktMX0KI2RlZmluZSBUSUNLU19QRVJfU0VDICAgICA1MC4wICAgLy8gQlBNPTEyNSBj"
+    "b25zdGFudCBmb3IgMTJUSC5NT0QKCi8vIOKUgOKUgCBBdWRpbyBlZmZlY3RzIOKUgOKUgOKUgOKUgOKU"
+    "gOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKU"
+    "gOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKU"
+    "gOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgApjb25zdCBib29sICBlbmFibGUz"
+    "RCAgICAgID0gdHJ1ZTsKY29uc3QgYm9vbCAgZW5hYmxlRkFUICAgICA9IHRydWU7CmNvbnN0IGl2ZWMy"
+    "IHN1cnJfY2hhbm5lbHMgPSBpdmVjMigxLCA0KTsKIiIiCgogICAgIyDilIDilIAgc29uZyBtZXRhZGF0"
+    "YSBhcnJheXMKICAgIGNoYW5fcGFuX3N0ciAgID0gIiwgIi5qb2luKGYie3Y6LjFmfSIgZm9yIHYgaW4g"
+    "Y2hhbl9wYW4pCiAgICBzb25ncG9zX3N0ciAgICA9ICIsICIuam9pbihzdHIoeCkgZm9yIHggaW4gc29u"
+    "Z19wb3NpdGlvbnMpCiAgICByb3dvZmZfc3RyICAgICA9ICIsICIuam9pbihzdHIoeCkgZm9yIHggaW4g"
+    "cGF0X3Jvd19vZmZzZXQpCiAgICBzdGFydHJvd19zdHIgICA9ICIsICIuam9pbihzdHIoeCkgZm9yIHgg"
+    "aW4gcGF0X3N0YXJ0X3JvdykKCiAgICBtZXRhID0gZiIiIgpjb25zdCBmbG9hdCBjaGFubmVsUGFuWzMy"
+    "XSA9IGZsb2F0W10oe2NoYW5fcGFuX3N0cn0pOwpjb25zdCBpbnQgICBzb25nUG9zaXRpb25zW3ttb2Qu"
+    "c29uZ19sZW5ndGh9XSAgID0gaW50W10oe3Nvbmdwb3Nfc3RyfSk7CmNvbnN0IGludCAgIHBhdFJvd09m"
+    "ZnNldFt7bW9kLnNvbmdfbGVuZ3RoKzF9XSAgICA9IGludFtdKHtyb3dvZmZfc3RyfSk7CmNvbnN0IGlu"
+    "dCAgIHBhdFN0YXJ0Um93W3ttb2Quc29uZ19sZW5ndGh9XSAgICAgPSBpbnRbXSh7c3RhcnRyb3dfc3Ry"
+    "fSk7CiIiIgoKICAgICMg4pSA4pSAIERhdGEgYXJyYXlzIChpdmVjNCBjaHVua3MpCiAgICBkYXRhX2Fy"
+    "cmF5cyA9IFsiXG4vLyDilIDilIAgUGF0dGVybiBkaWN0aW9uYXJ5ICh1bmlxdWUgNC1ieXRlIG5vdGVz"
+    "LCBNU0ItZmlyc3QgcGVyIGludCkg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSAXG4iXQog"
+    "ICAgZGF0YV9hcnJheXMuYXBwZW5kKGVtaXRfaXZlYzRfYXJyYXkoInBhdERpY3QiLCBkaWN0X2NodW5r"
+    "cykpCiAgICBkYXRhX2FycmF5cy5hcHBlbmQoIlxuLy8g4pSA4pSAIFBhdHRlcm4gYml0bWFwICgxIGJp"
+    "dC9ub3RlLCBMU0ItZmlyc3Qgd2l0aGluIGJ5dGUpIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKU"
+    "gOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgFxuIikKICAgIGRhdGFfYXJyYXlzLmFwcGVuZChl"
+    "bWl0X2l2ZWM0X2FycmF5KCJwYXRCaXRtYXAiLCBiaXRtYXBfY2h1bmtzKSkKICAgIGRhdGFfYXJyYXlz"
+    "LmFwcGVuZCgiXG4vLyDilIDilIAgSW5kZXggc3RyZWFtICglcyBieXRlcyBwZXIgbm9uLWVtcHR5IG5v"
+    "dGUpIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKU"
+    "gOKUgOKUgOKUgOKUgOKUgOKUgOKUgFxuIiAlIHBbJ2lkeF9ieXRlcyddKQogICAgZGF0YV9hcnJheXMu"
+    "YXBwZW5kKGVtaXRfaXZlYzRfYXJyYXkoInBhdElkeCIsIGlkeF9jaHVua3MpKQogICAgZGF0YV9hcnJh"
+    "eXMuYXBwZW5kKCJcbi8vIOKUgOKUgCBSb3cgc2VlayB0YWJsZSAoMTYtYml0IExFIHByZWZpeCBzdW1z"
+    "LCBPKDEpIGxvb2t1cCkg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA"
+    "4pSA4pSA4pSAXG4iKQogICAgZGF0YV9hcnJheXMuYXBwZW5kKGVtaXRfaXZlYzRfYXJyYXkoInBhdFJv"
+    "d1NlZWsiLCByb3dzZWVrX2NodW5rcykpCiAgICBkYXRhX2FycmF5cy5hcHBlbmQoIlxuLy8g4pSA4pSA"
+    "IFZRIGNvZGVzIChwYWNrZWQgYml0IHN0cmVhbSkg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA"
+    "4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA"
+    "4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSAXG4iKQogICAgZGF0YV9hcnJheXMuYXBwZW5k"
+    "KGVtaXRfaXZlYzRfYXJyYXkoInZxQ29kZXMiLCBjb2Rlc19jaHVua3MpKQogICAgZGF0YV9hcnJheXMu"
+    "YXBwZW5kKGYiXG4vLyDilIDilIAgVlEgY29kZWJvb2sgKHtLfSBlbnRyaWVzIMOXIDIgc2FtcGxlcywg"
+    "c2lnbmVkIDgtYml0IGFzIHVuc2lnbmVkKSDilIDilIBcbiIpCiAgICBkYXRhX2FycmF5cy5hcHBlbmQo"
+    "ZW1pdF9pdmVjNF9hcnJheSgidnFDb2RlYm9vayIsIGNiX2NodW5rcykpCiAgICBkYXRhX2FycmF5cy5h"
+    "cHBlbmQoIlxuLy8g4pSA4pSAIFBlci1yb3cgY3VtdWxhdGl2ZSB0aWNrIHRhYmxlICgxNi1iaXQgTEUs"
+    "IEZ4eC1hd2FyZSkg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA"
+    "XG4iKQogICAgZGF0YV9hcnJheXMuYXBwZW5kKGVtaXRfaXZlYzRfYXJyYXkoInJvd1N0YXJ0VGljayIs"
+    "IHRpY2tfY2h1bmtzKSkKCiAgICAjIOKUgOKUgCBTYW1wbGVJbmZvICYgcGVyaW9kVGFibGUKICAgIHRh"
+    "YmxlcyA9IGYiIiIKLy8g4pSA4pSAIFNhbXBsZSBtZXRhZGF0YSAoc3RhcnQgPSBzYW1wbGUgaW5kZXgg"
+    "aW4gcGFja2VkIDMtYml0IHN0cmVhbSkg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACnN0cnVjdCBT"
+    "YW1wbGVJbmZvIHt7CiAgICBpbnQgc3RhcnQsIGxlbmd0aCwgbG9vcFN0YXJ0LCBsb29wTGVuLCB2b2x1"
+    "bWUsIGJ3RmFjdG9yOwp9fTsKe3NhbXBsZXNfaW5mb19nbHNsfQoKLy8gUHJvVHJhY2tlciBwZXJpb2Qg"
+    "dGFibGUgKEMtMSB0byBCLTMpCmNvbnN0IGludCBwZXJpb2RUYWJsZVszN10gPSBpbnRbXSgKICAgIDg1"
+    "Niw4MDgsNzYyLDcyMCw2NzgsNjQwLDYwNCw1NzAsNTM4LDUwOCw0ODAsNDUzLAogICAgNDI4LDQwNCwz"
+    "ODEsMzYwLDMzOSwzMjAsMzAyLDI4NSwyNjksMjU0LDI0MCwyMjYsCiAgICAyMTQsMjAyLDE5MCwxODAs"
+    "MTcwLDE2MCwxNTEsMTQzLDEzNSwxMjcsMTIwLDExMywwCik7CgovLyBQcm9UcmFja2VyIDMyLWVudHJ5"
+    "IHNpbmUgdGFibGUgZm9yIHZpYnJhdG8gKExVVCwga2VwdCBnbG9iYWwgc28gaXQgZG9lc24ndAovLyBj"
+    "b25zdW1lIHBlci1jYWxsIHByaXZhdGUvc3RhY2sgc3RvcmFnZSBpbiBnZXRDaGFubmVsT3V0cHV0KS4K"
+    "Y29uc3QgZmxvYXQgdmliVGFiWzMyXSA9IGZsb2F0W10oCiAgICAgIDAuMCwgIDI0LjAsICA0OS4wLCAg"
+    "NzQuMCwgIDk3LjAsIDEyMC4wLCAxNDEuMCwgMTYxLjAsCiAgICAxODAuMCwgMTk3LjAsIDIxMi4wLCAy"
+    "MjQuMCwgMjM1LjAsIDI0NC4wLCAyNTAuMCwgMjUzLjAsCiAgICAyNTUuMCwgMjUzLjAsIDI1MC4wLCAy"
+    "NDQuMCwgMjM1LjAsIDIyNC4wLCAyMTIuMCwgMTk3LjAsCiAgICAxODAuMCwgMTYxLjAsIDE0MS4wLCAx"
+    "MjAuMCwgIDk3LjAsICA3NC4wLCAgNDkuMCwgIDI0LjAKKTsKCmZsb2F0IHBlcmlvZFRvRnJlcShpbnQg"
+    "cGVyaW9kKSB7ewogICAgcmV0dXJuIHBlcmlvZCA+IDAgPyA3MDkzNzg5LjIgLyAoZmxvYXQocGVyaW9k"
+    "KSAqIDIuMCkgOiAwLjA7Cn19CiIiIgoKICAgICMg4pSA4pSAIEZldGNoIGhlbHBlcnMgKGNodW5rIGRp"
+    "c3BhdGNoZXJzIGZvciBlYWNoIGFycmF5KQogICAgZGVmIGNodW5rX2Rpc3BhdGNoKG5hbWUsIG51bV9j"
+    "aHVua3MsIHZhcj0naScpOgogICAgICAgIGlmIG51bV9jaHVua3MgPT0gMToKICAgICAgICAgICAgcmV0"
+    "dXJuIGYiICAgIHJldHVybiB7bmFtZX0wW3t2YXJ9Pj4yXTsiCiAgICAgICAgbGluZXMgPSBbZiIgICAg"
+    "aXZlYzQgdiA9IGl2ZWM0KDApOyJdCiAgICAgICAgbGluZXMuYXBwZW5kKGYiICAgIGlmIChjaHVua0lk"
+    "eCA9PSAwKSB2ID0ge25hbWV9MFt7dmFyfT4+Ml07IikKICAgICAgICBmb3IgayBpbiByYW5nZSgxLCBu"
+    "dW1fY2h1bmtzKToKICAgICAgICAgICAgbGluZXMuYXBwZW5kKGYiICAgIGVsc2UgaWYgKGNodW5rSWR4"
+    "ID09IHtrfSkgdiA9IHtuYW1lfXtrfVt7dmFyfT4+Ml07IikKICAgICAgICBsaW5lcy5hcHBlbmQoZiIg"
+    "ICAgcmV0dXJuIHY7IikKICAgICAgICByZXR1cm4gIlxuIi5qb2luKGxpbmVzKQoKICAgIGRlZiBpdmVj"
+    "NF9zZWxlY3QodmFyPSdpJyk6CiAgICAgICAgcmV0dXJuIGYiIiIgICAgaW50IGNpID0ge3Zhcn0gJiAz"
+    "OwogICAgcmV0dXJuIGNpPT0wID8gdi54IDogY2k9PTEgPyB2LnkgOiBjaT09MiA/IHYueiA6IHYudzsi"
+    "IiIKCiAgICBmZXRjaGVycyA9IGYiIiIKLy8g4pWQ4pWQ4pWQIENodW5rZWQgaXZlYzQgZmV0Y2hlcnMg"
+    "4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ"
+    "4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ"
+    "4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQCgovLyBGZXRjaCBhIGJ5dGUgZnJvbSBhbnkgY2h1bmtlZCBi"
+    "eXRlIGFycmF5IChNU0ItZmlyc3Qgd2l0aGluIGVhY2ggaW50MzIpLgovLyBFYWNoIGl2ZWM0IGhvbGRz"
+    "IDE2IGJ5dGVzOiAueCA9IGJ5dGVzIDAtMywgLnkgPSA0LTcsIC56ID0gOC0xMSwgLncgPSAxMi0xNQov"
+    "LyBXaXRoaW4gZWFjaCBpbnQ6IGJ5dGUgMCA9IE1TQiwgYnl0ZSAzID0gTFNCLgoKaW50IF9leHRyYWN0"
+    "Qnl0ZShpdmVjNCB2LCBpbnQgYnl0ZUluSXZlYzQpIHt7CiAgICBpbnQgaW50SWR4ID0gYnl0ZUluSXZl"
+    "YzQgPj4gMjsKICAgIGludCBieXRlSW5JbnQgPSBieXRlSW5JdmVjNCAmIDM7CiAgICBpbnQgcGFja2Vk"
+    "ID0gaW50SWR4PT0wID8gdi54IDogaW50SWR4PT0xID8gdi55IDogaW50SWR4PT0yID8gdi56IDogdi53"
+    "OwogICAgaW50IHNoaWZ0ID0gMjQgLSBieXRlSW5JbnQgKiA4OwogICAgcmV0dXJuIChwYWNrZWQgPj4g"
+    "c2hpZnQpICYgMHhGRjsKfX0KCi8vIOKUgOKUgCBEaWN0aW9uYXJ5IGJ5dGUgZmV0Y2ggKGJ5dGVJZHgg"
+    "aW4gWzAsIERJQ1RfTk9URVMqNCkpIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKU"
+    "gOKUgOKUgOKUgOKUgOKUgAppbnQgZmV0Y2hEaWN0Qnl0ZShpbnQgYnl0ZUlkeCkge3sKICAgIGludCBp"
+    "dmVjNElkeCA9IGJ5dGVJZHggPj4gNDsKICAgIGludCBieXRlSW5JdmVjNCA9IGJ5dGVJZHggJiAxNTsK"
+    "ICAgIGl2ZWM0IHYgPSBwYXREaWN0MFtpdmVjNElkeF07CiAgICByZXR1cm4gX2V4dHJhY3RCeXRlKHYs"
+    "IGJ5dGVJbkl2ZWM0KTsKfX0KCi8vIOKUgOKUgCBCaXRtYXAgYnl0ZSBmZXRjaCDilIDilIDilIDilIDi"
+    "lIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDi"
+    "lIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDi"
+    "lIDilIDilIDilIDilIDilIDilIDilIDilIAKaW50IGZldGNoQml0bWFwQnl0ZShpbnQgYnl0ZUlkeCkg"
+    "e3sKICAgIGludCBpdmVjNElkeCA9IGJ5dGVJZHggPj4gNDsKICAgIGludCBieXRlSW5JdmVjNCA9IGJ5"
+    "dGVJZHggJiAxNTsKICAgIGl2ZWM0IHYgPSBwYXRCaXRtYXAwW2l2ZWM0SWR4XTsKICAgIHJldHVybiBf"
+    "ZXh0cmFjdEJ5dGUodiwgYnl0ZUluSXZlYzQpOwp9fQoKLy8g4pSA4pSAIEluZGV4IHN0cmVhbSBieXRl"
+    "IGZldGNoIChjaHVua2VkIGlmIG5lZWRlZCkg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA"
+    "4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACmludCBmZXRjaElkeEJ5"
+    "dGUoaW50IGJ5dGVJZHgpIHt7CiAgICBpbnQgaXZlYzRJZHggPSBieXRlSWR4ID4+IDQ7CiAgICBpbnQg"
+    "Ynl0ZUluSXZlYzQgPSBieXRlSWR4ICYgMTU7CiAgICBpbnQgY2h1bmtJZHggPSBpdmVjNElkeCAvIDUx"
+    "MjsKICAgIGludCBsb2NhbEl2ZWM0ID0gaXZlYzRJZHggJSA1MTI7CiAgICBpdmVjNCB2ID0gaXZlYzQo"
+    "MCk7CntjaHIoMTApLmpvaW4oZicgICAgeyJpZiIgaWYgaz09MCBlbHNlICJlbHNlIGlmIn0gKGNodW5r"
+    "SWR4ID09IHtrfSkgdiA9IHBhdElkeHtrfVtsb2NhbEl2ZWM0XTsnIGZvciBrIGluIHJhbmdlKGxlbihp"
+    "ZHhfY2h1bmtzKSkpfQogICAgcmV0dXJuIF9leHRyYWN0Qnl0ZSh2LCBieXRlSW5JdmVjNCk7Cn19Cgov"
+    "LyDilIDilIAgUm93LXNlZWsgbmliYmxlIGJ5dGUgZmV0Y2gg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA"
+    "4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA"
+    "4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACmludCBmZXRjaFJvd1Nl"
+    "ZWtCeXRlKGludCBieXRlSWR4KSB7ewogICAgaW50IGl2ZWM0SWR4ID0gYnl0ZUlkeCA+PiA0OwogICAg"
+    "aW50IGJ5dGVJbkl2ZWM0ID0gYnl0ZUlkeCAmIDE1OwogICAgaXZlYzQgdiA9IHBhdFJvd1NlZWswW2l2"
+    "ZWM0SWR4XTsKICAgIHJldHVybiBfZXh0cmFjdEJ5dGUodiwgYnl0ZUluSXZlYzQpOwp9fQoKLy8g4pSA"
+    "4pSAIFZRIGNvZGUgc3RyZWFtIGJ5dGUgZmV0Y2ggKGNodW5rZWQpIOKUgOKUgOKUgOKUgOKUgOKUgOKU"
+    "gOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKU"
+    "gOKUgOKUgOKUgOKUgOKUgOKUgOKUgAppbnQgZmV0Y2hDb2Rlc0J5dGUoaW50IGJ5dGVJZHgpIHt7CiAg"
+    "ICBpbnQgaXZlYzRJZHggPSBieXRlSWR4ID4+IDQ7CiAgICBpbnQgYnl0ZUluSXZlYzQgPSBieXRlSWR4"
+    "ICYgMTU7CiAgICBpbnQgY2h1bmtJZHggPSBpdmVjNElkeCAvIDUxMjsKICAgIGludCBsb2NhbEl2ZWM0"
+    "ID0gaXZlYzRJZHggJSA1MTI7CiAgICBpdmVjNCB2ID0gaXZlYzQoMCk7CntjaHIoMTApLmpvaW4oZicg"
+    "ICAgeyJpZiIgaWYgaz09MCBlbHNlICJlbHNlIGlmIn0gKGNodW5rSWR4ID09IHtrfSkgdiA9IHZxQ29k"
+    "ZXN7a31bbG9jYWxJdmVjNF07JyBmb3IgayBpbiByYW5nZShsZW4oY29kZXNfY2h1bmtzKSkpfQogICAg"
+    "cmV0dXJuIF9leHRyYWN0Qnl0ZSh2LCBieXRlSW5JdmVjNCk7Cn19CgovLyDilIDilIAgVlEgY29kZWJv"
+    "b2sgYnl0ZSBmZXRjaCAoc21hbGwsIGZpdHMgaW4gMSBjaHVuayB1c3VhbGx5KSDilIDilIDilIDilIDi"
+    "lIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKaW50IGZldGNoQ29kZWJvb2tCeXRlKGludCBieXRl"
+    "SWR4KSB7ewogICAgaW50IGl2ZWM0SWR4ID0gYnl0ZUlkeCA+PiA0OwogICAgaW50IGJ5dGVJbkl2ZWM0"
+    "ID0gYnl0ZUlkeCAmIDE1OwogICAgaW50IGNodW5rSWR4ID0gaXZlYzRJZHggLyA1MTI7CiAgICBpbnQg"
+    "bG9jYWxJdmVjNCA9IGl2ZWM0SWR4ICUgNTEyOwogICAgaXZlYzQgdiA9IGl2ZWM0KDApOwp7Y2hyKDEw"
+    "KS5qb2luKGYnICAgIHsiaWYiIGlmIGs9PTAgZWxzZSAiZWxzZSBpZiJ9IChjaHVua0lkeCA9PSB7a30p"
+    "IHYgPSB2cUNvZGVib29re2t9W2xvY2FsSXZlYzRdOycgZm9yIGsgaW4gcmFuZ2UobGVuKGNiX2NodW5r"
+    "cykpKX0KICAgIHJldHVybiBfZXh0cmFjdEJ5dGUodiwgYnl0ZUluSXZlYzQpOwp9fQoiIiIKCiAgICAj"
+    "IOKUgOKUgCBwb3Bjb3VudCBoZWxwZXIgKDQtYml0IG5pYmJsZSkKICAgICMg4pSA4pSAIGdldE5vdGU6"
+    "IGJpdG1hcCArIGRpY3QgbG9va3VwIHdpdGggTygxKSByb3cgc2VlayArIHByZWZpeCBwb3Bjb3VudAog"
+    "ICAgZGVjb2RlcnMgPSAiIiIKLy8g4pWQ4pWQ4pWQIFBhdHRlcm4gZGVjb2RlcjogYml0bWFwICsgZGlj"
+    "dGlvbmFyeSArIHJvdyBzZWVrIOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKV"
+    "kOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkOKVkAoKc3RydWN0IE5vdGUgeyBpbnQgaW5zdHJ1bWVudCwg"
+    "cGVyaW9kLCBlZmZlY3QsIHBhcmFtOyB9OwoKLy8gUG9wY291bnQgZm9yIDQtYml0IG5pYmJsZSAoMC4u"
+    "MTUg4oaSIDAuLjQpCmludCBwb3Bjb3VudDQoaW50IHgpIHsKICAgIHggPSAoeCAmIDB4NSkgKyAoKHgg"
+    "Pj4gMSkgJiAweDUpOwogICAgcmV0dXJuICh4ICYgMHgzKSArICgoeCA+PiAyKSAmIDB4Myk7Cn0KCi8v"
+    "IFJlY29uc3RydWN0IGN1bXVsYXRpdmUgbm9uLWVtcHR5IGNvdW50IHVwIHRvIHN0YXJ0IG9mIGByb3dg"
+    "IOKAlCBPKDEpLgovLyBSb3cgc2VlayB0YWJsZSBob2xkcyAxNi1iaXQgTEUgcHJlZml4IHN1bXM6IDIg"
+    "Ynl0ZXMgcGVyIHJvdy4KaW50IHJvd1NlZWtDdW0oaW50IHRhcmdldFJvdykgewogICAgaW50IGJ5dGVJ"
+    "ZHggPSB0YXJnZXRSb3cgKiAyOwogICAgaW50IGxvID0gZmV0Y2hSb3dTZWVrQnl0ZShieXRlSWR4KTsK"
+    "ICAgIGludCBoaSA9IGZldGNoUm93U2Vla0J5dGUoYnl0ZUlkeCArIDEpOwogICAgcmV0dXJuIGxvIHwg"
+    "KGhpIDw8IDgpOwp9CgpOb3RlIGVtcHR5Tm90ZSgpIHsgTm90ZSBuOyBuLmluc3RydW1lbnQ9MDsgbi5w"
+    "ZXJpb2Q9MDsgbi5lZmZlY3Q9MDsgbi5wYXJhbT0wOyByZXR1cm4gbjsgfQoKTm90ZSBnZXROb3RlKGlu"
+    "dCBzb25nUG9zLCBpbnQgcm93LCBpbnQgY2hhbm5lbCkgewogICAgaW50IHBhdCA9IHNvbmdQb3NpdGlv"
+    "bnNbc29uZ1Bvc107CiAgICBpbnQgcm93R2xvYmFsID0gcGF0ICogNjQgKyByb3c7CiAgICBpbnQgbm90"
+    "ZUlkeCAgID0gcm93R2xvYmFsICogNCArIGNoYW5uZWw7CgogICAgLy8gMSkgQml0bWFwIGNoZWNrCiAg"
+    "ICBpbnQgYm1CeXRlID0gZmV0Y2hCaXRtYXBCeXRlKG5vdGVJZHggPj4gMyk7CiAgICBpbnQgYml0ID0g"
+    "KGJtQnl0ZSA+PiAobm90ZUlkeCAmIDcpKSAmIDE7CiAgICBpZiAoYml0ID09IDApIHJldHVybiBlbXB0"
+    "eU5vdGUoKTsKCiAgICAvLyAyKSBDb3VudCBub24tZW1wdHkgbm90ZXMgYmVmb3JlIHRoaXMgcG9zaXRp"
+    "b24KICAgIC8vICAgID0gY3VtdWxhdGl2ZSB1cCB0byByb3dHbG9iYWwgKyBwb3Bjb3VudCBvZiBiaXRt"
+    "YXAgbmliYmxlIHdpdGhpbiB0aGlzIHJvdwogICAgaW50IHJhbmsgPSByb3dTZWVrQ3VtKHJvd0dsb2Jh"
+    "bCk7CiAgICAvLyBUaGlzIHJvdydzIDQgYml0cyBzcGFuIGNoYW5uZWxzIDAuLjMg4oaSIHRha2UgY2hh"
+    "bm5lbHMgWzAuLmNoYW5uZWwtMV0KICAgIGludCByb3dCaXRtYXBTdGFydCA9IHJvd0dsb2JhbCAqIDQ7"
+    "CiAgICAvLyBUaGUgNCBiaXRzIG9mIHRoaXMgcm93IG1heSBzcGFuIDEgYnl0ZSAoaWYgYWxpZ25lZCkg"
+    "b3IgMi4KICAgIGludCBieXRlMElkeCA9IHJvd0JpdG1hcFN0YXJ0ID4+IDM7CiAgICBpbnQgc2hpZnQg"
+    "ICAgPSByb3dCaXRtYXBTdGFydCAmIDc7CiAgICBpbnQgYnl0ZTAgPSBmZXRjaEJpdG1hcEJ5dGUoYnl0"
+    "ZTBJZHgpOwogICAgaW50IGJ5dGUxID0gZmV0Y2hCaXRtYXBCeXRlKGJ5dGUwSWR4ICsgMSk7CiAgICBp"
+    "bnQgcm93Qml0cyA9ICgoYnl0ZTAgPj4gc2hpZnQpIHwgKGJ5dGUxIDw8ICg4IC0gc2hpZnQpKSkgJiAw"
+    "eEY7CiAgICBpbnQgbWFzayA9ICgxIDw8IGNoYW5uZWwpIC0gMTsKICAgIHJhbmsgKz0gcG9wY291bnQ0"
+    "KHJvd0JpdHMgJiBtYXNrKTsKCiAgICAvLyAzKSBMb29rIHVwIGluZGV4IGFuZCBmZXRjaCBub3RlIGZy"
+    "b20gZGljdGlvbmFyeQogICAgaW50IGRpY3RJZHg7CiNpZiBJRFhfQllURVNfUEVSID09IDEKICAgIGRp"
+    "Y3RJZHggPSBmZXRjaElkeEJ5dGUocmFuayk7CiNlbHNlCiAgICBpbnQgbG8gPSBmZXRjaElkeEJ5dGUo"
+    "cmFuayAqIDIpOwogICAgaW50IGhpID0gZmV0Y2hJZHhCeXRlKHJhbmsgKiAyICsgMSk7CiAgICBkaWN0"
+    "SWR4ID0gbG8gfCAoaGkgPDwgOCk7CiNlbmRpZgogICAgaW50IGIwID0gZmV0Y2hEaWN0Qnl0ZShkaWN0"
+    "SWR4ICogNCArIDApOwogICAgaW50IGIxID0gZmV0Y2hEaWN0Qnl0ZShkaWN0SWR4ICogNCArIDEpOwog"
+    "ICAgaW50IGIyID0gZmV0Y2hEaWN0Qnl0ZShkaWN0SWR4ICogNCArIDIpOwogICAgaW50IGIzID0gZmV0"
+    "Y2hEaWN0Qnl0ZShkaWN0SWR4ICogNCArIDMpOwoKICAgIE5vdGUgbjsKICAgIG4uaW5zdHJ1bWVudCA9"
+    "IChiMCAmIDB4RjApIHwgKChiMiA+PiA0KSAmIDB4MEYpOwogICAgbi5wZXJpb2QgICAgID0gKChiMCAm"
+    "IDB4MEYpIDw8IDgpIHwgYjE7CiAgICBuLmVmZmVjdCAgICAgPSBiMiAmIDB4MEY7CiAgICBuLnBhcmFt"
+    "ICAgICAgPSBiMzsKICAgIHJldHVybiBuOwp9CgovLyDilZDilZDilZAgU2FtcGxlIGRlY29kZXI6IDIt"
+    "c3RhZ2UgUmVzaWR1YWwgVlEg4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ"
+    "4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQ4pWQCi8v"
+    "IEVhY2ggdmVjdG9yIGVuY29kZXMgMiBzYW1wbGVzLiBDb2RlIGlzIDExIGJpdHMgcGFja2VkIExTQi1m"
+    "aXJzdDoKLy8gICBiaXRzIFswLi41XSAgPSBzdGFnZS0xIGNvZGUgKEsxPTY0KQovLyAgIGJpdHMgWzYu"
+    "LjEwXSA9IHN0YWdlLTIgY29kZSAoSzI9MzIpCi8vIENvZGVib29rIGxheW91dDogW0sxw5cyIHNpZ25l"
+    "ZCBieXRlc11bSzLDlzIgc2lnbmVkIGJ5dGVzXSAoc3RvcmVkICsxMjggdW5zaWduZWQpCi8vIERlY29k"
+    "ZXI6IHNhbXBsZSA9IGNiMVtjb2RlMV1bbGFuZV0gKyBjYjJbY29kZTJdW2xhbmVdICAodHdvIGxvb2t1"
+    "cHMgKyBhZGQpCiNkZWZpbmUgUlZRX0JJVFMgICAgIDExCiNkZWZpbmUgUlZRX0sxICAgICAgIDY0CiNk"
+    "ZWZpbmUgUlZRX0syICAgICAgIDMyCiNkZWZpbmUgUlZRX0NCMl9CWVRFIChSVlFfSzEgKiAyKSAgIC8v"
+    "IGJ5dGUgb2Zmc2V0IG9mIHN0YWdlLTIgY29kZWJvb2sKCnZvaWQgX2dldFJWUUNvZGVzKGludCB2ZWNJ"
+    "ZHgsIG91dCBpbnQgY29kZTEsIG91dCBpbnQgY29kZTIpIHt7CiAgICBpbnQgYml0UG9zICA9IHZlY0lk"
+    "eCAqIFJWUV9CSVRTOwogICAgaW50IGJ5dGVQb3MgPSBiaXRQb3MgPj4gMzsKICAgIGludCBzaGlmdCAg"
+    "ID0gYml0UG9zICYgNzsKICAgIGludCBiMCA9IGZldGNoQ29kZXNCeXRlKGJ5dGVQb3MpOwogICAgaW50"
+    "IGIxID0gZmV0Y2hDb2Rlc0J5dGUoYnl0ZVBvcyArIDEpOwogICAgaW50IGIyID0gZmV0Y2hDb2Rlc0J5"
+    "dGUoYnl0ZVBvcyArIDIpOwogICAgaW50IGNvbWJpbmVkID0gYjAgfCAoYjEgPDwgOCkgfCAoYjIgPDwg"
+    "MTYpOwogICAgaW50IHJhdyA9IChjb21iaW5lZCA+PiBzaGlmdCkgJiAoKDEgPDwgUlZRX0JJVFMpIC0g"
+    "MSk7CiAgICBjb2RlMSA9IHJhdyAmIDB4M0Y7ICAgICAgICAgIC8vIGxvdyA2IGJpdHMg4oaSIHN0YWdl"
+    "LTEgKEsxPTY0KQogICAgY29kZTIgPSAocmF3ID4+IDYpICYgMHgxRjsgIC8vIG5leHQgNSBiaXRzIOKG"
+    "kiBzdGFnZS0yIChLMj0zMikKfX0KCmZsb2F0IGdldFNhbXBsZShpbnQgc2FtcGxlSWR4KSB7ewogICAg"
+    "aWYgKHNhbXBsZUlkeCA8IDAgfHwgc2FtcGxlSWR4ID49IFRPVEFMX1NBTVBMRVMpIHJldHVybiAwLjA7"
+    "CiAgICBpbnQgdmVjSWR4ID0gc2FtcGxlSWR4ID4+IDE7CiAgICBpbnQgbGFuZSAgID0gc2FtcGxlSWR4"
+    "ICYgMTsKICAgIGludCBjb2RlMSwgY29kZTI7CiAgICBfZ2V0UlZRQ29kZXModmVjSWR4LCBjb2RlMSwg"
+    "Y29kZTIpOwogICAgaW50IHViMSA9IGZldGNoQ29kZWJvb2tCeXRlKGNvZGUxICogMiArIGxhbmUpOwog"
+    "ICAgaW50IHMxICA9IHViMSA8IDEyOCA/IHViMSA6IHViMSAtIDI1NjsKICAgIGludCB1YjIgPSBmZXRj"
+    "aENvZGVib29rQnl0ZShSVlFfQ0IyX0JZVEUgKyBjb2RlMiAqIDIgKyBsYW5lKTsKICAgIGludCBzMiAg"
+    "PSB1YjIgPCAxMjggPyB1YjIgOiB1YjIgLSAyNTY7CiAgICByZXR1cm4gZmxvYXQoczEgKyBzMikgLyAx"
+    "MjguMDsKfX0KCi8vIOKUgOKUgCBQb3NpdGlvbiBjYWxjdWxhdGlvbiAoRnh4LWF3YXJlIHZpYSByb3dT"
+    "dGFydFRpY2spIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKU"
+    "gOKUgOKUgOKUgApzdHJ1Y3QgUG9zaXRpb24geyBpbnQgc29uZ1BvcywgcGF0dGVybiwgcm93OyBmbG9h"
+    "dCB0aWNrLCByb3dUaW1lOyB9OwoKLy8gRmV0Y2ggMTYtYml0IExFIHZhbHVlIGF0IHJvdyBpbmRleCBp"
+    "bnRvIHJvd1N0YXJ0VGljawppbnQgZmV0Y2hUaWNrKGludCByb3dJZHgpIHsKICAgIGludCBieXRlSWR4"
+    "ID0gcm93SWR4ICogMjsKICAgIGludCBjaHVua0lkeCAgPSBieXRlSWR4ID4+IDY7CiAgICBpbnQgYnl0"
+    "ZUluMTYgID0gYnl0ZUlkeCAmIDYzOwogICAgaW50IGxvID0gX2V4dHJhY3RCeXRlKHJvd1N0YXJ0VGlj"
+    "azBbKGNodW5rSWR4PDwyKSsoYnl0ZUluMTY+PjQpXSwgYnl0ZUluMTYgJiAxNSk7CiAgICAvLyBuZXh0"
+    "IGJ5dGUKICAgIGludCBieXRlSWR4MiA9IGJ5dGVJZHggKyAxOwogICAgaW50IGNodW5rSWR4MiA9IGJ5"
+    "dGVJZHgyID4+IDY7CiAgICBpbnQgYnl0ZUluMTZfMiA9IGJ5dGVJZHgyICYgNjM7CiAgICBpbnQgaGkg"
+    "PSBfZXh0cmFjdEJ5dGUocm93U3RhcnRUaWNrMFsoY2h1bmtJZHgyPDwyKSsoYnl0ZUluMTZfMj4+NCld"
+    "LCBieXRlSW4xNl8yICYgMTUpOwogICAgcmV0dXJuIGxvIHwgKGhpIDw8IDgpOwp9CgpQb3NpdGlvbiBn"
+    "ZXRQb3NpdGlvbihmbG9hdCB0aW1lKSB7CiAgICBQb3NpdGlvbiBwb3M7CiAgICBmbG9hdCBzb25nRHVy"
+    "YXRpb24gPSBmbG9hdChUT1RBTF9USUNLUykgLyBUSUNLU19QRVJfU0VDOwogICAgZmxvYXQgbG9vcGVk"
+    "VGltZSA9IG1vZCh0aW1lLCBzb25nRHVyYXRpb24pOwogICAgZmxvYXQgdG90YWxUaWNrRiA9IGxvb3Bl"
+    "ZFRpbWUgKiBUSUNLU19QRVJfU0VDOwoKICAgIC8vIEJpbmFyeSBzZWFyY2ggcm93U3RhcnRUaWNrIGZv"
+    "ciB0aGUgY3VycmVudCByb3cKICAgIGludCBsbyA9IDAsIGhpID0gTlVNX1NPTkdfUk9XUzsKICAgIGZv"
+    "ciAoaW50IF9icyA9IDA7IF9icyA8IDEyOyBfYnMrKykgeyAgLy8gbG9nMigxOTIwKykg4omIIDExCiAg"
+    "ICAgICAgaWYgKGxvID49IGhpIC0gMSkgYnJlYWs7CiAgICAgICAgaW50IG1pZCA9IChsbyArIGhpKSA+"
+    "PiAxOwogICAgICAgIGlmIChmbG9hdChmZXRjaFRpY2sobWlkKSkgPD0gdG90YWxUaWNrRikgbG8gPSBt"
+    "aWQ7CiAgICAgICAgZWxzZSBoaSA9IG1pZDsKICAgIH0KICAgIGludCBnbG9iYWxSb3cgPSBsbzsKICAg"
+    "IGlmIChnbG9iYWxSb3cgPj0gTlVNX1NPTkdfUk9XUykgZ2xvYmFsUm93ID0gTlVNX1NPTkdfUk9XUyAt"
+    "IDE7CgogICAgcG9zLnNvbmdQb3MgPSBnbG9iYWxSb3cgPj4gNjsgICAgICAgICAgICAgICAgICAgLy8g"
+    "LzY0CiAgICBwb3MucGF0dGVybiA9IHNvbmdQb3NpdGlvbnNbcG9zLnNvbmdQb3NdOwogICAgcG9zLnJv"
+    "dyAgICAgPSBnbG9iYWxSb3cgJiA2MzsgICAgICAgICAgICAgICAgICAgLy8gJTY0CgogICAgaW50IHJv"
+    "d1RpY2sgICAgPSBmZXRjaFRpY2soZ2xvYmFsUm93KTsKICAgIGludCBuZXh0VGljayAgID0gZmV0Y2hU"
+    "aWNrKGdsb2JhbFJvdyArIDEpOwogICAgaW50IHJvd1NwZWVkICAgPSBuZXh0VGljayAtIHJvd1RpY2s7"
+    "CiAgICBwb3MudGljayAgICAgICA9IHRvdGFsVGlja0YgLSBmbG9hdChyb3dUaWNrKTsKICAgIHBvcy5y"
+    "b3dUaW1lICAgID0gZmxvYXQocm93U3BlZWQpIC8gVElDS1NfUEVSX1NFQzsKICAgIHJldHVybiBwb3M7"
+    "Cn0KCi8vIDQtcG9pbnQgY3ViaWMgQi1zcGxpbmUgaW50ZXJwb2xhdGlvbi4KLy8gQi1zcGxpbmUgaXMg"
+    "QVBQUk9YSU1BVElORyAoc21vb3RocyB0aHJvdWdoIHNhbXBsZSBwb2ludHMpIHJhdGhlciB0aGFuCi8v"
+    "IElOVEVSUE9MQVRJTkcgKHBhc3NpbmcgZXhhY3RseSB0aHJvdWdoIHRoZW0pLCBnaXZpbmcgaW5oZXJl"
+    "bnQgbG93LXBhc3MKLy8gY2hhcmFjdGVyLiBBdCAzLWJpdCBxdWFudGl6YXRpb24gdGhpcyByZWR1Y2Vz"
+    "IEhGIG5vaXNlIGJ5IH4yNSUgdnMKLy8gQ2F0bXVsbC1Sb20vSGVybWl0ZSBhdCBpZGVudGljYWwgY29z"
+    "dCAoc2FtZSA0IHRhcHMsIGRpZmZlcmVudCB3ZWlnaHRzKS4KZmxvYXQgZ2V0U2FtcGxlRihpbnQgYmFz"
+    "ZSwgZmxvYXQgZnBvcywgaW50IHNtcExlbiwgaW50IGxvb3BTdGFydCwgaW50IGxvb3BMZW4pIHsKICAg"
+    "IGludCBpICA9IGludChmcG9zKTsKICAgIGZsb2F0IHQgPSBmcG9zIC0gZmxvYXQoaSk7CiAgICBpbnQg"
+    "aTAgPSBpIC0gMTsKICAgIGlmIChsb29wTGVuID4gMiAmJiBpMCA8IGxvb3BTdGFydCkgaTAgPSBsb29w"
+    "U3RhcnQgKyBsb29wTGVuIC0gMTsKICAgIGVsc2UgaTAgPSBtYXgoMCwgaTApOwogICAgZmxvYXQgcDAg"
+    "PSBnZXRTYW1wbGUoYmFzZSArIGkwKTsKICAgIGZsb2F0IHAxID0gZ2V0U2FtcGxlKGJhc2UgKyBpKTsK"
+    "ICAgIGZsb2F0IHAyID0gZ2V0U2FtcGxlKGJhc2UgKyBtaW4oaSArIDEsIHNtcExlbiArIDE1KSk7CiAg"
+    "ICBmbG9hdCBwMyA9IGdldFNhbXBsZShiYXNlICsgbWluKGkgKyAyLCBzbXBMZW4gKyAxNSkpOwogICAg"
+    "ZmxvYXQgdDIgPSB0ICogdDsKICAgIGZsb2F0IHQzID0gdDIgKiB0OwogICAgZmxvYXQgdzAgPSAoMS4w"
+    "IC0gdCkgKiAoMS4wIC0gdCkgKiAoMS4wIC0gdCkgLyA2LjA7CiAgICBmbG9hdCB3MSA9ICgzLjAgKiB0"
+    "MyAtIDYuMCAqIHQyICsgNC4wKSAvIDYuMDsKICAgIGZsb2F0IHcyID0gKC0zLjAgKiB0MyArIDMuMCAq"
+    "IHQyICsgMy4wICogdCArIDEuMCkgLyA2LjA7CiAgICBmbG9hdCB3MyA9IHQzIC8gNi4wOwogICAgcmV0"
+    "dXJuIHcwICogcDAgKyB3MSAqIHAxICsgdzIgKiBwMiArIHczICogcDM7Cn0KCiIiIgoKICAgIGltcG9y"
+    "dCBiYXNlNjQgYXMgX2I2NGUKICAgIGdldF9jaGFubmVsX291dHB1dCA9IF9iNjRlLmI2NGRlY29kZSgn"
+    "THk4Z2RtbGlWR0ZpSUdseklHUmxZMnhoY21Wa0lHRnpJR0VnWjJ4dlltRnNJR052Ym5OMElHWnNiMkYw"
+    "V3pNeVhTQnVaV0Z5SUhSb1pTQjBiM0FnYjJZZ1EyOXRiVzl1Q2k4dklDaHlhV2RvZENCaFpuUmxjaUJ3"
+    "WlhKcGIyUlVZV0pzWlNrdUlFUnZiaWQwSUhKbFpHVmpiR0Z5WlNCcGRDQm9aWEpsTGdvS1pteHZZWFFn"
+    "WjJWMFEyaGhibTVsYkU5MWRIQjFkQ2hwYm5RZ1kyZ3NJR1pzYjJGMElIUnBiV1VzSUZCdmMybDBhVzl1"
+    "SUhCdmN5d2dabXh2WVhRZ2NtOTNWR2x0WlNrZ2V3b0tJQ0FnSUM4dklGTjBaWEFnTVRvZ1ptbHVaQ0J0"
+    "YjNOMExYSmxZMlZ1ZEd4NUxYUnlhV2RuWlhKbFpDQnViM1JsSUc5dUlIUm9hWE1nWTJoaGJtNWxiQW9n"
+    "SUNBZ1RtOTBaU0IwY21sblRtOTBaU0E5SUdkbGRFNXZkR1VvY0c5ekxuTnZibWRRYjNNc0lIQnZjeTV5"
+    "YjNjc0lHTm9LVHNLSUNBZ0lHbHVkQ0FnZEhKcFoxSnZkeUFnUFNCd2IzTXVjbTkzT3dvZ0lDQWdhVzUw"
+    "SUNCMGNtbG5VR0YwSUNBOUlIQnZjeTV6YjI1blVHOXpPd29nSUNBZ2FXWWdLSFJ5YVdkT2IzUmxMbWx1"
+    "YzNSeWRXMWxiblFnUEQwZ01DQjhmQ0IwY21sblRtOTBaUzV3WlhKcGIyUWdQRDBnTUNrZ2V3b2dJQ0Fn"
+    "SUNBZ0lHbHVkQ0J6VWlBOUlIQnZjeTV5YjNjc0lITlFJRDBnY0c5ekxuTnZibWRRYjNNN0NpQWdJQ0Fn"
+    "SUNBZ1ptOXlJQ2hwYm5RZ2JHSWdQU0F4T3lCc1lpQThJRFkwT3lCc1lpc3JLU0I3Q2lBZ0lDQWdJQ0Fn"
+    "SUNBZ0lITlNMUzA3Q2lBZ0lDQWdJQ0FnSUNBZ0lHbG1JQ2h6VWlBOElEQXBJSHNLSUNBZ0lDQWdJQ0Fn"
+    "SUNBZ0lDQWdJR2xtSUNoelVDQStJREFwSUhzS0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQnpVQzB0"
+    "T3dvZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lITlNJRDBnY0dGMFUzUmhjblJTYjNkYmMxQmRJQ3Nn"
+    "S0hCaGRGSnZkMDltWm5ObGRGdHpVQ3N4WFNBdElIQmhkRkp2ZDA5bVpuTmxkRnR6VUYwcElDMGdNVHNL"
+    "SUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJSDBnWld4elpTQjdJR0p5WldGck95QjlDaUFnSUNBZ0lDQWdJQ0Fn"
+    "SUgwS0lDQWdJQ0FnSUNBZ0lDQWdUbTkwWlNCd2NtVjJJRDBnWjJWMFRtOTBaU2h6VUN3Z2MxSXNJR05v"
+    "S1RzS0lDQWdJQ0FnSUNBZ0lDQWdhV1lnS0hCeVpYWXVhVzV6ZEhKMWJXVnVkQ0ErSURBZ2ZId2djSEps"
+    "ZGk1d1pYSnBiMlFnUGlBd0tTQjdDaUFnSUNBZ0lDQWdJQ0FnSUNBZ0lDQjBjbWxuVG05MFpTQTlJSEJ5"
+    "WlhZN0lIUnlhV2RTYjNjZ1BTQnpVanNnZEhKcFoxQmhkQ0E5SUhOUU93b2dJQ0FnSUNBZ0lDQWdJQ0Fn"
+    "SUNBZ1luSmxZV3M3Q2lBZ0lDQWdJQ0FnSUNBZ0lIMEtJQ0FnSUNBZ0lDQjlDaUFnSUNCOUNnb2dJQ0Fn"
+    "YVdZZ0tIUnlhV2RPYjNSbExtbHVjM1J5ZFcxbGJuUWdQRDBnTUNCOGZDQjBjbWxuVG05MFpTNXBibk4w"
+    "Y25WdFpXNTBJRDRnTXpFZ2ZId2dkSEpwWjA1dmRHVXVjR1Z5YVc5a0lEdzlJREFwQ2lBZ0lDQWdJQ0Fn"
+    "Y21WMGRYSnVJREF1TURzS0NpQWdJQ0JUWVcxd2JHVkpibVp2SUhOdGNDQTlJSE5oYlhCc1pYTmJkSEpw"
+    "WjA1dmRHVXVhVzV6ZEhKMWJXVnVkQ0F0SURGZE93b2dJQ0FnYVdZZ0tITnRjQzVzWlc1bmRHZ2dQVDBn"
+    "TUNrZ2NtVjBkWEp1SURBdU1Ec0tDaUFnSUNBdkx5QlVhV05yTFdKaGMyVmtJSFJwYldVS0lDQWdJR2x1"
+    "ZENCZmRISnBaMGRTSUQwZ2RISnBaMUJoZENBcUlEWTBJQ3NnS0hSeWFXZFNiM2NnTFNCd1lYUlRkR0Z5"
+    "ZEZKdmQxdDBjbWxuVUdGMFhTazdDaUFnSUNCcGJuUWdYMk4xY25KSFVpQTlJSEJ2Y3k1emIyNW5VRzl6"
+    "SUNvZ05qUWdLeUFvY0c5ekxuSnZkeUF0SUhCaGRGTjBZWEowVW05M1czQnZjeTV6YjI1blVHOXpYU2s3"
+    "Q2lBZ0lDQm1iRzloZENCMGNtbG5aMlZ5VkdsdFpTQTlJR1pzYjJGMEtHWmxkR05vVkdsamF5aGZkSEpw"
+    "WjBkU0tTa2dMeUJVU1VOTFUxOVFSVkpmVTBWRE93b2dJQ0FnWm14dllYUWdZM1Z5Y21WdWRGUnBiV1Vn"
+    "UFNCbWJHOWhkQ2htWlhSamFGUnBZMnNvWDJOMWNuSkhVaWtwSUM4Z1ZFbERTMU5mVUVWU1gxTkZReUFy"
+    "SUhCdmN5NTBhV05ySUM4Z1ZFbERTMU5mVUVWU1gxTkZRenNLSUNBZ0lHWnNiMkYwSUdWc1lYQnpaV1Fn"
+    "UFNCamRYSnlaVzUwVkdsdFpTQXRJSFJ5YVdkblpYSlVhVzFsT3dvZ0lDQWdhV1lnS0dWc1lYQnpaV1Fn"
+    "UENBd0xqQXBJSEpsZEhWeWJpQXdMakE3Q2dvZ0lDQWdhVzUwSUY5d1kzUWdQU0JwYm5Rb2NHOXpMblJw"
+    "WTJzcE93b2dJQ0FnVG05MFpTQmZjR055SUQwZ1oyVjBUbTkwWlNod2IzTXVjMjl1WjFCdmN5d2djRzl6"
+    "TG5KdmR5d2dZMmdwT3dvS0lDQWdJQzh2SU9LVWdPS1VnQ0JEYjIxaWFXNWxaQ0JtYjNKM1lYSmtJSE5q"
+    "WVc0NklISmxZblZwYkdRZ2NHbDBZMmdnUVU1RUlIWnZiSFZ0WlNCbWNtOXRJSFJ5YVdkblpYSWdkRzhn"
+    "WTNWeWNtVnVkQ0RpbElEaWxJQUtJQ0FnSUdac2IyRjBJR1ZtWm1WamRHbDJaVkJsY21sdlpDQTlJR1pz"
+    "YjJGMEtIUnlhV2RPYjNSbExuQmxjbWx2WkNrN0NpQWdJQ0JtYkc5aGRDQjBZWEpuWlhSUVpYSnBiMlFn"
+    "SUNBZ1BTQm1iRzloZENoMGNtbG5UbTkwWlM1d1pYSnBiMlFwT3dvZ0lDQWdhVzUwSUNBZ2RtOXNkVzFs"
+    "SUNBZ0lDQWdJQ0FnSUQwZ2MyMXdMblp2YkhWdFpUc0tDaUFnSUNBdkx5QkJjSEJzZVNCMGNtbG5aMlZ5"
+    "TFhKdmR5QmxabVpsWTNSek9pQkRlSGdnS0hObGRDQjJiMndwTENCQmVIZ3ZObmg0SUNoMmIyd2djMnhw"
+    "WkdVZ2NHRnlkR2xoYkM5bWRXeHNLUW9nSUNBZ2FXWWdLSFJ5YVdkT2IzUmxMbVZtWm1WamRDQTlQU0F3"
+    "ZUVNcElIc0tJQ0FnSUNBZ0lDQjJiMngxYldVZ1BTQnRhVzRvZEhKcFowNXZkR1V1Y0dGeVlXMHNJRFkw"
+    "S1RzS0lDQWdJSDBnWld4elpTQnBaaUFvZEhKcFowNXZkR1V1WldabVpXTjBJRDA5SURCNFFTQjhmQ0Iw"
+    "Y21sblRtOTBaUzVsWm1abFkzUWdQVDBnTUhnMktTQjdDaUFnSUNBZ0lDQWdhVzUwSUY5emRTQTlJQ2gw"
+    "Y21sblRtOTBaUzV3WVhKaGJUNCtOQ2ttTUhoR0xDQmZjMlFnUFNCMGNtbG5UbTkwWlM1d1lYSmhiU1l3"
+    "ZUVZN0NpQWdJQ0FnSUNBZ2FXNTBJRjl6ZEdWd0lEMGdLRjl6ZFQ0d0tTQS9JRjl6ZFNBNklDMWZjMlE3"
+    "Q2lBZ0lDQWdJQ0FnYVdZZ0tIUnlhV2RRWVhRZ1BUMGdjRzl6TG5OdmJtZFFiM01nSmlZZ2RISnBaMUp2"
+    "ZHlBOVBTQndiM011Y205M0tTQjdDaUFnSUNBZ0lDQWdJQ0FnSUhadmJIVnRaU0E5SUdOc1lXMXdLSFp2"
+    "YkhWdFpTQXJJRjl6ZEdWd0lDb2dYM0JqZEN3Z01Dd2dOalFwT3dvZ0lDQWdJQ0FnSUgwZ1pXeHpaU0I3"
+    "Q2lBZ0lDQWdJQ0FnSUNBZ0lHbHVkQ0JmZEhNZ1BTQm1aWFJqYUZScFkyc29YM1J5YVdkSFVpQXJJREVw"
+    "SUMwZ1ptVjBZMmhVYVdOcktGOTBjbWxuUjFJcE93b2dJQ0FnSUNBZ0lDQWdJQ0IyYjJ4MWJXVWdQU0Jq"
+    "YkdGdGNDaDJiMngxYldVZ0t5QmZjM1JsY0NBcUlDaGZkSE10TVNrc0lEQXNJRFkwS1RzS0lDQWdJQ0Fn"
+    "SUNCOUNpQWdJQ0I5Q2dvZ0lDQWdMeThnUm05eWQyRnlaQ0J6WTJGdU9pQnliM2R6SUZOVVVrbERWRXha"
+    "SUdKbGRIZGxaVzRnZEhKcFoyZGxjaUJoYm1RZ1kzVnljbVZ1ZEFvZ0lDQWdhV1lnS0hSeWFXZFFZWFFn"
+    "SVQwZ2NHOXpMbk52Ym1kUWIzTWdmSHdnZEhKcFoxSnZkeUFoUFNCd2IzTXVjbTkzS1NCN0NpQWdJQ0Fn"
+    "SUNBZ2FXNTBJRjltY0NBOUlIUnlhV2RRWVhRc0lGOW1jaUE5SUhSeWFXZFNiM2NnS3lBeE93b2dJQ0Fn"
+    "SUNBZ0lHbG1JQ2hmWm5JZ1BqMGdjR0YwVTNSaGNuUlNiM2RiWDJad1hTQXJJQ2h3WVhSU2IzZFBabVp6"
+    "WlhSYlgyWndLekZkSUMwZ2NHRjBVbTkzVDJabWMyVjBXMTltY0YwcEtTQjdDaUFnSUNBZ0lDQWdJQ0Fn"
+    "SUY5bWNDc3JPeUJmWm5JZ1BTQW9YMlp3SUR3Z1UwOU9SMTlNUlU1SFZFZ3BJRDhnY0dGMFUzUmhjblJT"
+    "YjNkYlgyWndYU0E2SURBN0NpQWdJQ0FnSUNBZ2ZRb2dJQ0FnSUNBZ0lHWnZjaUFvYVc1MElGOW1hU0E5"
+    "SURBN0lGOW1hU0E4SURZME95QmZabWtyS3lrZ2V3b2dJQ0FnSUNBZ0lDQWdJQ0JwWmlBb1gyWndJRDRn"
+    "Y0c5ekxuTnZibWRRYjNNZ2ZId2dLRjltY0NBOVBTQndiM011YzI5dVoxQnZjeUFtSmlCZlpuSWdQajBn"
+    "Y0c5ekxuSnZkeWtwSUdKeVpXRnJPd29nSUNBZ0lDQWdJQ0FnSUNCcFppQW9YMlp3SUQ0OUlGTlBUa2Rm"
+    "VEVWT1IxUklLU0JpY21WaGF6c0tJQ0FnSUNBZ0lDQWdJQ0FnYVdZZ0tGOW1jaUErUFNCd1lYUlRkR0Z5"
+    "ZEZKdmQxdGZabkJkSUNzZ0tIQmhkRkp2ZDA5bVpuTmxkRnRmWm5Bck1WMGdMU0J3WVhSU2IzZFBabVp6"
+    "WlhSYlgyWndYU2twSUhzS0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUY5bWNDc3JPeUJmWm5JZ1BTQW9YMlp3"
+    "SUR3Z1UwOU9SMTlNUlU1SFZFZ3BJRDhnY0dGMFUzUmhjblJTYjNkYlgyWndYU0E2SURBN0NpQWdJQ0Fn"
+    "SUNBZ0lDQWdJQ0FnSUNCamIyNTBhVzUxWlRzS0lDQWdJQ0FnSUNBZ0lDQWdmUW9nSUNBZ0lDQWdJQ0Fn"
+    "SUNCT2IzUmxJRjltYmlBOUlHZGxkRTV2ZEdVb1gyWndMQ0JmWm5Jc0lHTm9LVHNLSUNBZ0lDQWdJQ0Fn"
+    "SUNBZ2FXWWdLRjltYmk1cGJuTjBjblZ0Wlc1MElENGdNQ0I4ZkNCZlptNHVjR1Z5YVc5a0lENGdNQ2tn"
+    "WW5KbFlXczdJQ0F2THlCdVpYY2dkSEpwWjJkbGNpQmxibVJ6SUhSb1pTQnpZMkZ1Q2dvZ0lDQWdJQ0Fn"
+    "SUNBZ0lDQnBiblFnWDNObmNpQWdJRDBnWDJad0lDb2dOalFnS3lBb1gyWnlJQzBnY0dGMFUzUmhjblJT"
+    "YjNkYlgyWndYU2s3Q2lBZ0lDQWdJQ0FnSUNBZ0lHbHVkQ0JmWm5Wc2JDQWdQU0JtWlhSamFGUnBZMnNv"
+    "WDNObmNpQXJJREVwSUMwZ1ptVjBZMmhVYVdOcktGOXpaM0lwSUMwZ01Uc2dJQzh2SUhScFkydHpJREV1"
+    "TG5Od1pXVmtMVEVLQ2lBZ0lDQWdJQ0FnSUNBZ0lDOHZJRkJwZEdOb0lHVm1abVZqZEhNS0lDQWdJQ0Fn"
+    "SUNBZ0lDQWdhV1lnS0Y5bWJpNWxabVpsWTNRZ1BUMGdNSGd4S1FvZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0Fn"
+    "WldabVpXTjBhWFpsVUdWeWFXOWtJRDBnYldGNEtERXhNeTR3TENCbFptWmxZM1JwZG1WUVpYSnBiMlFn"
+    "TFNCbWJHOWhkQ2hmWm00dWNHRnlZVzBnS2lCZlpuVnNiQ2twT3dvZ0lDQWdJQ0FnSUNBZ0lDQmxiSE5s"
+    "SUdsbUlDaGZabTR1WldabVpXTjBJRDA5SURCNE1pa0tJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lHVm1abVZq"
+    "ZEdsMlpWQmxjbWx2WkNBOUlHMXBiaWc0TlRZdU1Dd2daV1ptWldOMGFYWmxVR1Z5YVc5a0lDc2dabXh2"
+    "WVhRb1gyWnVMbkJoY21GdElDb2dYMloxYkd3cEtUc0tJQ0FnSUNBZ0lDQWdJQ0FnWld4elpTQnBaaUFv"
+    "WDJadUxtVm1abVZqZENBOVBTQXdlRE1wSUhzS0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUdsbUlDaGxabVps"
+    "WTNScGRtVlFaWEpwYjJRZ1BDQjBZWEpuWlhSUVpYSnBiMlFwQ2lBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0Fn"
+    "SUNBZ1pXWm1aV04wYVhabFVHVnlhVzlrSUQwZ2JXbHVLSFJoY21kbGRGQmxjbWx2WkN3Z1pXWm1aV04w"
+    "YVhabFVHVnlhVzlrSUNzZ1pteHZZWFFvWDJadUxuQmhjbUZ0SUNvZ1gyWjFiR3dwS1RzS0lDQWdJQ0Fn"
+    "SUNBZ0lDQWdJQ0FnSUdWc2MyVWdhV1lnS0dWbVptVmpkR2wyWlZCbGNtbHZaQ0ErSUhSaGNtZGxkRkJs"
+    "Y21sdlpDa0tJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0JsWm1abFkzUnBkbVZRWlhKcGIyUWdQU0J0"
+    "WVhnb2RHRnlaMlYwVUdWeWFXOWtMQ0JsWm1abFkzUnBkbVZRWlhKcGIyUWdMU0JtYkc5aGRDaGZabTR1"
+    "Y0dGeVlXMGdLaUJmWm5Wc2JDa3BPd29nSUNBZ0lDQWdJQ0FnSUNCOUNpQWdJQ0FnSUNBZ0lDQWdJQzh2"
+    "SUZadmJIVnRaU0JsWm1abFkzUnpDaUFnSUNBZ0lDQWdJQ0FnSUdWc2MyVWdhV1lnS0Y5bWJpNWxabVps"
+    "WTNRZ1BUMGdNSGhES1FvZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnZG05c2RXMWxJRDBnYldsdUtGOW1iaTV3"
+    "WVhKaGJTd2dOalFwT3dvZ0lDQWdJQ0FnSUNBZ0lDQmxiSE5sSUdsbUlDaGZabTR1WldabVpXTjBJRDA5"
+    "SURCNFFTQjhmQ0JmWm00dVpXWm1aV04wSUQwOUlEQjROaWtnZXdvZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0Fn"
+    "YVc1MElGOTJkU0E5SUNoZlptNHVjR0Z5WVcwK1BqUXBKakI0Uml3Z1gzWmtJRDBnWDJadUxuQmhjbUZ0"
+    "SmpCNFJqc0tJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lIWnZiSFZ0WlNBOUlHTnNZVzF3S0hadmJIVnRaU0Fy"
+    "SUNoZmRuVStNRDlmZG5VNkxWOTJaQ2tnS2lCZlpuVnNiQ3dnTUN3Z05qUXBPd29nSUNBZ0lDQWdJQ0Fn"
+    "SUNCOUNpQWdJQ0FnSUNBZ0lDQWdJRjltY2lzck93b2dJQ0FnSUNBZ0lDQWdJQ0JwWmlBb1gyWnlJRDQ5"
+    "SURZMEtTQjdJRjltY2lBOUlEQTdJRjltY0Nzck95QjlDaUFnSUNBZ0lDQWdmUW9LSUNBZ0lDQWdJQ0F2"
+    "THlCRGRYSnlaVzUwSUhKdmR5QndZWEowYVdGc0lDaHViMjR0ZEhKcFoyZGxjaUJ5YjNjZ2IyNXNlU0Rp"
+    "Z0pRZ2RISnBaMmRsY2lCb1lXNWtiR1ZrSUdGaWIzWmxLUW9nSUNBZ0lDQWdJR2xtSUNoZmNHTnlMbWx1"
+    "YzNSeWRXMWxiblFnUEQwZ01DQW1KaUJmY0dOeUxuQmxjbWx2WkNBOFBTQXdLU0I3Q2lBZ0lDQWdJQ0Fn"
+    "SUNBZ0lHbG1JQ2hmY0dOeUxtVm1abVZqZENBOVBTQXdlRU1wQ2lBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0Iy"
+    "YjJ4MWJXVWdQU0J0YVc0b1gzQmpjaTV3WVhKaGJTd2dOalFwT3dvZ0lDQWdJQ0FnSUNBZ0lDQmxiSE5s"
+    "SUdsbUlDaGZjR055TG1WbVptVmpkQ0E5UFNBd2VFRWdmSHdnWDNCamNpNWxabVpsWTNRZ1BUMGdNSGcy"
+    "S1NCN0NpQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNCcGJuUWdYM1oxSUQwZ0tGOXdZM0l1Y0dGeVlXMCtQalFw"
+    "SmpCNFJpd2dYM1prSUQwZ1gzQmpjaTV3WVhKaGJTWXdlRVk3Q2lBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0Iy"
+    "YjJ4MWJXVWdQU0JqYkdGdGNDaDJiMngxYldVZ0t5QW9YM1oxUGpBL1gzWjFPaTFmZG1RcElDb2dYM0Jq"
+    "ZEN3Z01Dd2dOalFwT3dvZ0lDQWdJQ0FnSUNBZ0lDQjlDaUFnSUNBZ0lDQWdmUW9nSUNBZ2ZRb0tJQ0Fn"
+    "SUM4dklFTjFjbkpsYm5RZ2NtOTNJSEJoY25ScFlXd2djR2wwWTJnZ1pXWm1aV04wSUNoaGNIQnNhV1Z6"
+    "SUdWMlpXNGdiMjRnZEhKcFoyZGxjaUJ5YjNjcENpQWdJQ0JwWmlBb1gzQmpjaTVsWm1abFkzUWdQVDBn"
+    "TUhneEtRb2dJQ0FnSUNBZ0lHVm1abVZqZEdsMlpWQmxjbWx2WkNBOUlHMWhlQ2d4TVRNdU1Dd2daV1pt"
+    "WldOMGFYWmxVR1Z5YVc5a0lDMGdabXh2WVhRb1gzQmpjaTV3WVhKaGJTQXFJRjl3WTNRcEtUc0tJQ0Fn"
+    "SUdWc2MyVWdhV1lnS0Y5d1kzSXVaV1ptWldOMElEMDlJREI0TWlrS0lDQWdJQ0FnSUNCbFptWmxZM1Jw"
+    "ZG1WUVpYSnBiMlFnUFNCdGFXNG9PRFUyTGpBc0lHVm1abVZqZEdsMlpWQmxjbWx2WkNBcklHWnNiMkYw"
+    "S0Y5d1kzSXVjR0Z5WVcwZ0tpQmZjR04wS1NrN0NpQWdJQ0JsYkhObElHbG1JQ2hmY0dOeUxtVm1abVZq"
+    "ZENBOVBTQXdlRE1nSmlZZ1gzQmpjaTVwYm5OMGNuVnRaVzUwSUQwOUlEQWdKaVlnWDNCamNpNXdaWEpw"
+    "YjJRZ1BUMGdNQ2tnZXdvZ0lDQWdJQ0FnSUdsbUlDaGxabVpsWTNScGRtVlFaWEpwYjJRZ1BDQjBZWEpu"
+    "WlhSUVpYSnBiMlFwQ2lBZ0lDQWdJQ0FnSUNBZ0lHVm1abVZqZEdsMlpWQmxjbWx2WkNBOUlHMXBiaWgw"
+    "WVhKblpYUlFaWEpwYjJRc0lHVm1abVZqZEdsMlpWQmxjbWx2WkNBcklHWnNiMkYwS0Y5d1kzSXVjR0Z5"
+    "WVcwZ0tpQmZjR04wS1NrN0NpQWdJQ0FnSUNBZ1pXeHpaU0JwWmlBb1pXWm1aV04wYVhabFVHVnlhVzlr"
+    "SUQ0Z2RHRnlaMlYwVUdWeWFXOWtLUW9nSUNBZ0lDQWdJQ0FnSUNCbFptWmxZM1JwZG1WUVpYSnBiMlFn"
+    "UFNCdFlYZ29kR0Z5WjJWMFVHVnlhVzlrTENCbFptWmxZM1JwZG1WUVpYSnBiMlFnTFNCbWJHOWhkQ2hm"
+    "Y0dOeUxuQmhjbUZ0SUNvZ1gzQmpkQ2twT3dvZ0lDQWdmUW9nSUNBZ1pteHZZWFFnWW1GelpWQmxjbWx2"
+    "WkNBOUlHVm1abVZqZEdsMlpWQmxjbWx2WkRzS0NpQWdJQ0F2THlCQmNuQmxaMmRwYnlBb1JXWm1aV04w"
+    "SURCNGVTa2c0b0NVSUhCNWJXOWtKM01nYjNKa1pYSWdhWE1nWW1GelplS0drbGdvYUdsbmFDbmlocEpa"
+    "S0d4dmR5azZDaUFnSUNBdkx5QWdJSE4wWlhBZ01DQTlJR0poYzJWUVpYSnBiMlFLSUNBZ0lDOHZJQ0Fn"
+    "YzNSbGNDQXhJRDBnSzFnZ2MyVnRhWFJ2Ym1WeklDaG9hV2RvSUc1cFltSnNaU2tLSUNBZ0lDOHZJQ0Fn"
+    "YzNSbGNDQXlJRDBnSzFrZ2MyVnRhWFJ2Ym1WeklDaHNiM2NnYm1saVlteGxLUW9nSUNBZ2FXWWdLRjl3"
+    "WTNJdVpXWm1aV04wSUQwOUlEQjRNQ0FtSmlCZmNHTnlMbkJoY21GdElDRTlJREFwSUhzS0lDQWdJQ0Fn"
+    "SUNCcGJuUWdYMkZ5Y0ZOMFpYQWdQU0JwYm5Rb2NHOXpMblJwWTJzcElDMGdhVzUwS0hCdmN5NTBhV05y"
+    "SUM4Z015NHdLU0FxSURNN0NpQWdJQ0FnSUNBZ2FXWWdLRjloY25CVGRHVndJRDA5SURFcENpQWdJQ0Fn"
+    "SUNBZ0lDQWdJR1ZtWm1WamRHbDJaVkJsY21sdlpDQTlJR0poYzJWUVpYSnBiMlFnS2lCd2IzY29NaTR3"
+    "TENBdFpteHZZWFFvS0Y5d1kzSXVjR0Z5WVcwZ1BqNGdOQ2tnSmlBd2VFWXBJQzhnTVRJdU1DazdDaUFn"
+    "SUNBZ0lDQWdaV3h6WlNCcFppQW9YMkZ5Y0ZOMFpYQWdQVDBnTWlrS0lDQWdJQ0FnSUNBZ0lDQWdaV1pt"
+    "WldOMGFYWmxVR1Z5YVc5a0lEMGdZbUZ6WlZCbGNtbHZaQ0FxSUhCdmR5Z3lMakFzSUMxbWJHOWhkQ2hm"
+    "Y0dOeUxuQmhjbUZ0SUNZZ01IaEdLU0F2SURFeUxqQXBPd29nSUNBZ2ZRb0tJQ0FnSUM4dklGWnBZbkpo"
+    "ZEc4Z0tFVm1abVZqZENBMEx6WXBJT0tBbENCMWMyVnpJR2RzYjJKaGJDQjJhV0pVWVdJS0lDQWdJSHNL"
+    "SUNBZ0lDQWdJQ0JwYm5RZ1gzWlRJRDBnTUN3Z1gzWkVJRDBnTURzS0lDQWdJQ0FnSUNCcFppQW9kSEpw"
+    "WjA1dmRHVXVaV1ptWldOMElEMDlJREI0TkNCOGZDQjBjbWxuVG05MFpTNWxabVpsWTNRZ1BUMGdNSGcy"
+    "S1NCN0NpQWdJQ0FnSUNBZ0lDQWdJRjkyVXlBOUlDaDBjbWxuVG05MFpTNXdZWEpoYlNBK1BpQTBLU0Ft"
+    "SURCNFJqc0tJQ0FnSUNBZ0lDQWdJQ0FnWDNaRUlEMGdJSFJ5YVdkT2IzUmxMbkJoY21GdElDWWdNSGhH"
+    "T3dvZ0lDQWdJQ0FnSUgwS0lDQWdJQ0FnSUNCcFppQW9kSEpwWjFCaGRDQTlQU0J3YjNNdWMyOXVaMUJ2"
+    "Y3lCOGZDQmZka1FnUFQwZ01Da2dld29nSUNBZ0lDQWdJQ0FnSUNCbWIzSWdLR2x1ZENCZmRta2dQU0F4"
+    "T3lCZmRta2dQRDBnTVRZN0lGOTJhU3NyS1NCN0NpQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNCcGJuUWdYM1p5"
+    "SUQwZ2RISnBaMUp2ZHlBcklGOTJhVHNLSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJR2xtSUNoZmRuSWdQajBn"
+    "TmpRZ2ZId2dYM1p5SUQ0OUlIQnZjeTV5YjNjcElHSnlaV0ZyT3dvZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0Fn"
+    "VG05MFpTQmZkbTRnUFNCblpYUk9iM1JsS0hSeWFXZFFZWFFzSUY5MmNpd2dZMmdwT3dvZ0lDQWdJQ0Fn"
+    "SUNBZ0lDQWdJQ0FnYVdZZ0tGOTJiaTVwYm5OMGNuVnRaVzUwSUQ0Z01DQjhmQ0JmZG00dWNHVnlhVzlr"
+    "SUQ0Z01Da2dZbkpsWVdzN0NpQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNCcFppQW9LRjkyYmk1bFptWmxZM1Fn"
+    "UFQwZ01IZzBJSHg4SUY5MmJpNWxabVpsWTNRZ1BUMGdNSGcyS1NBbUppQmZkbTR1Y0dGeVlXMGdJVDBn"
+    "TUNrZ2V3b2dJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJRjkyVXlBOUlDaGZkbTR1Y0dGeVlXMGdQajRn"
+    "TkNrZ0ppQXdlRVk3Q2lBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ1gzWkVJRDBnSUY5MmJpNXdZWEpo"
+    "YlNBbUlEQjRSanNLSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJSDBLSUNBZ0lDQWdJQ0FnSUNBZ2ZRb2dJQ0Fn"
+    "SUNBZ0lIMEtJQ0FnSUNBZ0lDQnBaaUFvWDNaRUlENGdNQ2tnZXdvZ0lDQWdJQ0FnSUNBZ0lDQnBiblFn"
+    "WDNaUUlEMGdhVzUwS0dWc1lYQnpaV1FnS2lCVVNVTkxVMTlRUlZKZlUwVkRLU0FxSUY5MlV5QW1JRFl6"
+    "T3dvZ0lDQWdJQ0FnSUNBZ0lDQm1iRzloZENCZmRrUmxiSFJoSUQwZ0tIWnBZbFJoWWx0ZmRsQWdKaUF6"
+    "TVYwZ0tpQm1iRzloZENoZmRrUXBLU0F2SURFeU9DNHdPd29nSUNBZ0lDQWdJQ0FnSUNCbFptWmxZM1Jw"
+    "ZG1WUVpYSnBiMlFnS3owZ0tGOTJVQ0E4SURNeUtTQS9JRjkyUkdWc2RHRWdPaUF0WDNaRVpXeDBZVHNL"
+    "SUNBZ0lDQWdJQ0I5Q2lBZ0lDQjlDZ29nSUNBZ0x5OGdVbVZ1WkdWeUlITmhiWEJzWlFvZ0lDQWdabXh2"
+    "WVhRZ1puSmxjU0FnSUNBZ0lDQTlJSEJsY21sdlpGUnZSbkpsY1NodFlYZ29NU3dnYVc1MEtHVm1abVZq"
+    "ZEdsMlpWQmxjbWx2WkNrcEtUc0tJQ0FnSUdac2IyRjBJR1pUWVcxd2JHVlFiM01nUFNCbGJHRndjMlZr"
+    "SUNvZ1puSmxjU0F2SUdac2IyRjBLSE50Y0M1aWQwWmhZM1J2Y2lrN0Nnb2dJQ0FnYVdZZ0tITnRjQzVz"
+    "YjI5d1RHVnVJRDRnTWlrZ2V3b2dJQ0FnSUNBZ0lHbG1JQ2htVTJGdGNHeGxVRzl6SUQ0OUlHWnNiMkYw"
+    "S0hOdGNDNXNiMjl3VTNSaGNuUWdLeUJ6YlhBdWJHOXZjRXhsYmlrcENpQWdJQ0FnSUNBZ0lDQWdJR1pU"
+    "WVcxd2JHVlFiM01nUFNCbWJHOWhkQ2h6YlhBdWJHOXZjRk4wWVhKMEtTQXJJRzF2WkNobVUyRnRjR3hs"
+    "VUc5eklDMGdabXh2WVhRb2MyMXdMbXh2YjNCVGRHRnlkQ2tzSUdac2IyRjBLSE50Y0M1c2IyOXdUR1Z1"
+    "S1NrN0NpQWdJQ0I5SUdWc2MyVWdhV1lnS0daVFlXMXdiR1ZRYjNNZ1BqMGdabXh2WVhRb2MyMXdMbXhs"
+    "Ym1kMGFDa3BJSHNLSUNBZ0lDQWdJQ0J5WlhSMWNtNGdNQzR3T3dvZ0lDQWdmUW9nSUNBZ2FXWWdLR1pU"
+    "WVcxd2JHVlFiM01nUENBd0xqQXBJSEpsZEhWeWJpQXdMakE3Q2dvZ0lDQWdabXh2WVhRZ2N5QTlJR2Rs"
+    "ZEZOaGJYQnNaVVlvYzIxd0xuTjBZWEowTENCbVUyRnRjR3hsVUc5ekxDQnpiWEF1YkdWdVozUm9MQ0J6"
+    "YlhBdWJHOXZjRk4wWVhKMExDQnpiWEF1Ykc5dmNFeGxiaWs3Q2lBZ0lDQnlaWFIxY200Z2N5QXFJR1pz"
+    "YjJGMEtIWnZiSFZ0WlNrZ0x5QTJOQzR3T3dwOUNnPT0nKS5kZWNvZGUoJ3V0Zi04JykKCiAgICAjIEFz"
+    "c2VtYmxlCiAgICByZXR1cm4gaGVhZGVyICsgbWV0YSArICIiLmpvaW4oZGF0YV9hcnJheXMpICsgIlxu"
+    "IiArIHRhYmxlcyArIGZldGNoZXJzICsgZGVjb2RlcnMgKyBnZXRfY2hhbm5lbF9vdXRwdXQKCgppZiBf"
+    "X25hbWVfXyA9PSAnX19tYWluX18nOgogICAgbW9kX3BhdGggPSBzeXMuYXJndlsxXSBpZiBsZW4oc3lz"
+    "LmFyZ3YpID4gMSBlbHNlICcvbW50L3VzZXItZGF0YS91cGxvYWRzLzEyVEguTU9EJwogICAgb3V0X3Bh"
+    "dGggPSBzeXMuYXJndlsyXSBpZiBsZW4oc3lzLmFyZ3YpID4gMiBlbHNlICcvaG9tZS9jbGF1ZGUvbW9k"
+    "X2NydW5jaC8xMlRIX2NydW5jaF9jb21tb24uZ2xzbCcKICAgIG1haW4obW9kX3BhdGgsIG91dF9wYXRo"
+    "KQo="
+)
 
 def main():
     import argparse
@@ -3307,13 +4107,17 @@ def main():
     
     base_name = os.path.splitext(os.path.basename(args.modfile))[0]
     
-    # Collect all samples into one array, with 32-byte zero-padding after each
-    # (mikIT technique: safe to read pos+1 and pos+2 for cubic interpolation)
+    # Collect all samples with bandwidth-adaptive compression + zero-padding
     all_samples = []
-    for sample in mod.samples:
+    png_sample_bw = {}  # track bw_factor per sample index for sample_map
+    for idx, sample in enumerate(mod.samples):
         if sample['data'] is not None and len(sample['data']) > 0:
-            all_samples.extend(sample['data'])
-            all_samples.extend([0] * 32)  # zero-padding for cubic interpolation
+            bf, compressed = bw_compress_sample(sample['data'])
+            png_sample_bw[idx] = bf
+            all_samples.extend(compressed.tolist())
+            all_samples.extend([0] * 32)
+        else:
+            png_sample_bw[idx] = 1
     
     # RLE compression helper
     def rle_compress_with_row_breaks(data, row_size):
@@ -3547,23 +4351,51 @@ Generated by MOD2GLSL
     # Generate HTML player (now works for both MOD and S3M)
     html_file = base_name + "_player.html"
     create_fixed_player_html(mod, html_file, args.downsample, compress=True)
-    
-    # Always generate ShaderToy GLSL (3 files)
-    glsl_file = base_name + "_shadertoy.glsl"
-    create_shadertoy_glsl(mod, glsl_file, args.downsample, compress=True, 
+
+    # ShaderToy Common tab: VQ-encoded via embedded vq_encoder_v2
+    glsl_common_file = base_name + "_shadertoy_common.glsl"
+    try:
+        import types as _types, base64 as _b64
+        _vqmod = _types.ModuleType('vq_encoder_v2')
+        _vqmod.__file__ = __file__
+        exec(compile(_b64.b64decode(_VQ_ENCODER_B64).decode('utf-8'), 'vq_encoder_v2', 'exec'), _vqmod.__dict__)
+        print(f"\n\U0001f3b5 Generating VQ-encoded Common tab...")
+        _vqmod.main(args.modfile, glsl_common_file, K=256, weighted=True)
+    except Exception as _e:
+        print(f"   WARNING: VQ encoder failed ({_e}), falling back to built-in")
+        _fb_glsl = base_name + "_shadertoy.glsl"
+        create_shadertoy_glsl(mod, _fb_glsl, args.downsample, compress=True,
+                             compressed_pattern_size=pattern_size,
+                             pattern_bytes_data=pattern_bytes,
+                             sample_bytes_data=sample_bytes,
+                             seek_table=seek_table)
+        glsl_common_file = _fb_glsl.replace('.glsl', '_common.glsl')
+
+    # Sound / Image / Buffer A tabs from built-in emitter
+    # Use a stub name that has NO overlap with _shadertoy.glsl patterns
+    _glsl_stub = base_name + "_tmp_tabs_shadertoy.glsl"
+    create_shadertoy_glsl(mod, _glsl_stub, args.downsample, compress=True,
                          compressed_pattern_size=pattern_size,
                          pattern_bytes_data=pattern_bytes,
                          sample_bytes_data=sample_bytes,
                          seek_table=seek_table)
-    
+    import os as _os2
+    # create_shadertoy_glsl writes: _tmp_tabs_shadertoy_common/sound/image/bufferA.glsl
+    for _ext in ('_sound.glsl', '_image.glsl', '_bufferA.glsl'):
+        _src = _glsl_stub.replace('.glsl', _ext)
+        _dst = base_name + "_shadertoy" + _ext
+        if _os2.path.exists(_src): _os2.replace(_src, _dst)
+    for _del in (_glsl_stub.replace('.glsl', '_common.glsl'), _glsl_stub):
+        if _os2.path.exists(_del): _os2.remove(_del)
+
     # Summary
-    bufA_file_short = glsl_file.replace('.glsl', '_bufferA.glsl')
+    bufA_file_short = base_name + "_shadertoy_bufferA.glsl"
 
     print(f"\n✅ Generated:")
     print(f"   🌐 HTML Player:    {html_file}")
-    print(f"   📁 ShaderToy tabs: {glsl_file.replace('.glsl', '_common.glsl')}")
-    print(f"                      {glsl_file.replace('.glsl', '_sound.glsl')}")
-    print(f"                      {glsl_file.replace('.glsl', '_image.glsl')}")
+    print(f"   📁 ShaderToy tabs: {glsl_common_file}  (VQ-encoded)")
+    print(f"                      {base_name}_shadertoy_sound.glsl")
+    print(f"                      {base_name}_shadertoy_image.glsl")
     print(f"                      {bufA_file_short}  ← Buffer A (FFT + state)")
     print(f"   🖼️  Sample PNG:     {png_file} ({png_size} bytes)")
     print(f"   📄 Instructions:   {instructions_file}")
