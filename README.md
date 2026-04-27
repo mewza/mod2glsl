@@ -1,4 +1,4 @@
-## MOD2GLSL v1.35 | GLSL MOD Player v1.35 for ShaderToy/GLSL<br><span style="color: dkgray;">&copy; 2026 Orblivius. All rights reserved.</span>
+## MOD2GLSL v1.35 | GLSL MOD Player v1.35 for ShaderToy/GLSL<br><span style="color: green;">&copy; 2026 Orblivius. All rights reserved.</span>
 
 `NEW in v1.35`<br>
 <br>
