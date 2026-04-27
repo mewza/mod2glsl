@@ -2530,6 +2530,73 @@ vec2 mainSound(int samp, float time) {{
     
     float outL = surrL + centL;
     float outR = surrR + centR;
+
+    // ── Velvet-noise reverb (stateless) ─────────────────────────────────────
+    // Adapted from the velvet reverb pattern: prime-spaced early reflections
+    // for diffusion + hash-randomised late tail for density.  source(t) is
+    // replaced by a full mono MOD channel mix at time t.
+    //
+    // Cost: (N_early + N_late) × (getPosition + NUM_CHANNELS×getChannelOutput)
+    // per sample.  Reduce counts below if audio stutters.
+    //
+    const float RV_WET    = 0.30;
+    const int   N_EARLY   = 6;     // early reflections — cost: N_EARLY × 5 calls
+    const int   N_LATE    = 12;    // velvet late tail  — cost: N_LATE  × 5 calls
+
+    // Hash for pseudo-random late delays/signs (same as original)
+    // h(n) = fract(sin(n × 12.9898) × 43758.5453)
+    #define RVHASH(n) fract(sin((n)*12.9898)*43758.5453)
+
+    // Prime-spaced early reflection delays (seconds) — from original velvet design
+    const float eD[6] = float[](.0071,.0113,.0197,.0293,.0379,.0571);
+
+    float rvL = 0.0, rvR = 0.0;
+
+    // Early reflections — separate L/R via 1.043× decorrelation factor
+    for (int _re = 0; _re < N_EARLY; _re++) {{
+        float d  = eD[_re];
+        float g  = exp(-6.0 * d);
+        // Left tap
+        float twL = playbackTime - d;
+        Position rpL = getPosition(twL);
+        float mL = 0.0;
+        for (int ch = 0; ch < NUM_CHANNELS; ch++)
+            mL += getChannelOutput(ch, twL, rpL, rowTime);
+        mL *= normFactor;
+        // Right tap (1.043× delay gives ~3ms stereo decorrelation at d=0.07)
+        float twR = playbackTime - d * 1.043;
+        Position rpR = getPosition(twR);
+        float mR = 0.0;
+        for (int ch = 0; ch < NUM_CHANNELS; ch++)
+            mR += getChannelOutput(ch, twR, rpR, rowTime);
+        mR *= normFactor;
+        rvL += g * mL;
+        rvR += g * mR;
+    }}
+
+    // Velvet late tail — hash-randomised delays 50–500 ms, sign-randomised stereo
+    float decay = 3.5;  // RT60 ≈ 6.9/decay ≈ 2.0 s
+    for (int _rl = 0; _rl < N_LATE; _rl++) {{
+        float fi = float(_rl);
+        float d  = 0.05 + 0.45 * RVHASH(fi);          // 50–500 ms
+        float g  = exp(-decay * d) / sqrt(float(N_LATE));
+        float tw = playbackTime - d;
+        Position rp = getPosition(tw);
+        float m = 0.0;
+        for (int ch = 0; ch < NUM_CHANNELS; ch++)
+            m += getChannelOutput(ch, tw, rp, rowTime);
+        m *= normFactor;
+        // Sign-randomised for L and R independently (velvet noise decorrelation)
+        float sL = RVHASH(fi + 17.0) > 0.5 ?  1.0 : -1.0;
+        float sR = RVHASH(fi + 53.0) > 0.5 ?  1.0 : -1.0;
+        rvL += sL * g * m;
+        rvR += sR * g * m;
+    }}
+    #undef RVHASH
+
+    outL += rvL * RV_WET;
+    outR += rvR * RV_WET;
+
     return vec2(clamp(outL, -1.0, 1.0), clamp(outR, -1.0, 1.0));
 }}
 """
@@ -4159,34 +4226,48 @@ _VQ_ENCODER_B64 = (
     "SUNBZ0lDQWdaV1ptWldOMGFYWmxVR1Z5YVc5a0lDczlJQ2hmZGxBZ1BDQXpNaWtnUHlCZmRrUmxiSFJo"
     "SURvZ0xWOTJSR1ZzZEdFN0NpQWdJQ0FnSUNBZ2ZRb2dJQ0FnZlFvS0lDQWdJQzh2SUZKbGJtUmxjaUJ6"
     "WVcxd2JHVUtJQ0FnSUdac2IyRjBJR1p5WlhFZ0lDQWdJQ0FnUFNCd1pYSnBiMlJVYjBaeVpYRW9iV0Y0"
-    "S0RFc0lHbHVkQ2hsWm1abFkzUnBkbVZRWlhKcGIyUXBLU2s3Q2lBZ0lDQm1iRzloZENCbVUyRnRjR3hs"
-    "VUc5eklEMGdaV3hoY0hObFpDQXFJR1p5WlhFZ0x5Qm1iRzloZENoemJYQXVZbmRHWVdOMGIzSXBPd29L"
-    "SUNBZ0lHbG1JQ2h6YlhBdWJHOXZjRXhsYmlBK0lESXBJSHNLSUNBZ0lDQWdJQ0JwWmlBb1psTmhiWEJz"
-    "WlZCdmN5QStQU0JtYkc5aGRDaHpiWEF1Ykc5dmNGTjBZWEowSUNzZ2MyMXdMbXh2YjNCTVpXNHBLUW9n"
-    "SUNBZ0lDQWdJQ0FnSUNCbVUyRnRjR3hsVUc5eklEMGdabXh2WVhRb2MyMXdMbXh2YjNCVGRHRnlkQ2tn"
-    "S3lCdGIyUW9abE5oYlhCc1pWQnZjeUF0SUdac2IyRjBLSE50Y0M1c2IyOXdVM1JoY25RcExDQm1iRzlo"
-    "ZENoemJYQXViRzl2Y0V4bGJpa3BPd29nSUNBZ2ZTQmxiSE5sSUdsbUlDaG1VMkZ0Y0d4bFVHOXpJRDQ5"
-    "SUdac2IyRjBLSE50Y0M1c1pXNW5kR2dwS1NCN0NpQWdJQ0FnSUNBZ2NtVjBkWEp1SURBdU1Ec0tJQ0Fn"
-    "SUgwS0lDQWdJR2xtSUNobVUyRnRjR3hsVUc5eklEd2dNQzR3S1NCeVpYUjFjbTRnTUM0d093b0tJQ0Fn"
-    "SUdac2IyRjBJSE1nUFNCblpYUlRZVzF3YkdWR0tITnRjQzV6ZEdGeWRDd2dabE5oYlhCc1pWQnZjeXdn"
-    "YzIxd0xteGxibWQwYUN3Z2MyMXdMbXh2YjNCVGRHRnlkQ3dnYzIxd0xteHZiM0JNWlc0cE93b0tJQ0Fn"
-    "SUM4dklFRnVkR2t0WTJ4cFkyc2djbUZ0Y0RvZ1RXbHJUVzlrSUdaaFpHVmpiM1Z1ZENBOUlHOTFkSEIx"
-    "ZEY5eVlYUmxJQzhnTmpnNUlPS0ppQ0EyTkNCellXMXdiR1Z6SUVBZ05EUXhNREFnU0hvdUNpQWdJQ0F2"
-    "THlCUGJpQnViM1JsSUhSeWFXZG5aWElnZEdobElHOXNaQ0JqYUdGdWJtVnNJR2hoWkNCaElHNXZiaTE2"
-    "WlhKdklFUkRJSFpoYkhWbE95QnlZVzF3YVc1bklIUm9aU0J1WlhjS0lDQWdJQzh2SUc1dmRHVW5jeUIy"
-    "YjJ4MWJXVWdabkp2YlNBdzRvYVNNU0J2ZG1WeUlIUm9aU0J6WVcxbElIZHBibVJ2ZHlCeVpXMXZkbVZ6"
-    "SUhSb1pTQmthWE5qYjI1MGFXNTFhWFI1TGdvZ0lDQWdMeThnTmpRdU1DODBOREV3TUM0d0lPS0ppQ0F3"
-    "TGpBd01UUTFNU0J6SU9LQWxDQjNjbWwwZEdWdUlHRnpJR3hwZEdWeVlXd2dkRzhnWVhadmFXUWdZMjl1"
-    "YzNRdGFXNHRablZ1WTNScGIyNGdhWE56ZFdWekxnb2dJQ0FnWm14dllYUWdaR1ZqYkdsamF5QTlJR05z"
-    "WVcxd0tHVnNZWEJ6WldRZ0tpQW9ORFF4TURBdU1DQXZJRFkwTGpBcExDQXdMakFzSURFdU1DazdDZ29n"
-    "SUNBZ2NtVjBkWEp1SUhNZ0tpQW9abXh2WVhRb2RtOXNkVzFsS1NBdklEWTBMakFwSUNvZ1pHVmpiR2xq"
-    "YXpzS2ZRbz0nKS5kZWNvZGUoJ3V0Zi04JykKCiAgICAjIEFzc2VtYmxlCiAgICByZXR1cm4gaGVhZGVy"
-    "ICsgbWV0YSArICIiLmpvaW4oZGF0YV9hcnJheXMpICsgIlxuIiArIHRhYmxlcyArIGZldGNoZXJzICsg"
-    "ZGVjb2RlcnMgKyBnZXRfY2hhbm5lbF9vdXRwdXQKCgppZiBfX25hbWVfXyA9PSAnX19tYWluX18nOgog"
-    "ICAgbW9kX3BhdGggPSBzeXMuYXJndlsxXSBpZiBsZW4oc3lzLmFyZ3YpID4gMSBlbHNlICcvbW50L3Vz"
-    "ZXItZGF0YS91cGxvYWRzLzEyVEguTU9EJwogICAgb3V0X3BhdGggPSBzeXMuYXJndlsyXSBpZiBsZW4o"
-    "c3lzLmFyZ3YpID4gMiBlbHNlICcvaG9tZS9jbGF1ZGUvbW9kX2NydW5jaC8xMlRIX2NydW5jaF9jb21t"
-    "b24uZ2xzbCcKICAgIG1haW4obW9kX3BhdGgsIG91dF9wYXRoKQo="
+    "S0RFc0lHbHVkQ2hsWm1abFkzUnBkbVZRWlhKcGIyUXBLU2s3Q2lBZ0lDQXZMeUJRYVhSamFDMWhZMk4x"
+    "Y21GMFpTQnpZVzF3YkdVZ2NHOXphWFJwYjI0NkNpQWdJQ0F2THlBZ0lFNXZjbTFoYkNCallYTmxPaUFn"
+    "WmxOaGJYQnNaVkJ2Y3lBOUlHVnNZWEJ6WldRZ3c1Y2dabkpsY1NoUUtRb2dJQ0FnTHk4Z0lDQlRiR2xr"
+    "WlNCallYTmxPaUFnSUdaVFlXMXdiR1ZRYjNNZ1BTRGlpS3ZpZ29CZVZDQkRMMUFvZENrZ1pIUWdJRDBn"
+    "UThPWFZDL09sRkFndzVjZ2JHNG9VREV2VURBcENpQWdJQ0F2THlCVWFHVWdhVzUwWldkeVlXd2dabTl5"
+    "YlNCbGJHbHRhVzVoZEdWeklHTnNhV05yY3lCaGRDQjBhV05ySUdKdmRXNWtZWEpwWlhNZ2QyaGxjbVVn"
+    "VUNCemRHVndjd29nSUNBZ0x5OGdaR2x6WTNKbGRHVnNlU0RpZ0pRZ2FYUWdZWE56ZFcxbGN5QmhJR3hw"
+    "Ym1WaGNpQnlZVzF3SUZBdzRvYVNVREVnYjNabGNpQmxiR0Z3YzJWa0lIUnBiV1VnVkM0S0lDQWdJR1pz"
+    "YjJGMElGQXdaaUE5SUdac2IyRjBLSFJ5YVdkT2IzUmxMbkJsY21sdlpDazdDaUFnSUNCbWJHOWhkQ0JR"
+    "TVdZZ1BTQmxabVpsWTNScGRtVlFaWEpwYjJRN0NpQWdJQ0JtYkc5aGRDQmtVR1lnUFNCUU1XWWdMU0JR"
+    "TUdZN0NpQWdJQ0JtYkc5aGRDQm1VMkZ0Y0d4bFVHOXpPd29nSUNBZ2FXWWdLR0ZpY3loa1VHWXBJRDRn"
+    "TUM0MUlDWW1JR1ZzWVhCelpXUWdQaUF4WlMwMktTQjdDaUFnSUNBZ0lDQWdabXh2WVhRZ1F5QTlJRGN3"
+    "T1RNM09Ea3VNaUF2SUNneUxqQWdLaUJtYkc5aGRDaHpiWEF1WW5kR1lXTjBiM0lwS1RzS0lDQWdJQ0Fn"
+    "SUNCbVUyRnRjR3hsVUc5eklEMGdReUFxSUdWc1lYQnpaV1FnTHlCa1VHWWdLaUJzYjJjb1VERm1JQzhn"
+    "VURCbUtUc0tJQ0FnSUgwZ1pXeHpaU0I3Q2lBZ0lDQWdJQ0FnWmxOaGJYQnNaVkJ2Y3lBOUlHVnNZWEJ6"
+    "WldRZ0tpQm1jbVZ4SUM4Z1pteHZZWFFvYzIxd0xtSjNSbUZqZEc5eUtUc0tJQ0FnSUgwS0NpQWdJQ0Jw"
+    "WmlBb2MyMXdMbXh2YjNCTVpXNGdQaUF5S1NCN0NpQWdJQ0FnSUNBZ2FXWWdLR1pUWVcxd2JHVlFiM01n"
+    "UGowZ1pteHZZWFFvYzIxd0xteHZiM0JUZEdGeWRDQXJJSE50Y0M1c2IyOXdUR1Z1S1NrS0lDQWdJQ0Fn"
+    "SUNBZ0lDQWdabE5oYlhCc1pWQnZjeUE5SUdac2IyRjBLSE50Y0M1c2IyOXdVM1JoY25RcElDc2diVzlr"
+    "S0daVFlXMXdiR1ZRYjNNZ0xTQm1iRzloZENoemJYQXViRzl2Y0ZOMFlYSjBLU3dnWm14dllYUW9jMjF3"
+    "TG14dmIzQk1aVzRwS1RzS0lDQWdJSDBnWld4elpTQnBaaUFvWmxOaGJYQnNaVkJ2Y3lBK1BTQm1iRzlo"
+    "ZENoemJYQXViR1Z1WjNSb0tTa2dld29nSUNBZ0lDQWdJSEpsZEhWeWJpQXdMakE3Q2lBZ0lDQjlDaUFn"
+    "SUNCcFppQW9abE5oYlhCc1pWQnZjeUE4SURBdU1Da2djbVYwZFhKdUlEQXVNRHNLQ2lBZ0lDQm1iRzlo"
+    "ZENCeklEMGdaMlYwVTJGdGNHeGxSaWh6YlhBdWMzUmhjblFzSUdaVFlXMXdiR1ZRYjNNc0lITnRjQzVz"
+    "Wlc1bmRHZ3NJSE50Y0M1c2IyOXdVM1JoY25Rc0lITnRjQzVzYjI5d1RHVnVLVHNLQ2lBZ0lDQXZMeUJC"
+    "Ym5ScExXTnNhV05ySUhKaGJYQTZJRTFwYTAxdlpDQm1ZV1JsWTI5MWJuUWdQU0J2ZFhSd2RYUmZjbUYw"
+    "WlNBdklEWTRPU0RpaVlnZ05qUWdjMkZ0Y0d4bGN5QkFJRFEwTVRBd0lFaDZMZ29nSUNBZ0x5OGdUMjRn"
+    "Ym05MFpTQjBjbWxuWjJWeUlIUm9aU0J2YkdRZ1kyaGhibTVsYkNCb1lXUWdZU0J1YjI0dGVtVnlieUJF"
+    "UXlCMllXeDFaVHNnY21GdGNHbHVaeUIwYUdVZ2JtVjNDaUFnSUNBdkx5QnViM1JsSjNNZ2RtOXNkVzFs"
+    "SUdaeWIyMGdNT0tHa2pFZ2IzWmxjaUIwYUdVZ2MyRnRaU0IzYVc1a2IzY2djbVZ0YjNabGN5QjBhR1Vn"
+    "WkdselkyOXVkR2x1ZFdsMGVTNEtJQ0FnSUM4dklEWTBMakF2TkRReE1EQXVNQ0RpaVlnZ01DNHdNREUw"
+    "TlRFZ2N5RGlnSlFnZDNKcGRIUmxiaUJoY3lCc2FYUmxjbUZzSUhSdklHRjJiMmxrSUdOdmJuTjBMV2x1"
+    "TFdaMWJtTjBhVzl1SUdsemMzVmxjeTRLSUNBZ0lHWnNiMkYwSUdSbFkyeHBZMnNnUFNCamJHRnRjQ2hs"
+    "YkdGd2MyVmtJQ29nS0RRME1UQXdMakFnTHlBMk5DNHdLU3dnTUM0d0xDQXhMakFwT3dvS0lDQWdJSEps"
+    "ZEhWeWJpQnpJQ29nS0dac2IyRjBLSFp2YkhWdFpTa2dMeUEyTkM0d0tTQXFJR1JsWTJ4cFkyczdDbjBL"
+    "JykuZGVjb2RlKCd1dGYtOCcpCgogICAgIyBBc3NlbWJsZQogICAgcmV0dXJuIGhlYWRlciArIG1ldGEg"
+    "KyAiIi5qb2luKGRhdGFfYXJyYXlzKSArICJcbiIgKyB0YWJsZXMgKyBmZXRjaGVycyArIGRlY29kZXJz"
+    "ICsgZ2V0X2NoYW5uZWxfb3V0cHV0CgoKaWYgX19uYW1lX18gPT0gJ19fbWFpbl9fJzoKICAgIG1vZF9w"
+    "YXRoID0gc3lzLmFyZ3ZbMV0gaWYgbGVuKHN5cy5hcmd2KSA+IDEgZWxzZSAnL21udC91c2VyLWRhdGEv"
+    "dXBsb2Fkcy8xMlRILk1PRCcKICAgIG91dF9wYXRoID0gc3lzLmFyZ3ZbMl0gaWYgbGVuKHN5cy5hcmd2"
+    "KSA+IDIgZWxzZSAnL2hvbWUvY2xhdWRlL21vZF9jcnVuY2gvMTJUSF9jcnVuY2hfY29tbW9uLmdsc2wn"
+    "CiAgICBtYWluKG1vZF9wYXRoLCBvdXRfcGF0aCkK"
 )
 
 def main():
