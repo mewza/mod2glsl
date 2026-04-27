@@ -1,6 +1,7 @@
 ## MOD2GLSL - ProTracker MOD Player v1.32 for ShaderToy/GLSL<br>(c) 2026 Orblivius. All rights reserved.
 
 `NEW in v1.32`<br>
+<br>
        • RVQ advanced sample compression (27.7 dB)<br>
        • Downsample feature now fuse with RVQ ensures smooth samples (--downsample 2. 4, 8)<br>
        • 3D Surround Sound<br>
@@ -12,6 +13,7 @@ Convert Amiga ProTracker MOD(and soon S3M/XM and IT) files
 to ShaderToy shader with visualization and note/effect overlay.
 
 Live Demos: <br>
+<br>
        • https://www.shadertoy.com/view/7cBXWK<br>
        • https://www.shadertoy.com/view/NfjXWy<br>
 <br>
