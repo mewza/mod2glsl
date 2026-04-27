@@ -12,7 +12,7 @@ to ShaderToy shader with visualization and note/effect overlay.
 
 Live Demo: [https://www.shadertoy.com/view/scBXzy](https://www.shadertoy.com/view/fcSXRc)
 
-<img width="50%" height="50%" alt="image" src="https://github.com/user-attachments/assets/8b86d2b2-5734-4376-94c7-3b04f5608d4d" />
+<img width="50%" height="50%" alt="image" src="https://github.com/user-attachments/assets/6003607b-60b4-481f-b14c-e9b4f123359b" />
 <br>
 
 If you feel like it donate PayPal to <subband@protonmail.com><br>
