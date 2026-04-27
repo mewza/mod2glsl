@@ -1,6 +1,6 @@
-## MOD2GLSL - ProTracker MOD Player v1.32 for ShaderToy/GLSL<br>(c) 2026 Orblivius. All rights reserved.
+## MOD2GLSL - ProTracker MOD Player v1.33 for ShaderToy/GLSL<br>(c) 2026 Orblivius. All rights reserved.
 
-`NEW in v1.32`<br>
+`NEW in v1.33`<br>
 <br>
        • RVQ advanced sample compression (27.7 dB)<br>
        • Downsample feature now fuse with RVQ ensures smooth samples (--downsample 2. 4, 8)<br>
