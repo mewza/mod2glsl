@@ -1,4 +1,4 @@
-![MOD2GLSL header](header.svg)
+![MOD2GLSL header](header.svg?v=2)
 <br>
 Convert Amiga ProTracker MOD(and soon S3M/XM and IT) files 
 to ShaderToy shader with visualization and note/effect overlay.
