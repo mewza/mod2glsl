@@ -1,14 +1,15 @@
-## MOD2GLSL v1.35<br><br>$${\color{dkgray}GLSL MOD Player v1.35 for ShaderToy}$$<br>$${\color{purple}&copy; 2026 Orblivius. All rights reserved.}$$
+## MOD2GLSL v1.36<br><br>$${\color{dkgray}GLSL MOD Player v1.35 for ShaderToy}$$<br>$${\color{purple}&copy; 2026 Orblivius. All rights reserved.}$$
 
-`NEW in v1.35`<br>
+`NEW in v1.36`<br>
 <br>
        • Stateless CombFilter Reverb<br>
        • RVQ advanced sample compression (27.7 dB)<br>
        • Downsample feature now fuse with RVQ ensures smooth samples <br>(--downsample 2. 4, 8)<br>
        • 3D Surround Sound<br>
        • Cubic resampling<br>
-       • FAT BASS (Hilbert)<br>
-       • Bug fixes in playback
+       • PHAT BASS (Hilbert)<br>
+       • FAT<br>
+       • Bug fixes (fixed --downsample 1 which produced white noise, but --downsample 2, 4 should also work now)<br>
 
 Convert Amiga ProTracker MOD(and soon S3M/XM and IT) files 
 to ShaderToy shader with visualization and note/effect overlay.
