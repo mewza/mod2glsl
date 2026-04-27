@@ -4,8 +4,7 @@ Convert Amiga ProTracker MOD(and soon S3M/XM and IT) files
 to ShaderToy shader with visualization and note/effect overlay.
 <br>
 <br>
-<h3><code>NEW in v1.36</code></h3>
-<br>
+<h4><code>NEW in v1.36</code></h4>
        • Stateless CombFilter Reverb<br>
        • RVQ advanced sample compression (27.7 dB)<br>
        • Downsample feature now fuse with RVQ ensures smooth samples <br>(--downsample 2. 4, 8)<br>
