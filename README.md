@@ -1,4 +1,4 @@
-## $${\color{lightblue}MOD2GLSL v1.35 }$$| GLSL MOD Player v1.35 for ShaderToy/GLSL<br>$${\color{drgray}&copy; 2026 Orblivius. All rights reserved.}$$
+## $${\color{lightblue}MOD2GLSL v1.35 }$$| $${\color{purple}GLSL MOD Player v1.35 for ShaderToy/GLSL}$$<br>$${\color{drgray}&copy; 2026 Orblivius. All rights reserved.}$$
 
 `NEW in v1.35`<br>
 <br>
