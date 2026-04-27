@@ -1,4 +1,6 @@
-# MOD2GLSL v1.36 <span style="color:darkgray">GLSL MOD Player v1.36 for ShaderToy</span> <span style="color:purple">© 2026 Orblivius. All rights reserved.</span>
+<h1>MOD2GLSL v1.36 <span style="color:darkgray">GLSL MOD Player v1.36 for ShaderToy</span> <span style="color:purple">© 2026 Orblivius. All rights reserved.</span></h1>
+
+
 <br>
 Convert Amiga ProTracker MOD(and soon S3M/XM and IT) files 
 to ShaderToy shader with visualization and note/effect overlay.
