@@ -1466,7 +1466,10 @@ class MODPlayer {{
                     
                     const effectivePeriod = this.getEffectivePeriod(ch);
                     const smpFt = (modData.sampleMap[state.sample] || {{}}).finetune || 0;
-                    const freq = this.periodToFreq(effectivePeriod, smpFt) / modData.downsample;
+                    // samplePos is in original (uncompressed) sample space.
+                    // getSampleData maps it to compressed space via pos/bw_factor — so
+                    // freq must NOT be divided by bw_factor here (would double-divide).
+                    const freq = this.periodToFreq(effectivePeriod, smpFt);
                     state.samplePos += freq / this.sampleRate;
                 }}
             }}
@@ -2531,71 +2534,47 @@ vec2 mainSound(int samp, float time) {{
     float outL = surrL + centL;
     float outR = surrR + centR;
 
-    // ── Velvet-noise reverb (stateless) ─────────────────────────────────────
-    // Adapted from the velvet reverb pattern: prime-spaced early reflections
-    // for diffusion + hash-randomised late tail for density.  source(t) is
-    // replaced by a full mono MOD channel mix at time t.
+    // ── Freeverb-inspired parallel comb reverb (stateless) ─────────────────
+    // 6 parallel combs with Freeverb delays, each unrolled k steps:
+    //   y(t) = Σ g^k · source(t - k·D)
+    // Separate L/R panning per comb creates stereo width without doubling cost.
     //
-    // Cost: (N_early + N_late) × (getPosition + NUM_CHANNELS×getChannelOutput)
-    // per sample.  Reduce counts below if audio stutters.
+    // N_ITER = unroll depth. Full 80 iterations as in the original would give
+    // perfect RT60, but k=12 gives ~-14 dB at tail end (decent room feel).
+    // Reduce N_ITER to 8 if audio drops out.
     //
-    const float RV_WET    = 0.30;
-    const int   N_EARLY   = 6;     // early reflections — cost: N_EARLY × 5 calls
-    const int   N_LATE    = 12;    // velvet late tail  — cost: N_LATE  × 5 calls
+    const float RV_WET  = 0.15;
+    const int   N_ITER  = 5;   // iterations per comb
+    const float RT60    = 2.4;
+    const float _decay  = 8.9078 / RT60;  // ln(1000)/RT60
 
-    // Hash for pseudo-random late delays/signs (same as original)
-    // h(n) = fract(sin(n × 12.9898) × 43758.5453)
-    #define RVHASH(n) fract(sin((n)*12.9898)*43758.5453)
+    // Freeverb-inspired comb delays (seconds), mutually prime in samples
+    const float _D[6] = float[](0.0253, 0.0269, 0.0290, 0.0307, 0.0322, 0.0338);
+    // Per-comb L/R pan — alternating for stereo spread, no extra source calls
+    const float _pL[6] = float[](0.85, 0.40, 0.90, 0.35, 0.80, 0.45);
+    const float _pR[6] = float[](0.40, 0.85, 0.35, 0.90, 0.45, 0.80);
 
-    // Prime-spaced early reflection delays (seconds) — from original velvet design
-    const float eD[6] = float[](.0071,.0113,.0197,.0293,.0379,.0571);
-
-    float rvL = 0.0, rvR = 0.0;
-
-    // Early reflections — separate L/R via 1.043× decorrelation factor
-    for (int _re = 0; _re < N_EARLY; _re++) {{
-        float d  = eD[_re];
-        float g  = exp(-6.0 * d);
-        // Left tap
-        float twL = playbackTime - d;
-        Position rpL = getPosition(twL);
-        float mL = 0.0;
-        for (int ch = 0; ch < NUM_CHANNELS; ch++)
-            mL += getChannelOutput(ch, twL, rpL, rowTime);
-        mL *= normFactor;
-        // Right tap (1.043× delay gives ~3ms stereo decorrelation at d=0.07)
-        float twR = playbackTime - d * 1.043;
-        Position rpR = getPosition(twR);
-        float mR = 0.0;
-        for (int ch = 0; ch < NUM_CHANNELS; ch++)
-            mR += getChannelOutput(ch, twR, rpR, rowTime);
-        mR *= normFactor;
-        rvL += g * mL;
-        rvR += g * mR;
+    vec2 _wet = vec2(0.0);
+    for (int _c = 0; _c < 6; _c++) {{
+        float _d  = _D[_c];
+        float _g  = exp(-_decay * _d);
+        float _gk = 1.0, _tk = 0.0;
+        for (int _k = 0; _k < N_ITER; _k++) {{
+            _gk *= _g;
+            _tk += _d;
+            float _tw = playbackTime - _tk;
+            Position _rp = getPosition(_tw);
+            float _m = 0.0;
+            for (int ch = 0; ch < NUM_CHANNELS; ch++)
+                _m += getChannelOutput(ch, _tw, _rp, rowTime);
+            _m *= normFactor * _gk;
+            _wet.x += _pL[_c] * _m;
+            _wet.y += _pR[_c] * _m;
+        }}
     }}
-
-    // Velvet late tail — hash-randomised delays 50–500 ms, sign-randomised stereo
-    float decay = 3.5;  // RT60 ≈ 6.9/decay ≈ 2.0 s
-    for (int _rl = 0; _rl < N_LATE; _rl++) {{
-        float fi = float(_rl);
-        float d  = 0.05 + 0.45 * RVHASH(fi);          // 50–500 ms
-        float g  = exp(-decay * d) / sqrt(float(N_LATE));
-        float tw = playbackTime - d;
-        Position rp = getPosition(tw);
-        float m = 0.0;
-        for (int ch = 0; ch < NUM_CHANNELS; ch++)
-            m += getChannelOutput(ch, tw, rp, rowTime);
-        m *= normFactor;
-        // Sign-randomised for L and R independently (velvet noise decorrelation)
-        float sL = RVHASH(fi + 17.0) > 0.5 ?  1.0 : -1.0;
-        float sR = RVHASH(fi + 53.0) > 0.5 ?  1.0 : -1.0;
-        rvL += sL * g * m;
-        rvR += sR * g * m;
-    }}
-    #undef RVHASH
-
-    outL += rvL * RV_WET;
-    outR += rvR * RV_WET;
+    _wet /= 6.0;
+    outL += _wet.x * RV_WET;
+    outR += _wet.y * RV_WET;
 
     return vec2(clamp(outL, -1.0, 1.0), clamp(outR, -1.0, 1.0));
 }}
