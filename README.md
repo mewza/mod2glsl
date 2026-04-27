@@ -1,4 +1,14 @@
-<h1>MOD2GLSL v1.36 <span style="color:darkgray">GLSL MOD Player v1.36 for ShaderToy</span> <span style="color:purple">© 2026 Orblivius. All rights reserved.</span></h1>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="120" viewBox="0 0 1200 120">
+  <style>
+    .title { font: bold 36px sans-serif; fill:#000; }
+    .subtitle { font: 20px sans-serif; fill:#565656; } /* darkgray */
+    .copyright { font: 20px sans-serif; fill:#800080; } /* purple */
+  </style>
+  <text x="10" y="42" class="title">MOD2GLSL v1.36</text>
+  <text x="10" y="76" class="subtitle">GLSL MOD Player v1.36 for ShaderToy</text>
+  <text x="10" y="100" class="copyright">© 2026 Orblivius. All rights reserved.</text>
+</svg>
+
 
 
 <br>
