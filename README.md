@@ -260,9 +260,6 @@ Free for non-commercial use. Ask author for more information
 
 Contact:<br>
    Orblivius : <subband@gmail.com><br>
-   <a href="https://t.me/hrooster">
-  <img src="https://upload.wikimedia.org/wikipedia/commons/8/82/Telegram_logo.svg" width="30">
-</a>
 <br>
    Donate PayPal : <subband@protonmail.com><br>
    
