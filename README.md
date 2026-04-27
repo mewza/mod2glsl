@@ -4,7 +4,7 @@
 <br>
        • Stateless CombFilter Reverb<br>
        • RVQ advanced sample compression (27.7 dB)<br>
-       • Downsample feature now fuse with RVQ ensures smooth samples (<br>--downsample 2. 4, 8)<br>
+       • Downsample feature now fuse with RVQ ensures smooth samples <br>(--downsample 2. 4, 8)<br>
        • 3D Surround Sound<br>
        • Cubic resampling<br>
        • FAT BASS (Hilbert)<br>
