@@ -10,10 +10,14 @@ to ShaderToy shader with visualization and note/effect overlay.
        • Downsample feature now fuse with RVQ ensures smooth samples <br>(--downsample 2. 4, 8)<br>
        • 3D Surround Sound<br>
        • Cubic resampling<br>
-       • PHAT BASS (Hilbert)<br>
+       • PHAT Bass (Hilbert)<br>
        • FAT<br>
+       • Added --viz 0 (no backrop viz, and 1 to 5 different ones)<br>
+       • Added options for --split and --no-split (--split for faster loading time)<br>
+       • Added --vec-dim 8 (instead of doing --downsample 2 you can just go --vec-dim 8 for better results)<br>
+       • Added --no-rvq2 mode (feature to reduce load time but shaves 4 dB)<br>
        • Bug fixes (fixed --downsample 1 which produced white noise, but --downsample 2, 4 should also work now)<br>
-       
+       <br>
        (myenv) bash-3.2$ python mod_player.py --help              
        usage: mod_player.py [-h] [--downsample DOWNSAMPLE] [--bitrate {lo,med,hi,ultra}]
                             [--vec-dim {2,4,8}] [--resampler {linear,bspline,lanczos3}]
