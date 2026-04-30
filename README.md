@@ -1,7 +1,8 @@
 # MOD2GLSL v1.37<br><br>$${\color{orange}GLSL\ MOD\ Player\ v1.37\ for\ ShaderToy}$$<br>$${\color{litegray}©2026\ Orblivius.\ All\ rights\ reserved.}$$
 <br>
 Convert Amiga ProTracker MOD(and soon S3M/XM and IT) files 
-to ShaderToy shader with visualization and note/effect overlay.
+to ShaderToy shader with visualization and note/effect overlay.<br>
+<br>
 WARNING: Do not release your shaders on ShaderToy.com I got banned
 already because the loading takes forever, if you want to use this,
 either clone it as Private or Unlisted, otherwise just build your own
