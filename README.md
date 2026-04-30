@@ -1,11 +1,11 @@
-# MOD2GLSL v1.36<br><br>$${\color{orange}GLSL\ MOD\ Player\ v1.36\ for\ ShaderToy}$$<br>$${\color{litegray}©2026\ Orblivius.\ All\ rights\ reserved.}$$
+# MOD2GLSL v1.37<br><br>$${\color{orange}GLSL\ MOD\ Player\ v1.37\ for\ ShaderToy}$$<br>$${\color{litegray}©2026\ Orblivius.\ All\ rights\ reserved.}$$
 <br>
 Convert Amiga ProTracker MOD(and soon S3M/XM and IT) files 
 to ShaderToy shader with visualization and note/effect overlay.
 <br>
 <br>
-<h4><code>NEW in v1.36</code></h4>
-       • Stateless CombFilter Reverb<br>
+<h4><code>NEW in v1.37</code></h4>
+       • CombFilter Reverb<br>
        • RVQ advanced sample compression (27.7 dB)<br>
        • Downsample feature now fuse with RVQ ensures smooth samples <br>(--downsample 2. 4, 8)<br>
        • 3D Surround Sound<br>
@@ -13,7 +13,56 @@ to ShaderToy shader with visualization and note/effect overlay.
        • PHAT BASS (Hilbert)<br>
        • FAT<br>
        • Bug fixes (fixed --downsample 1 which produced white noise, but --downsample 2, 4 should also work now)<br>
-
+       
+       (myenv) bash-3.2$ python mod_player.py --help              
+       usage: mod_player.py [-h] [--downsample DOWNSAMPLE] [--bitrate {lo,med,hi,ultra}]
+                            [--vec-dim {2,4,8}] [--resampler {linear,bspline,lanczos3}]
+                            [--no-split] [--split] [--viz {0,1,2,3,4,5}] [--no-rvq2]
+                            modfile
+       
+       MOD/S3M Player - Generates HTML player + ShaderToy GLSL + PNG samples
+       
+       positional arguments:
+         modfile               MOD or S3M file to play
+       
+       options:
+         -h, --help            show this help message and exit
+         --downsample DOWNSAMPLE
+                               Sample decimation factor: 1=full-rate, 2=22kHz, 4=11kHz. HF
+                               percussion (cymbals/rides) gets max(1,DS//2) to keep shimmer.
+                               (default: 1)
+         --bitrate {lo,med,hi,ultra}
+                               RVQ codebook size (mp3-style quality knob). lo=K(128,64) 13b/pair
+                               smallest+grainy, med=K(256,128) 15b/pair balanced, hi=K(512,256)
+                               17b/pair sharper, ultra=K(1024,512) 19b/pair near-transparent.
+                               (default: med)
+         --vec-dim {2,4,8}     RVQ vector dimensionality. 8=smallest (~2.1 bits/sample), 4=medium
+                               (4.25 bits/sample), 2=highest fidelity (8.5 bits/sample). (default:
+                               8)
+         --resampler {linear,bspline,lanczos3}
+                               Sample resampler. linear=2-tap (cheapest, ProTracker-style),
+                               bspline=4-tap cubic (smooth/soft), lanczos3=6-tap sinc
+                               (sharpest/brightest, ~50% more cost). (default: lanczos3)
+         --no-split            Keep VQ arrays + decoders in Common tab. Required for
+                               oscilloscope/spectrum/Buffer A visualizers to decode actual audio
+                               via getChannelOutput. Default ON. (default: True)
+         --split               Split VQ arrays into Sound tab — fast Common compile, but breaks
+                               audio-driven visualizers (no getChannelOutput in Image/BufferA).
+                               (default: True)
+         --viz {0,1,2,3,4,5}   Image-tab visualizer: 0=None (black backdrop, fastest compile),
+                               1=Reactive 001 (PAEz fork — SDF circles + cosmic web, default),
+                               2=Fluxline Surfer (mrange — DR2 dodecahedron + glowtracer), 3=Zuvuya
+                               (city/stars + audio-reactive curtain), 4=Maya (raymarched fractal
+                               tunnel-warp), 5=Dodecahedron (Philip Bertani — DR2 IFS fractal
+                               raymarcher). (default: 1)
+         --no-rvq2             Skip RVQ stage 2 (residual quantization). Drops ~40% of sample-data
+                               const arrays from Sound tab → faster compile. Quality cost: ~4 dB
+                               SNR (sounds noisier but pitch is unchanged). IMPORTANT: when re-
+                               pasting into ShaderToy, paste BOTH the new Common AND new Sound —
+                               otherwise mismatched RVQ_BITS produces high-pitch garbage from a
+                               stale Common reading 15-bit-packed codes that were actually written
+                               at 8 bits. (default: False)
+                        
 `Live Demos` <br>
 <br>
        • https://www.shadertoy.com/view/7cBXWK<br>
