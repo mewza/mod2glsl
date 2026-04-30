@@ -19,6 +19,7 @@ to ShaderToy shader with visualization and note/effect overlay.
        • Added --no-rvq2 mode (feature to reduce load time but shaves 4 dB)<br>
        • Bug fixes (fixed --downsample 1 which produced white noise, but --downsample 2, 4 should also work now)<br>
        <br>
+       
        bash-3.2$ python mod_player.py --help              
        usage: mod_player.py [-h] [--downsample DOWNSAMPLE] [--bitrate {lo,med,hi,ultra}]
                             [--vec-dim {2,4,8}] [--resampler {linear,bspline,lanczos3}]
@@ -71,7 +72,6 @@ to ShaderToy shader with visualization and note/effect overlay.
 `Live Demos` <br>
 <br>
        • https://www.shadertoy.com/view/7cBXWK<br>
-       • https://www.shadertoy.com/view/NfjXWy<br>
 <br>
 
 <img width="50%" height="50%" alt="image" src="https://github.com/user-attachments/assets/b10632a5-c7a6-47e7-a28e-832251b19e6c" />
