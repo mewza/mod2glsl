@@ -7,18 +7,19 @@ to ShaderToy shader with visualization and note/effect overlay.
 <h4><code>NEW in v1.37</code></h4>
        • CombFilter Reverb<br>
        • RVQ advanced sample compression (27.7 dB)<br>
-       • Downsample feature now fuse with RVQ ensures smooth samples <br>(--downsample 2. 4, 8)<br>
-       • 3D Surround Sound<br>
-       • Cubic resampling<br>
-       • PHAT Bass (Hilbert)<br>
+       • Downsample feature now fuse with RVQ ensures smooth samples <br>(--downsample 1 (default), 2. 4, 8)<br>
+       • 3D Surround<br>
+       • Linear, B-Spline, Lanczcos3 resamplers<br>
+       • PHAT Bass (Hilbert, improved bass track detection)<br>
        • FAT<br>
+       • Added --help<br>
        • Added --viz 0 (no backrop viz, and 1 to 5 different ones)<br>
        • Added options for --split and --no-split (--split for faster loading time)<br>
        • Added --vec-dim 8 (instead of doing --downsample 2 you can just go --vec-dim 8 for better results)<br>
        • Added --no-rvq2 mode (feature to reduce load time but shaves 4 dB)<br>
        • Bug fixes (fixed --downsample 1 which produced white noise, but --downsample 2, 4 should also work now)<br>
        <br>
-       (myenv) bash-3.2$ python mod_player.py --help              
+       bash-3.2$ python mod_player.py --help              
        usage: mod_player.py [-h] [--downsample DOWNSAMPLE] [--bitrate {lo,med,hi,ultra}]
                             [--vec-dim {2,4,8}] [--resampler {linear,bspline,lanczos3}]
                             [--no-split] [--split] [--viz {0,1,2,3,4,5}] [--no-rvq2]
