@@ -2,6 +2,13 @@
 <br>
 Convert Amiga ProTracker MOD(and soon S3M/XM and IT) files 
 to ShaderToy shader with visualization and note/effect overlay.
+WARNING: Do not release your shaders on ShaderToy.com I got banned
+already because the loading takes forever, if you want to use this,
+either clone it as Private or Unlisted, otherwise just build your own
+and do not use large MOD files or you will get banned from ShaderToy.com
+site like I did. The reason is because large MOD files take forever to
+load and crash Linux 3D Gfx drivers, so the users will complain and you
+will get banned. You've been warned!
 <br>
 <br>
 <h4><code>NEW in v1.37</code></h4>
