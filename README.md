@@ -18,8 +18,7 @@ custom textures. I did propose to them a simple solution, for established
 contributors to the site offer that possibility and still run it through a
 simple automated approval process that checks image for nafarious content.
 Well, if you feel like writing an email to support this proposal please
-email to [Email ShaderToy Admin](mailto:info@shadertoy.com?subject=Upload%20texture%20(PNG)%20feature%20request&body=) and just copy paste the paragraph. That would
-be the only possibility if enough people ask them for this feature, then,
+email to [Email ShaderToy Admin](mailto:info@shadertoy.com?subject=PNG%20texture%20upload%20feature&body=Hi,%0A%0AI%27d%20like%20to%20support%20the%20proposal%20to%20allow%20custom%20texture%20uploads...) and just copy paste the paragraph. That would be the only possibility if enough people ask them for this feature, then,
 embedding MOD into PNG and uploading it to the site with the local reference
 would make things a LOT simplier, make loading instant and not crash
 the poorly written Linux 3d gfx drivers, it is happening because of
