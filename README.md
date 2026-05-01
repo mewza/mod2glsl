@@ -43,25 +43,22 @@ The 64K stack-space limit. As shader local-variable usage approaches that ceilin
 
 ## $${\color{limegreen}\textsf{✨ What's new in v1.37}}$$
 
-```diff
-+ CombFilter Reverb
-+ RVQ advanced sample compression (27.7 dB)
-+ Downsampling fused with RVQ for smooth samples
-    --downsample 1 (default), 2, 4, 8
-+ 3D Surround
-+ Linear, B-Spline, and Lanczos3 resamplers
-+ PHAT Bass — Hilbert transform with improved bass-track detection
-+ FAT mode
-+ --help flag
-+ --use-png  (embed MOD into a PNG and configure player to load from texture)
-+ --viz 0 (no backdrop) plus visualizers 1–5
-+ --split / --no-split  (--split for faster compile)
-+ --vec-dim 8  (better results than --downsample 2)
-+ --no-rvq2  (faster compile, ~4 dB SNR cost)
+$\color{limegreen}\textsf{+}$ &nbsp; **CombFilter Reverb**  
+$\color{limegreen}\textsf{+}$ &nbsp; **RVQ advanced sample compression** — 27.7 dB  
+$\color{limegreen}\textsf{+}$ &nbsp; **Downsampling fused with RVQ** for smooth samples — `--downsample 1` (default), `2`, `4`, `8`  
+$\color{limegreen}\textsf{+}$ &nbsp; **3D Surround**  
+$\color{limegreen}\textsf{+}$ &nbsp; **Linear, B-Spline, and Lanczos3 resamplers**  
+$\color{limegreen}\textsf{+}$ &nbsp; **PHAT Bass** — Hilbert transform with improved bass-track detection  
+$\color{limegreen}\textsf{+}$ &nbsp; **FAT** mode  
+$\color{limegreen}\textsf{+}$ &nbsp; `--help` flag  
+$\color{limegreen}\textsf{+}$ &nbsp; `--use-png` — embed MOD into a PNG and configure player to load from texture  
+$\color{limegreen}\textsf{+}$ &nbsp; `--viz 0` (no backdrop) plus visualizers `1`–`5`  
+$\color{limegreen}\textsf{+}$ &nbsp; `--split` / `--no-split` — `--split` for faster compile  
+$\color{limegreen}\textsf{+}$ &nbsp; `--vec-dim 8` — better results than `--downsample 2`  
+$\color{limegreen}\textsf{+}$ &nbsp; `--no-rvq2` — faster compile, ~4 dB SNR cost
 
-! Bug fix: --downsample 1 no longer produces white noise
-! Bug fix: --downsample 2 and 4 now work correctly
-```
+$\color{orange}\textsf{!}$ &nbsp; Bug fix: `--downsample 1` no longer produces white noise  
+$\color{orange}\textsf{!}$ &nbsp; Bug fix: `--downsample 2` and `4` now work correctly
 
 ### Command-line reference
 
