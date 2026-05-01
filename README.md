@@ -3,14 +3,32 @@
 Convert Amiga ProTracker MOD(and soon S3M/XM and IT) files 
 to ShaderToy shader with visualization and note/effect overlay.<br>
 <br>
-WARNING: Do not release your shaders on ShaderToy.com I got banned
-already because the loading takes forever, if you want to use this,
+WARNING: Do not release your MOD shaders on ShaderToy.com if the MOD 
+is large and takes a long time to load - I recently got banned because
+I was posting all my fancy MODs all proud that I made them load into 64k 
+stack, but the admin didn't take it lightly. If you want to use this,
 either clone it as Private or Unlisted, otherwise just build your own
-and do not use large MOD files or you will get banned from ShaderToy.com
-site like I did. The reason is because large MOD files take forever to
-load and crash Linux 3D Gfx drivers, so the users will complain and you
-will get banned. You've been warned!
+and do not use large MOD files. The reason is because large MOD files 
+take forever to load in embedded mode and crash Linux 3D Gfx drivers, 
+so the users will complain and you will get banned. You've been warned!<br>
 <br>
+There is however an option to embed MOD file into PNG and load it from there
+very quickly, however, the ShaderToy.com site does not let you upload
+custom textures. I did propose to them a simple solution, for established
+contributors to the site offer that possibility and still run it through a
+simple automated approval process that checks image for nafarious content.
+Well, if you feel like writing an email to support this proposal please
+email to: <info@shadertoy.com> and just copy paste the paragraph. That would
+be the only possibility if enough people ask them for this feature, then,
+embedding MOD into PNG and uploading it to the site with the local reference
+would make things a LOT simplier, make loading instant and not crash
+the poorly written Linux 3d gfx drivers, it is happening because of
+64K stack space limit, when it reaches near that level, some drivers
+store some internal variables in that space which they shouldn't and
+it causes gfx driver to crash. By the standdard imposed by WebGL and
+ANGLE the stack of 64k of allocation of local variables and arrays
+must be respected, but apparently Linux 3D gfx driver developers don't
+know this, or ignore it.<br>
 <br>
 <h4><code>NEW in v1.37</code></h4>
        • CombFilter Reverb<br>
