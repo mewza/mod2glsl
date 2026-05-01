@@ -40,8 +40,8 @@ $\color{orange}\textsf{!}$ &nbsp; Bug fix: `--downsample 2` and `4` now work cor
 ## $${\color{deepskyblue}\textsf{🎬 Live demos}}$$
 
 <p align="center">
-  🔗 **https://www.shadertoy.com/view/7XlGRr**<br>
-  🔗 **https://www.shadertoy.com/view/73lGzr**<br>
+  🔗 https://www.shadertoy.com/view/7XlGRr<br>
+  🔗 https://www.shadertoy.com/view/73lGzr<br>
 </p>
 
 <p align="center">
