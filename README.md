@@ -169,11 +169,11 @@ I've been an audio guy my whole life. At 6 years old I was picked from the crowd
 
 ### Features
 
-✓ RLE compression for patterns  
-✓ Optimized `ivec4` chunked data loader  
-✓ Generates the GLSL infrastructure for you  
-✓ Tracker-like GUI with note and FX overlay  
-✓ Handles looping samples
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="14" /> RLE compression for patterns  
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="14" /> Optimized `ivec4` chunked data loader  
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="14" /> Generates the GLSL infrastructure for you  
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="14" /> Tracker-like GUI with note and FX overlay  
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="14" /> Handles looping samples
 
 ### Requirements
 
