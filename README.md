@@ -60,8 +60,7 @@ $\color{limegreen}\textsf{+}$ &nbsp; `--no-rvq2` — faster compile, ~4 dB SNR c
 $\color{orange}\textsf{!}$ &nbsp; Bug fix: `--downsample 1` no longer produces white noise  
 $\color{orange}\textsf{!}$ &nbsp; Bug fix: `--downsample 2` and `4` now work correctly
 
-<details>
-<summary>$\color{gray}\textsf{📋 Command-line reference — click to expand}$</summary>
+### Command-line reference
 
 ```text
 $ python mod_player.py --help
@@ -140,8 +139,6 @@ options:
                         GSLINGER_player_data.png via Unofficial Plugin
                         "Custom Textures". Implies --no-split. (default: False)
 ```
-
-</details>
 
 ---
 
