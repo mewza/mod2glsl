@@ -40,6 +40,8 @@ $\color{orange}\textsf{!}$ &nbsp; Bug fix: `--downsample 2` and `4` now work cor
 ## $${\color{deepskyblue}\textsf{🎬 Live demos}}$$
 <p align="center">
   <img width="60%" alt="MOD2GLSL screenshot" src="https://github.com/user-attachments/assets/b10632a5-c7a6-47e7-a28e-832251b19e6c" />
+</p>
+<p align="center">
 🔗 https://www.shadertoy.com/view/7XlGRr<br>
 🔗 https://www.shadertoy.com/view/73lGzr<br>
 </p>
