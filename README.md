@@ -59,7 +59,16 @@ $\color{limegreen}\textsf{+}$ &nbsp; `--no-rvq2` — faster compile, ~4 dB SNR c
 
 $\color{orange}\textsf{!}$ &nbsp; Bug fix: `--downsample 1` no longer produces white noise  
 $\color{orange}\textsf{!}$ &nbsp; Bug fix: `--downsample 2` and `4` now work correctly
+---
 
+## $${\color{deepskyblue}\textsf{🎬 Live demo}}$$
+
+🔗 **https://www.shadertoy.com/view/7XlGRr**
+
+<p align="center">
+  <img width="60%" alt="MOD2GLSL screenshot" src="https://github.com/user-attachments/assets/b10632a5-c7a6-47e7-a28e-832251b19e6c" />
+</p>
+---
 ### Command-line reference
 
 ```text
@@ -139,16 +148,6 @@ options:
                         GSLINGER_player_data.png via Unofficial Plugin
                         "Custom Textures". Implies --no-split. (default: False)
 ```
-
----
-
-## $${\color{deepskyblue}\textsf{🎬 Live demo}}$$
-
-🔗 **https://www.shadertoy.com/view/7XlGRr**
-
-<p align="center">
-  <img width="60%" alt="MOD2GLSL screenshot" src="https://github.com/user-attachments/assets/b10632a5-c7a6-47e7-a28e-832251b19e6c" />
-</p>
 
 ---
 
