@@ -38,6 +38,7 @@ know this, or ignore it.<br>
        • PHAT Bass (Hilbert, improved bass track detection)<br>
        • FAT<br>
        • Added --help<br>
+       • Added --use-png (Embed MOD into a PNG and configure player for loading MOD from texture)<br>
        • Added --viz 0 (no backrop viz, and 1 to 5 different ones)<br>
        • Added options for --split and --no-split (--split for faster loading time)<br>
        • Added --vec-dim 8 (instead of doing --downsample 2 you can just go --vec-dim 8 for better results)<br>
