@@ -169,18 +169,19 @@ I've been an audio guy my whole life. At 6 years old I was picked from the crowd
 
 ### Features
 
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **2-stage Residual Vector Quantization** — RVQ sample compression with K-means codebooks (K1=256, K2=128 at default `med` bitrate). ~14.7 dB SNR at ~2.1 bits/sample with vec_dim=8.  
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Per-sample FFT bandwidth analysis** — auto-decimates low-bandwidth samples (bass, muted instruments) more aggressively than full-bandwidth ones (cymbals, vocals), preserving HF shimmer where it matters.  
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Loop-seam smoothing** — for looping samples, post-loop guard region is patched with the actual wraparound data so VQ doesn't introduce step discontinuities at loop boundaries.  
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Configurable resampler** — linear (2-tap, ProTracker-style), B-spline (4-tap cubic), or Lanczos-3 (6-tap windowed sinc) selectable at build time.  
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **3D Surround + PhatBass + Comb Reverb + FAT** — Hilbert allpass bass enhancement on detected bass instruments, Only3D widening on configurable channel pairs.  
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **RLE pattern compression** — bitmap + dictionary + 16-bit prefix-sum row seek for O(1) row lookup.  
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Optimized `ivec4` chunked data loader** — packs 4 bytes per int32, sidesteps GLSL's per-array element budget.  
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **6 visualizers built-in** — Reactive 001, Fluxline Surfer, Zuvuya, Maya, Philip Bertani Dodecahedron, or none. Selectable via `--viz {0..5}`.  
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Tracker-like GUI** — pattern grid with note + effect overlay, BPM/Speed/Position display, oscilloscope or FFT spectrum (click to toggle).  
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Generates everything for you** — HTML standalone player + 4 ShaderToy tabs (Common, Sound, Image, Buffer A) + PNG sample texture + paste instructions.  
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **`--use-png` mode** — alternative to RVQ for fast Common-tab compile (legacy texelFetch from PNG, raw 8-bit samples).  
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **`--no-rvq2` mode** — single-stage RVQ option, ~33% smaller Sound tab at the cost of ~4 dB SNR.
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **2-stage Residual VQ** — K-means sample compression, ~14.7 dB SNR at ~2.1 bits/sample.  
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Per-sample FFT bandwidth analysis** — auto-decimates low-bandwidth samples, preserves HF shimmer.  
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Loop-seam smoothing** — patches post-loop guard so VQ doesn't break loop boundaries.  
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Configurable resampler** — linear, B-spline, or Lanczos-3.  
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **3D Surround, PhatBass, Comb Reverb, FAT** — Hilbert bass enhance + channel-pair widening.  
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **RLE pattern compression** — bitmap + dictionary + O(1) row seek.  
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **`ivec4` chunked data loader** — 4 bytes per int32, beats GLSL array limits.  
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **6 built-in visualizers** — `--viz 0..5`.  
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Tracker-like GUI** — pattern grid, oscilloscope/FFT toggle, BPM/Speed/Position.  
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Full output bundle** — HTML player + 4 ShaderToy tabs + PNG + paste instructions.  
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **`--use-png`** — fast-compile alternative, raw 8-bit samples via texelFetch.  
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **`--no-rvq2`** — single-stage RVQ, ~33% smaller Sound, ~4 dB SNR cost.
+
 ### Requirements
 
 ```bash
