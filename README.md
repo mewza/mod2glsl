@@ -37,9 +37,10 @@ $\color{orange}\textsf{!}$ &nbsp; Bug fix: `--downsample 1` no longer produces w
 $\color{orange}\textsf{!}$ &nbsp; Bug fix: `--downsample 2` and `4` now work correctly
 ---
 
-## $${\color{deepskyblue}\textsf{🎬 Live demo}}$$
+## $${\color{deepskyblue}\textsf{🎬 Live demos}}$$
 
 🔗 **https://www.shadertoy.com/view/7XlGRr**
+🔗 **https://www.shadertoy.com/view/73lGzr**
 
 <p align="center">
   <img width="60%" alt="MOD2GLSL screenshot" src="https://github.com/user-attachments/assets/b10632a5-c7a6-47e7-a28e-832251b19e6c" />
