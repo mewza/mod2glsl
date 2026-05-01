@@ -17,30 +17,6 @@ Convert Amiga ProTracker MOD files (and soon S3M, XM, and IT) into a ShaderToy s
 
 ---
 
-> [!WARNING]
-> **Don't release large MOD shaders publicly on ShaderToy.com.**
-> I recently got banned for posting all my fancy MODs — proud that I'd squeezed them into the 64K stack — but the admin didn't take it lightly. If you want to use this:
-> - Clone your shader as **Private** or **Unlisted**, **or**
-> - Build your own with small MOD files.
->
-> Large MODs take forever to load in embedded mode and crash Linux 3D graphics drivers. Users complain → you get banned. You've been warned.
-
-> [!IMPORTANT]
-> **Help us get custom textures on ShaderToy** 🙏
->
-> There *is* a way to embed a MOD into a PNG and load it instantly — but ShaderToy.com doesn't allow custom-texture uploads. I've proposed a simple fix: let established contributors upload textures behind an automated content check.
->
-> If you'd like to support the proposal, please [📧 email the ShaderToy admin](mailto:info@shadertoy.com?subject=PNG%20texture%20upload%20feature%20request&body=Hi%2C%0A%0AI%27d%20like%20to%20support%20the%20proposal%20to%20allow%20custom%20texture%20uploads.) and copy-paste the paragraph above. The more voices, the better.
-
-<details>
-<summary>🔧 <b>Why does it crash, technically?</b></summary>
-
-The 64K stack-space limit. As shader local-variable usage approaches that ceiling, some Linux 3D drivers spill internal variables into that space when they shouldn't, and the driver crashes. The WebGL/ANGLE standard requires the 64K local-variable stack to be respected — apparently Linux 3D driver developers don't know this, or ignore it.
-
-</details>
-
----
-
 ## $${\color{limegreen}\textsf{✨ What's new in v1.37}}$$
 
 $\color{limegreen}\textsf{+}$ &nbsp; **CombFilter Reverb**  
@@ -68,6 +44,29 @@ $\color{orange}\textsf{!}$ &nbsp; Bug fix: `--downsample 2` and `4` now work cor
 <p align="center">
   <img width="60%" alt="MOD2GLSL screenshot" src="https://github.com/user-attachments/assets/b10632a5-c7a6-47e7-a28e-832251b19e6c" />
 </p>
+---
+
+> [!WARNING]
+> **Don't release large MOD shaders publicly on ShaderToy.com.**
+> I recently got banned for posting all my fancy MODs — proud that I'd squeezed them into the 64K stack — but the admin didn't take it lightly. If you want to use this:
+> - Clone your shader as **Private** or **Unlisted**, **or**
+> - Build your own with small MOD files.
+>
+> Large MODs take forever to load in embedded mode and crash Linux 3D graphics drivers. Users complain → you get banned. You've been warned.
+
+> [!IMPORTANT]
+> **Help us get custom textures on ShaderToy** 🙏
+>
+> There *is* a way to embed a MOD into a PNG and load it instantly — but ShaderToy.com doesn't allow custom-texture uploads. I've proposed a simple fix: let established contributors upload textures behind an automated content check.
+>
+> If you'd like to support the proposal, please [📧 email the ShaderToy admin](mailto:info@shadertoy.com?subject=PNG%20texture%20upload%20feature%20request&body=Hi%2C%0A%0AI%27d%20like%20to%20support%20the%20proposal%20to%20allow%20custom%20texture%20uploads.) and copy-paste the paragraph above. The more voices, the better.
+
+<details>
+<summary>🔧 <b>Why does it crash, technically?</b></summary>
+
+The 64K stack-space limit. As shader local-variable usage approaches that ceiling, some Linux 3D drivers spill internal variables into that space when they shouldn't, and the driver crashes. The WebGL/ANGLE standard requires the 64K local-variable stack to be respected — apparently Linux 3D driver developers don't know this, or ignore it.
+
+</details>
 ---
 ### Command-line reference
 
