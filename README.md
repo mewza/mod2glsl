@@ -45,10 +45,10 @@ know this, or ignore it.<br>
        • Bug fixes (fixed --downsample 1 which produced white noise, but --downsample 2, 4 should also work now)<br>
        <br>
        
-       bash-3.2$ python mod_player.py --help              
+       bash-3.2$ python mod_player.py --help
        usage: mod_player.py [-h] [--downsample DOWNSAMPLE] [--bitrate {lo,med,hi,ultra}]
                             [--vec-dim {2,4,8}] [--resampler {linear,bspline,lanczos3}]
-                            [--no-split] [--split] [--viz {0,1,2,3,4,5}] [--no-rvq2]
+                            [--no-split] [--split] [--viz {0,1,2,3,4,5}] [--no-rvq2] [--use-png]
                             modfile
        
        MOD/S3M Player - Generates HTML player + ShaderToy GLSL + PNG samples
@@ -59,40 +59,23 @@ know this, or ignore it.<br>
        options:
          -h, --help            show this help message and exit
          --downsample DOWNSAMPLE
-                               Sample decimation factor: 1=full-rate, 2=22kHz, 4=11kHz. HF
-                               percussion (cymbals/rides) gets max(1,DS//2) to keep shimmer.
-                               (default: 1)
+                               Sample decimation factor: 1=full-rate, 2=22kHz, 4=11kHz. HF percussion (cymbals/rides) gets max(1,DS//2) to keep shimmer. (default: 1)
          --bitrate {lo,med,hi,ultra}
-                               RVQ codebook size (mp3-style quality knob). lo=K(128,64) 13b/pair
-                               smallest+grainy, med=K(256,128) 15b/pair balanced, hi=K(512,256)
-                               17b/pair sharper, ultra=K(1024,512) 19b/pair near-transparent.
-                               (default: med)
-         --vec-dim {2,4,8}     RVQ vector dimensionality. 8=smallest (~2.1 bits/sample), 4=medium
-                               (4.25 bits/sample), 2=highest fidelity (8.5 bits/sample). (default:
-                               8)
+                               RVQ codebook size (mp3-style quality knob). lo=K(128,64) 13b/pair smallest+grainy, med=K(256,128) 15b/pair balanced, hi=K(512,256) 17b/pair sharper, ultra=K(1024,512) 19b/pair near-transparent. (default: med)
+         --vec-dim {2,4,8}     RVQ vector dimensionality. 8=smallest (~2.1 bits/sample), 4=medium (4.25 bits/sample), 2=highest fidelity (8.5 bits/sample). (default: 8)
          --resampler {linear,bspline,lanczos3}
-                               Sample resampler. linear=2-tap (cheapest, ProTracker-style),
-                               bspline=4-tap cubic (smooth/soft), lanczos3=6-tap sinc
-                               (sharpest/brightest, ~50% more cost). (default: lanczos3)
-         --no-split            Keep VQ arrays + decoders in Common tab. Required for
-                               oscilloscope/spectrum/Buffer A visualizers to decode actual audio
-                               via getChannelOutput. Default ON. (default: True)
-         --split               Split VQ arrays into Sound tab — fast Common compile, but breaks
-                               audio-driven visualizers (no getChannelOutput in Image/BufferA).
-                               (default: True)
-         --viz {0,1,2,3,4,5}   Image-tab visualizer: 0=None (black backdrop, fastest compile),
-                               1=Reactive 001 (PAEz fork — SDF circles + cosmic web, default),
-                               2=Fluxline Surfer (mrange — DR2 dodecahedron + glowtracer), 3=Zuvuya
-                               (city/stars + audio-reactive curtain), 4=Maya (raymarched fractal
-                               tunnel-warp), 5=Dodecahedron (Philip Bertani — DR2 IFS fractal
-                               raymarcher). (default: 1)
-         --no-rvq2             Skip RVQ stage 2 (residual quantization). Drops ~40% of sample-data
-                               const arrays from Sound tab → faster compile. Quality cost: ~4 dB
-                               SNR (sounds noisier but pitch is unchanged). IMPORTANT: when re-
-                               pasting into ShaderToy, paste BOTH the new Common AND new Sound —
-                               otherwise mismatched RVQ_BITS produces high-pitch garbage from a
-                               stale Common reading 15-bit-packed codes that were actually written
-                               at 8 bits. (default: False)
+                               Sample resampler. linear=2-tap (cheapest, ProTracker-style), bspline=4-tap cubic (smooth/soft), lanczos3=6-tap sinc (sharpest/brightest, ~50% more cost). (default: lanczos3)
+         --no-split            Keep VQ arrays + decoders in Common tab.  Required for oscilloscope/spectrum/Buffer A visualizers to decode actual audio via getChannelOutput.  Default ON. (default: True)
+         --split               Split VQ arrays into Sound tab — fast Common compile, but breaks audio-driven visualizers (no getChannelOutput in Image/BufferA). (default: True)
+         --viz {0,1,2,3,4,5}   Image-tab visualizer:
+                                 0 = None             (black backdrop, fastest compile)
+                                 1 = Reactive 001     (PAEz fork — SDF circles + cosmic web)  ← default
+                                 2 = Fluxline Surfer  (mrange — DR2 dodecahedron + glowtracer)
+                                 3 = Zuvuya           (city/stars + audio-reactive curtain)
+                                 4 = Maya             (raymarched fractal tunnel-warp)
+                                 5 = Dodecahedron     (Philip Bertani — DR2 IFS fractal raymarcher) (default: 1)
+         --no-rvq2             Skip RVQ stage 2 (residual quantization).  Drops ~40% of sample-data const arrays from Sound tab → faster compile. Quality cost: ~4 dB SNR (sounds noisier but pitch is unchanged). IMPORTANT: when re-pasting into ShaderToy, paste BOTH the new Common AND new Sound — otherwise mismatched RVQ_BITS produces high-pitch garbage from a stale Common reading 15-bit-packed codes that were actually written at 8 bits. (default: False)
+         --use-png             Use legacy PNG-loaded Common (samples read via texelFetch from iChannel0=PNG) instead of VQ-encoded const arrays. Smaller Common source = faster compile, but raw 8-bit samples (no RVQ) so quality differs.  ShaderToy setup: Image/Common iChannel0 = GSLINGER_player_data.png via Unofficial Plugin "Custom Textures". Implies --no-split. (default: False)
                         
 `Live Demos` <br>
 <br>
