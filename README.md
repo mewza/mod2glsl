@@ -41,12 +41,10 @@ $\color{orange}\textsf{!}$ &nbsp; Bug fix: `--downsample 2` and `4` now work cor
 <p align="center">
   <img width="60%" alt="MOD2GLSL screenshot" src="https://github.com/user-attachments/assets/b10632a5-c7a6-47e7-a28e-832251b19e6c" />
 </p>
-<div align="center">
-<table border="0" cellspacing="0" cellpadding="2" style="border:none;border-collapse:collapse;">
-  <tr><td><b>BEYOND.MOD</b></td><td>•</td><td><a href="https://www.shadertoy.com/view/7XlGRr">shadertoy.com/view/7XlGRr</a></td></tr>
-  <tr><td><b>12THWARRIOR.MOD</b></td><td>•</td><td><a href="https://www.shadertoy.com/view/73lGzr">shadertoy.com/view/73lGzr</a></td></tr>
-</table>
-</div>
+<p align="center"><pre>
+<b>BEYOND.MOD</b>      • <a href="https://www.shadertoy.com/view/7XlGRr">shadertoy.com/view/7XlGRr</a>
+<b>12THWARRIOR.MOD</b> • <a href="https://www.shadertoy.com/view/73lGzr">shadertoy.com/view/73lGzr</a>
+</pre></p>
 
 ---
 
