@@ -3563,6 +3563,12 @@ void _v6_coneRange(vec3 dir, float ang, _v6_Ray r, out float s, out float e) {
 }
 
 // ─── Smoke cone field (volumetric noise inside three rotating spotlights) ──
+// hit_ids uses BITMASK encoding so multi-cone overlaps decode unambiguously:
+//   cone 0 alone = 1, cone 1 alone = 2, cone 2 alone = 4
+//   pair overlaps: 0+1=3, 0+2=5, 1+2=6
+//   triple: 0+1+2=7
+// (The original Doc 12 used additive 1+2+3 which has 3 ambiguous between
+//  "cone 2 alone" vs "cones 0+1 overlap" — we fix that here.)
 vec2 _v6_maplight(vec3 orp) {
     float t = iTime * 0.025;
     float minm = 1e4, mm = 1e4, hit_ids = 0.0;
@@ -3580,7 +3586,7 @@ vec2 _v6_maplight(vec3 orp) {
                   n += _v6_noiseZ(_rp*152.5 + vec3(t*2.8, 0,0)) * 0.25;
             mm = min(mm, min(n, m));
             mm = min(mm, -0.2);
-            hit_ids += float(i + 1);
+            hit_ids += float(i + 1);     // Doc 12 additive: 1, 2, 3
         }
         minm = min(abs(m), minm);
     }
@@ -3613,6 +3619,8 @@ bool _v6_trace(vec3 ro, vec3 rd, inout vec4 color) {
         if (rp.z > _v6_FAR) return false;
         if (h < 0.0) {
             vec4 fgc = vec4(abs(h * 0.05));
+
+            // ── Smoke colorize: Doc 12 verbatim ─────────────────────────
             if      (hp.y == _v6_SMOKE_CONE_1) _v6_colorize(fgc, (-_v6_SPOT_POS[0]-rp), spcol1, music, color);
             else if (hp.y == _v6_SMOKE_CONE_2) _v6_colorize(fgc, (-_v6_SPOT_POS[1]-rp), spcol2, music, color);
             else if (hp.y == _v6_SMOKE_CONE_3) _v6_colorize(fgc, (-_v6_SPOT_POS[2]-rp), spcol3, music, color);
@@ -3620,6 +3628,34 @@ bool _v6_trace(vec3 ro, vec3 rd, inout vec4 color) {
                 _v6_colorize(fgc, (-_v6_SPOT_POS[0]-rp), spcol1, music, color);
                 _v6_colorize(fgc, (-_v6_SPOT_POS[1]-rp), spcol2, music, color);
                 _v6_colorize(fgc, (-_v6_SPOT_POS[2]-rp), spcol3, music, color);
+            }
+
+            // ── Floor band: Doc 12 verbatim ─────────────────────────────
+            //   collo = vec4(-normalize(pos).y * floorTexture(pos), 1.)
+            //   for(i=0..SPOTS+1) if(hp.y == float(i))
+            //     color += collo * SPOT_COL[i] + color * vec4(volumetric, 1.)
+            // (renderVolumetric is heavy and not present in viz 6 → vec3(0))
+            if (rp.y < _v6_FLOOR_Y && rp.y > _v6_FLOOR_Y - 0.0017) {
+                // Doc 12 plane intersection: y=-18 plane for distant pos
+                float tPlane = -18.0 / (rd.y - 1e-6);
+                vec3 pos = ro + rd * tPlane;
+
+                // floorTexture(pos): diagonal-stripe pattern
+                vec3 fp = pos; fp.z += fp.x * 0.25;
+                vec3 floorC = fract(fp.x * 0.1) > fract(fp.z * 0.1)
+                            ? vec3(1.0) : vec3(0.7);
+
+                vec4 collo = vec4(-normalize(pos).y * floorC, 1.0);
+                vec3 volumetric = vec3(0.0);  // renderVolumetric stub
+
+                // Doc 12 floor for-loop — preserves the i-as-id indexing
+                for (int i = 0; i < _v6_SPOTS + 1; i++) {
+                    if (hp.y == float(i)) {
+                        color += collo * _v6_SPOT_COL[i]
+                               + color * vec4(volumetric, 1.0);
+                    }
+                }
+                return true;
             }
             if (rp.y < _v6_FLOOR_Y) {
                 color = vec4(0.0);
@@ -3689,12 +3725,26 @@ vec3 _VizScene(vec2 fragCoord) {
     vec4 col2 = vec4(0, 1, 0, 1) * (uv.y*l + l*uv.y*uv.y) * c;
     col2.rgb = pow(col2.rgb, vec3(5));
 
-    // Composite: smoke spotlights + lasers/clouds
-    vec3 final = col.rgb + col2.rgb;
+    // ── Base floor (extends to horizon where trace didn't hit) ─────────
+    // Doc 12 used `b * ccol.rgb` for this — ccol was the iChannel1
+    // background texture filling everywhere the smoke-trace missed.
+    // Viz 6 has no equivalent texture, so we generate the same diagonal-
+    // stripe floor pattern used inside the cones.  Same `pos` (y=-18
+    // plane intersection) keeps the pattern continuous between the
+    // brightly-lit cone areas and the dim distant floor.
+    vec3 baseFloor = vec3(0.0);
+    if (rd.y < -0.001) {                  // ray heading downward
+        float tPlane = -18.0 / (rd.y - 1e-6);
+        vec3 pos = ro + rd * tPlane;
+        vec3 fp = pos; fp.z += fp.x * 0.25;
+        vec3 floorC = fract(fp.x * 0.1) > fract(fp.z * 0.1)
+                    ? vec3(1.0) : vec3(0.7);
+        float ny = max(-normalize(pos).y, 0.0);
+        baseFloor = ny * floorC * 0.18;   // dim — no cone illumination here
+    }
 
-    // Hue-shift modulation tied to a beat-derived value
-    final = _v6_hueShift(final, iTime*.05 + 2.*iBeatDet_v*iBeatAvg_v) * 0.5
-          + final * 0.5;
+    // Composite: smoke spotlights + lasers/clouds + base floor where trace missed
+    vec3 final = b * baseFloor + col.rgb + col2.rgb;
 
     // NaN/Inf guard (length(max(v=0, v/snd)) etc. can leak NaNs on bad input)
     final = mix(vec3(0.0), final, vec3(equal(final, final)));
