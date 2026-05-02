@@ -1,8 +1,8 @@
 <div align="center">
 
-# 🎵 MOD2GLSL v1.37
+# 🎵 MOD2GLSL v1.38
 
-$${\Large\color{orange}\textsf{GLSL MOD Player v1.37 for ShaderToy}}$$
+$${\Large\color{orange}\textsf{GLSL MOD Player v1.38 for ShaderToy}}$$
 $${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
 
 ![Version](https://img.shields.io/badge/version-1.37-orange?style=flat-square)
@@ -19,6 +19,7 @@ Convert Amiga ProTracker MOD files (and soon S3M, XM, and IT) into a ShaderToy s
 
 ## $${\color{limegreen}\textsf{✨ What's new in v1.37}}$$
 
+$\color{limegreen}\textsf{+}$ &nbsp; **Loader Optimizations**  
 $\color{limegreen}\textsf{+}$ &nbsp; **CombFilter Reverb**  
 $\color{limegreen}\textsf{+}$ &nbsp; **RVQ advanced sample compression** — 27.7 dB  
 $\color{limegreen}\textsf{+}$ &nbsp; **Downsampling fused with RVQ** for smooth samples — `--downsample 1` (default), `2`, `4`, `8`  
