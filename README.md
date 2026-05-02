@@ -13,7 +13,9 @@ $${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
 
 </div>
 
-Convert Amiga ProTracker MOD files (and soon S3M, XM, and IT) into a ShaderToy shader, complete with visualization and a note/effect overlay.
+Convert Amiga ProTracker MOD files (and soon S3M, XM, and IT) into a ShaderToy shader, complete with visualization and a note/effect overlay.<br>
+Useage:<br>
+   python mod_player.py beyond.mod --max-compat --viz 6   --resampler lanczos3
 
 ---
 
