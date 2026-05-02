@@ -45,7 +45,6 @@ $\color{orange}\textsf{!}$ &nbsp; Bug fix: `--downsample 2` and `4` now work cor
 </p>
 <p align="center">
 <samp>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>BEYOND.MOD</b> • <a href="https://www.shadertoy.com/view/7XlGRr">shadertoy.com/view/7XlGRr</a></samp><br>
-<samp><b>12THWARRIOR.MOD</b> • <a href="https://www.shadertoy.com/view/73lGzr">shadertoy.com/view/73lGzr</a></samp>
 </p>
 
 ---
