@@ -17,7 +17,7 @@ Convert Amiga ProTracker MOD files (and soon S3M, XM, and IT) into a ShaderToy s
 
 ---
 
-## $${\color{limegreen}\textsf{✨ What's new in v1.37}}$$
+## $${\color{limegreen}\textsf{✨ What's new in v1.38}}$$
 
 $\color{limegreen}\textsf{+}$ &nbsp; **Loader Optimizations**  
 $\color{limegreen}\textsf{+}$ &nbsp; **CombFilter Reverb**  
