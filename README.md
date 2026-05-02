@@ -44,7 +44,7 @@ $\color{orange}\textsf{!}$ &nbsp; Bug fix: `--downsample 2` and `4` now work cor
   <img width="60%" alt="MOD2GLSL screenshot" src="https://github.com/user-attachments/assets/b10632a5-c7a6-47e7-a28e-832251b19e6c" />
 </p>
 <p align="center">
-<samp>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>BEYOND.MOD</b> • <a href="https://www.shadertoy.com/view/7XlGRr">shadertoy.com/view/7XlGRr</a></samp><br>
+<samp>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>BEYOND.MOD</b> • <a href="https://www.shadertoy.com/view/s3l3R8">shadertoy.com/view/s3l3R8</a></samp><br>
 </p>
 
 ---
