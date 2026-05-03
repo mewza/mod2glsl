@@ -3932,11 +3932,16 @@ vec3 _VizScene(vec2 fragCoord) {
     _v6_SPOT_ROT[2] = _v6_rotx(-1.0 - xrot) * _v6_rotz( yrot);
 
     // Foreground smoke trace
+    // Ray origin — declared once so the trace AND the base-floor
+    // ground-plane intersection below both reference the same value.
+    // (Previously the trace took an inline literal and the floor block
+    // referenced an undeclared `ro` — compile error "undeclared identifier".)
+    vec3 ro = vec3(0.0, 0.0, -1.1);
     vec3 rd = vec3(uv - vec2(0.5), 1.0);
     rd.y /= aspect;
     rd = normalize(rd);
     vec4 col = vec4(0.0);
-    float b = _v6_trace(vec3(0.0, 0.0, -1.1), rd, col) ? 0.0 : 1.0;
+    float b = _v6_trace(ro, rd, col) ? 0.0 : 1.0;
 
     // Lasers + clouds overlay (the iconic green diagonal beams + fog)
     float l = (1.+_v6_noise2(vec2(20.0-iTime)))
@@ -4410,7 +4415,7 @@ void mainImage(out vec4 O, vec2 C) {{
     const vec3 BLUE   = vec3(0.30,0.55,1.00);
     const vec3 GREEN  = vec3(0.10,1.00,0.22);
     const vec3 DIM    = vec3(0.22,0.22,0.42);
-    const vec3 TC0    = vec3(0.50,1.00,0.30);   // lime green — back per user request
+    const vec3 TC0    = vec3(0.30,1.00,0.90);   // mint-cyan — leans cyan but greener than spectrum CYAN so it's distinct
     const vec3 TC1    = vec3(1.00,0.90,0.10);
     const vec3 TC2    = vec3(1.00,0.45,0.90);
     const vec3 TC3    = vec3(1.00,0.55,0.10);
