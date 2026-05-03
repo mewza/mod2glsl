@@ -1,8 +1,8 @@
 <div align="center">
 
-# 🎵 MOD2GLSL v1.38
+# 🎵 MOD2GLSL v1.4
 
-$${\Large\color{orange}\textsf{GLSL MOD Player v1.38 for ShaderToy}}$$
+$${\Large\color{orange}\textsf{GLSL MOD Player v1.4 for ShaderToy}}$$
 $${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
 
 ![Version](https://img.shields.io/badge/version-1.37-orange?style=flat-square)
@@ -29,6 +29,8 @@ Example: % python mod_player.py beyond.mod --max-compat --viz 6   --resampler la
 
 ## $${\color{limegreen}\textsf{✨ What's new in v1.38}}$$
 
+$\color{limegreen}\textsf{+}$ &nbsp; **Fixed most of the Pattern playback bugs**  
+$\color{limegreen}\textsf{+}$ &nbsp; **Cleaned up graphics**  
 $\color{limegreen}\textsf{+}$ &nbsp; **Loader Optimizations**  
 $\color{limegreen}\textsf{+}$ &nbsp; **CombFilter Reverb**  
 $\color{limegreen}\textsf{+}$ &nbsp; **RVQ advanced sample compression** — 27.7 dB  
