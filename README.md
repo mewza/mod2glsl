@@ -15,6 +15,8 @@ $${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
 <video src="https://github.com/mewza/mod2glsl/releases/download/v0.1-demo/Beyod_Music.mp4" controls width="700"></video>
 <br>
 
+<video src="https://github.com/mewza/mod2glsl/releases/download/v0.1-demo/Beyond_Music.mp4" controls width="700"></video>
+
 Convert Amiga ProTracker MOD files (and soon S3M, XM, and IT) into a ShaderToy shader, complete with visualization and a note/effect overlay.
 Example: % python mod_player.py beyond.mod --max-compat --viz 6   --resampler lanczos3<br>
 
