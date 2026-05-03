@@ -14,7 +14,11 @@ $${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
 </div>
 <div align="center">
 
-<video src="https://github.com/user-attachments/assets/4c7fe125-086c-410b-bcba-808fc7648984" controls width="700" style="display: block; border: none !important; outline: none !important; box-shadow: none !important; background: transparent;"></video>
+### 🎬 Live Demo
+
+https://github.com/user-attachments/assets/4c7fe125-086c-410b-bcba-808fc7648984
+
+*BEYOND_MUSIC.MOD rendered through GLSL MOD Player v1.40*
 
 </div>
 
