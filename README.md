@@ -12,7 +12,7 @@ $${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
 ![Format](https://img.shields.io/badge/MOD-ProTracker-ff69b4?style=flat-square)
 
 </div>
-<video src="https://github.com/mewza/mod2glsl/releases/download/v0.1-demo/Beyod_Music.mp4" controls width="700"></video>
+<video src="https://github.com/mewza/mod2glsl/releases/download/v0.1-demo/Beyond_Music.mp4" controls width="700"></video>
 <br>
 
 <video src="https://github.com/mewza/mod2glsl/releases/download/v0.1-demo/Beyond_Music.mp4" controls width="700"></video>
