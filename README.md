@@ -12,8 +12,9 @@ $${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
 ![Format](https://img.shields.io/badge/MOD-ProTracker-ff69b4?style=flat-square)
 
 </div>
+<div align="center">
 <video src="https://github.com/user-attachments/assets/4c7fe125-086c-410b-bcba-808fc7648984" width="700"></video>
-
+</div>
 Convert Amiga ProTracker MOD files (and soon S3M, XM, and IT) into a ShaderToy shader, complete with visualization and a note/effect overlay.
 Example: % python mod_player.py beyond.mod --max-compat --viz 6   --resampler lanczos3<br>
 
