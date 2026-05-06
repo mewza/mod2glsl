@@ -29,6 +29,8 @@ Example: % python mod_player.py beyond.mod --max-compat --viz 6   --resampler la
 
 ## $${\color{limegreen}\textsf{✨ What's new in v1.38}}$$
 
+$\color{limegreen}\textsf{+}$ &nbsp; **Improved 3D Surround**  
+$\color{limegreen}\textsf{+}$ &nbsp; **UI mouse track scrolling**  
 $\color{limegreen}\textsf{+}$ &nbsp; **16+ tracks supports amd S3M playback**  
 $\color{limegreen}\textsf{+}$ &nbsp; **Fixed most of the Pattern playback bugs in MOD**  
 $\color{limegreen}\textsf{+}$ &nbsp; **Cleaned up graphics**  
