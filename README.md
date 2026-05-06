@@ -32,7 +32,7 @@ Example: % python mod_player.py beyond.mod --max-compat --viz 6   --resampler la
 $\color{limegreen}\textsf{+}$ &nbsp; **TRU 3D Surround** (new improved AllPass 3D Surround technique)<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Phat Bass — Hilbert applied to bass tracks or a mix**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Velvet Reverb** <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **FAT 4X**<br>
+$\color{limegreen}\textsf{+}$ &nbsp; **FAT 4X** (Fat curve compressor)<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **W1 Limiter**  
 $\color{limegreen}\textsf{+}$ &nbsp; **ScreamTracker 3.xx (S3M) support and playback**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **RVQ sample compression** — 27.7 dB<br>
