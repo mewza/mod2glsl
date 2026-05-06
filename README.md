@@ -40,9 +40,9 @@ $\color{limegreen}\textsf{+}$ &nbsp; **Fixed most of the pattern playback bugs i
 $\color{limegreen}\textsf{+}$ &nbsp; **NEW visualizers**   
 $\color{limegreen}\textsf{+}$ &nbsp; **Velvet Reverb**  
 $\color{limegreen}\textsf{+}$ &nbsp; **RVQ sample compression** — 27.7 dB  
-$\color{limegreen}\textsf{+}$ &nbsp; **Downsampling integrated with RVQ** (--downsample 1, 2 or 4)
-$\color{limegreen}\textsf{+}$ &nbsp; **Linear, B-Spline, and Lanczos3 resamplers**  
-$\color{limegreen}\textsf{+}$ &nbsp; **Phat Bass** — Hilbert applied to bass tracks or a mix  
+$\color{limegreen}\textsf{+}$ &nbsp; **Downsampling integrated with RVQ (--downsample 1, 2 or 4)**
+$\color{limegreen}\textsf{+}$ &nbsp; **Linear, B-Spline, and Lanczos3 resamplers**
+$\color{limegreen}\textsf{+}$ &nbsp; **Phat Bass — Hilbert applied to bass tracks or a mix**
 $\color{limegreen}\textsf{+}$ &nbsp; **FAT 4X**
 $\color{limegreen}\textsf{+}$ &nbsp; Added `--help`   
 $\color{limegreen}\textsf{+}$ &nbsp; Added `--use-png` — roll MOD into a PNG for instant loads
