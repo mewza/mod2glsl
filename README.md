@@ -30,27 +30,26 @@ Example: % python mod_player.py beyond.mod --max-compat --viz 6   --resampler la
 ## $${\color{limegreen}\textsf{✨ What's new in v1.45}}$$
 
 $\color{limegreen}\textsf{+}$ &nbsp; **W1 Limiter**  
-$\color{limegreen}\textsf{+}$ &nbsp; **Arrays Repacking for faster loading**  
-$\color{limegreen}\textsf{+}$ &nbsp; **Improved 3D Surround**  
-$\color{limegreen}\textsf{+}$ &nbsp; **UI mouse track scrolling**  
-$\color{limegreen}\textsf{+}$ &nbsp; **S3M Loader and Playback**  
+$\color{limegreen}\textsf{+}$ &nbsp; **Data packing optimizations**  
+$\color{limegreen}\textsf{+}$ &nbsp; **Loader optimizations**  
+$\color{limegreen}\textsf{+}$ &nbsp; **TRU 3D Surround**  
+$\color{limegreen}\textsf{+}$ &nbsp; **Mouse cotrol to scroll tracks**  
+$\color{limegreen}\textsf{+}$ &nbsp; **S3M Loader and playback**  
 $\color{limegreen}\textsf{+}$ &nbsp; **Up to 32 tracks supported**  
-$\color{limegreen}\textsf{+}$ &nbsp; **Fixed most of the Pattern playback bugs in MOD**  
-$\color{limegreen}\textsf{+}$ &nbsp; **Cleaned up graphics**  
-$\color{limegreen}\textsf{+}$ &nbsp; **Loader Optimizations**  
-$\color{limegreen}\textsf{+}$ &nbsp; **CombFilter Reverb**  
-$\color{limegreen}\textsf{+}$ &nbsp; **RVQ advanced sample compression** — 27.7 dB  
-$\color{limegreen}\textsf{+}$ &nbsp; **Downsampling fused with RVQ** for smooth samples — `--downsample 1` (default), `2`, `4`, `8`  
-$\color{limegreen}\textsf{+}$ &nbsp; **3D Surround**  
+$\color{limegreen}\textsf{+}$ &nbsp; **Fixed most of the pattern playback bugs in S3M and MOD**  
+$\color{limegreen}\textsf{+}$ &nbsp; **NEW visualizers**   
+$\color{limegreen}\textsf{+}$ &nbsp; **Velvet Reverb**  
+$\color{limegreen}\textsf{+}$ &nbsp; **RVQ sample compression** — 27.7 dB  
+$\color{limegreen}\textsf{+}$ &nbsp; **Downsampling integrated with RVQ for smoother samples — `--downsample 1, 2 or 4`
 $\color{limegreen}\textsf{+}$ &nbsp; **Linear, B-Spline, and Lanczos3 resamplers**  
-$\color{limegreen}\textsf{+}$ &nbsp; **PHAT Bass** — Hilbert transform with improved bass-track detection  
-$\color{limegreen}\textsf{+}$ &nbsp; **FAT** mode  
-$\color{limegreen}\textsf{+}$ &nbsp; `--help` flag  
-$\color{limegreen}\textsf{+}$ &nbsp; `--use-png` — embed MOD into a PNG and configure player to load from texture  
-$\color{limegreen}\textsf{+}$ &nbsp; `--viz 0` (no backdrop) plus visualizers `1`–`7`  
-$\color{limegreen}\textsf{+}$ &nbsp; `--split` / `--no-split` — `--split` for faster compile  
-$\color{limegreen}\textsf{+}$ &nbsp; `--vec-dim 8` — better results than `--downsample 2`  
-$\color{limegreen}\textsf{+}$ &nbsp; `--no-rvq2` — faster compile, ~4 dB SNR cost
+$\color{limegreen}\textsf{+}$ &nbsp; **Phat Bass** — Hilbert applied to bass only tracks or mix option  
+$\color{limegreen}\textsf{+}$ &nbsp; **FAT 4X**
+$\color{limegreen}\textsf{+}$ &nbsp; Added `--help`   
+$\color{limegreen}\textsf{+}$ &nbsp; Added `--use-png` — roll MOD into a PNG for instant loads
+$\color{limegreen}\textsf{+}$ &nbsp; Added `--viz 0` (no backdrop) plus visualizers `1`–`8`  
+$\color{limegreen}\textsf{+}$ &nbsp; Added `--split` / `--no-split` — `--split` for faster compile  
+$\color{limegreen}\textsf{+}$ &nbsp; Added `--vec-dim 8` — better results than `--downsample 2`  
+$\color{limegreen}\textsf{+}$ &nbsp; Added `--no-rvq2` — faster compile, ~4 dB SNR cost
 ---
 
 ## $${\color{deepskyblue}\textsf{🎬 Live demos}}$$
