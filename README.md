@@ -33,7 +33,7 @@ $\color{limegreen}\textsf{+}$ &nbsp; **TRU 3D Surround** (new improved AllPass 3
 $\color{limegreen}\textsf{+}$ &nbsp; **Phat Bass — Hilbert applied to bass tracks or a mix**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Velvet Reverb** <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **FAT 4X** (Fat curve compressor)<br>
-$\color{limegreen}\textsf{+}$ &nbsp; **W1 Limiter**  
+$\color{limegreen}\textsf{+}$ &nbsp; **W1 (Low latency) Limiter** 
 $\color{limegreen}\textsf{+}$ &nbsp; **ScreamTracker 3.xx (S3M) support and playback**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **RVQ sample compression** — 27.7 dB<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Mouse control to horizontal scroll between tracks**  <br>
