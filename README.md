@@ -45,7 +45,7 @@ $\color{limegreen}\textsf{+}$ &nbsp; **PHAT Bass** — Hilbert transform with im
 $\color{limegreen}\textsf{+}$ &nbsp; **FAT** mode  
 $\color{limegreen}\textsf{+}$ &nbsp; `--help` flag  
 $\color{limegreen}\textsf{+}$ &nbsp; `--use-png` — embed MOD into a PNG and configure player to load from texture  
-$\color{limegreen}\textsf{+}$ &nbsp; `--viz 0` (no backdrop) plus visualizers `1`–`5`  
+$\color{limegreen}\textsf{+}$ &nbsp; `--viz 0` (no backdrop) plus visualizers `1`–`7`  
 $\color{limegreen}\textsf{+}$ &nbsp; `--split` / `--no-split` — `--split` for faster compile  
 $\color{limegreen}\textsf{+}$ &nbsp; `--vec-dim 8` — better results than `--downsample 2`  
 $\color{limegreen}\textsf{+}$ &nbsp; `--no-rvq2` — faster compile, ~4 dB SNR cost
