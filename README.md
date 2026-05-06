@@ -45,7 +45,7 @@ $\color{limegreen}\textsf{+}$ &nbsp; **Linear, B-Spline, and Lanczos3 resamplers
 $\color{limegreen}\textsf{+}$ &nbsp; **Phat Bass — Hilbert applied to bass tracks or a mix**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **FAT 4X**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; Added `--help`   <br>
-$\color{limegreen}\textsf{+}$ &nbsp; Added `--use-png` — roll MOD into a PNG for instant loads<br>
+$\color{limegreen}\textsf{+}$ &nbsp; Added `--use-png` — roll MOD into a PNG for a much faster load<br>
 $\color{limegreen}\textsf{+}$ &nbsp; Added `--viz 0` (no backdrop) plus visualizers `1`–`8`  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; Added `--split` / `--no-split` — `--split` for faster compile  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; Added `--vec-dim 8` — better results than `--downsample 2`  <br>
