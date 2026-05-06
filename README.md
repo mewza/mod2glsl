@@ -29,27 +29,27 @@ Example: % python mod_player.py beyond.mod --max-compat --viz 6   --resampler la
 
 ## $${\color{limegreen}\textsf{✨ What's new in v1.45}}$$
 
-$\color{limegreen}\textsf{+}$ &nbsp; **W1 Limiter**  
-$\color{limegreen}\textsf{+}$ &nbsp; **Data packing optimizations**  <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **Loader optimizations**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **TRU 3D Surround**  <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **Mouse control to scroll tracks**  <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **ScreamTracker 3.xx (S3M) support and playback**  <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **Up to 32 tracks supported**  <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **Fixed most of the pattern playback bugs in S3M and MOD**  <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **NEW visualizers** <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Phat Bass — Hilbert applied to bass tracks or a mix**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Velvet Reverb** <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **FAT 4X**<br>
+$\color{limegreen}\textsf{+}$ &nbsp; **W1 Limiter**  
+$\color{limegreen}\textsf{+}$ &nbsp; **ScreamTracker 3.xx (S3M) support and playback**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **RVQ sample compression** — 27.7 dB<br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Mouse control to horizontal scroll between tracks**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Downsampling integrated with RVQ (--downsample 1, 2 or 4)**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Linear, B-Spline, and Lanczos3 resamplers**<br>
-$\color{limegreen}\textsf{+}$ &nbsp; **Phat Bass — Hilbert applied to bass tracks or a mix**<br>
-$\color{limegreen}\textsf{+}$ &nbsp; **FAT 4X**<br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Up to 32 tracks supported**  <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Data packing optimizations**  <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Loader optimizations**  <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **NEW visualizers** <br>
 $\color{limegreen}\textsf{+}$ &nbsp; Added `--help`   <br>
 $\color{limegreen}\textsf{+}$ &nbsp; Added `--use-png` — roll MOD into a PNG for a much faster load<br>
 $\color{limegreen}\textsf{+}$ &nbsp; Added `--viz 0` (no backdrop) plus visualizers `1`–`8`  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; Added `--split` / `--no-split` — `--split` for faster compile  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; Added `--vec-dim 8` — better results than `--downsample 2`  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; Added `--no-rvq2` — faster compile, ~4 dB SNR cost<br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Fixed most of the pattern playback bugs in S3M and MOD**  <br>
 ---
 
 ## $${\color{deepskyblue}\textsf{🎬 Live demos}}$$
