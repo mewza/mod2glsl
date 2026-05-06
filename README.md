@@ -34,7 +34,7 @@ $\color{limegreen}\textsf{+}$ &nbsp; **Phat Bass — Hilbert applied to bass tra
 $\color{limegreen}\textsf{+}$ &nbsp; **Velvet Reverb** <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **FAT 4X** (Fat curve compressor)<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **W1 (Low latency) Limiter** <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **ScreamTracker 3.xx (S3M) support and playback**  <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Full ScreamTracker 3.xx (S3M) support and playback**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **RVQ sample compression** — 27.7 dB<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Mouse control to horizontal scroll between tracks**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Downsampling integrated with RVQ (--downsample 1, 2 or 4)**<br>
