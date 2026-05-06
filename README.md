@@ -33,7 +33,7 @@ $\color{limegreen}\textsf{+}$ &nbsp; **W1 Limiter**
 $\color{limegreen}\textsf{+}$ &nbsp; **Data packing optimizations**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Loader optimizations**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **TRU 3D Surround**  <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **Mouse cotrol to scroll tracks**  <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Mouse control to scroll tracks**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **ScreamTracker 3.xx (S3M) support and playback**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Up to 32 tracks supported**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Fixed most of the pattern playback bugs in S3M and MOD**  <br>
