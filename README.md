@@ -48,9 +48,6 @@ $\color{limegreen}\textsf{+}$ &nbsp; `--viz 0` (no backdrop) plus visualizers `1
 $\color{limegreen}\textsf{+}$ &nbsp; `--split` / `--no-split` — `--split` for faster compile  
 $\color{limegreen}\textsf{+}$ &nbsp; `--vec-dim 8` — better results than `--downsample 2`  
 $\color{limegreen}\textsf{+}$ &nbsp; `--no-rvq2` — faster compile, ~4 dB SNR cost
-
-$\color{orange}\textsf{!}$ &nbsp; Bug fix: `--downsample 1` no longer produces white noise  
-$\color{orange}\textsf{!}$ &nbsp; Bug fix: `--downsample 2` and `4` now work correctly
 ---
 
 ## $${\color{deepskyblue}\textsf{🎬 Live demos}}$$
