@@ -29,7 +29,7 @@ Example: % python mod_player.py beyond.mod --max-compat --viz 6   --resampler la
 
 ## $${\color{limegreen}\textsf{✨ What's new in v1.45}}$$
 
-$\color{limegreen}\textsf{+}$ &nbsp; **TRU 3D Surround**  <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **TRU 3D Surround** (new improved AllPass 3D Surround technique)<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Phat Bass — Hilbert applied to bass tracks or a mix**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Velvet Reverb** <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **FAT 4X**<br>
