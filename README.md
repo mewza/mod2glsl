@@ -27,7 +27,7 @@ Example: % python mod_player.py beyond.mod --max-compat --viz 6   --resampler la
 
 ---
 
-## $${\color{limegreen}\textsf{✨ What's new in v1.38}}$$
+## $${\color{limegreen}\textsf{✨ What's new in v1.45}}$$
 
 $\color{limegreen}\textsf{+}$ &nbsp; **W1 Limiter**  
 $\color{limegreen}\textsf{+}$ &nbsp; **Arrays Repacking for faster loading**  
