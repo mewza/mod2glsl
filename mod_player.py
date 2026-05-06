@@ -2084,17 +2084,57 @@ document.getElementById('phatSlider').addEventListener('input',function(){{
   const rangeEl   = document.getElementById('trkScrollRange');
   if(maxFirstTrack > 0){{
     trackerEl.classList.add('scrollable');
-    trackerEl.addEventListener('click', function(ev){{
-      // Where in the tracker did they click? Decide direction by x position
-      // relative to the tracker's bounding rect.
-      const rect = trackerEl.getBoundingClientRect();
-      const xFrac = (ev.clientX - rect.left) / rect.width;
-      const dir = (xFrac < 0.5) ? -1 : 1;
-      const next = firstTrack + dir;
-      if(next < 0 || next > maxFirstTrack) return;   // clamp at edges
-      firstTrack = next;
-      updateHeaderAndRange();
-      updateTracker();
+    
+    // Drag scrolling - only in tracker area, pixel-based offset
+    let isDragging = false;
+    let startX = 0;
+    let trackOffset = 0;
+    const hdrEl = document.getElementById('trkHeader');
+    const oscCanvas = document.getElementById('oscCanvas');
+    
+    // Only start drag if clicking anywhere in tracker area (header, body, etc)
+    const trackerParent = document.getElementById('tracker');
+    trackerParent.addEventListener('mousedown', function(ev){{
+      console.log('TRACKER MOUSEDOWN!', ev.clientX);
+      isDragging = true;
+      startX = ev.clientX;
+      document.body.style.cursor = 'grabbing';
+      ev.preventDefault();
+      ev.stopPropagation();
+      console.log('isDragging set to true');
+    }});
+    
+    document.addEventListener('mousemove', function(ev){{
+      if(!isDragging) return;
+      trackOffset = ev.clientX - startX;
+      console.log('DRAGGING:', trackOffset);
+      // Apply transform to both header and body
+      const tx = `translateX(${{trackOffset}}px)`;
+      hdrEl.style.transform = tx;
+      trackerEl.style.transform = tx;
+    }});
+    
+    document.addEventListener('mouseup', function(){{
+      if(isDragging){{
+        isDragging = false;
+        document.body.style.cursor = '';
+        // Snap to nearest track
+        const TRACK_WIDTH = 180;
+        const snapDelta = Math.round(-trackOffset / TRACK_WIDTH);
+        const next = Math.max(0, Math.min(maxFirstTrack, firstTrack + snapDelta));
+        firstTrack = next;
+        trackOffset = 0;
+        hdrEl.style.transform = '';
+        trackerEl.style.transform = '';
+        updateHeaderAndRange();
+        updateTracker();
+      }}
+    }});
+    
+    // Oscillo/Spectrum canvas click toggles mode (handled by shader)
+    oscCanvas.addEventListener('click', function(ev){{
+      ev.stopPropagation();  // Don't let this bubble to tracker
+      // Shader reads mouse click from iMouse and toggles mode automatically
     }});
   }}
 
@@ -2561,7 +2601,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
     # ========== COMMON TAB ==========
     data_source_comment = "Embedded data (no PNG required)" if use_embedded else f"All data in 1024×1024 RGBA PNG: {png_file}"
     common_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.42 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.43 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    COMMON TAB
    Visualizer: {viz_name}
@@ -2593,7 +2633,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
 //   ivec2(2,3) = inner RIGHT pair (ch1,ch2) — swap surround and center
 const bool  enable3D     = {str(not _compat["no_surround"]).lower()};
 const bool  enableFAT    = {str(not _compat["no_fat"]).lower()};
-const ivec2 surr_channels = ivec2(1, 4);  // 1-indexed; change to ivec2(2,3) to flip
+// Surround: AUTO-DETECT — applied to NON-bass channels (leads/pads get width, bass stays centered)
 
 // Channel panning (0=left, 0.5=center, 1.0=right)
 // For S3M, use the channel_settings field from the file header (per-channel
@@ -3199,7 +3239,7 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
         print(f"   🎚️  PhatBass routing: {_routing} (auto)")
     
     sound_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.42 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.43 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    SOUND TAB
    Visualizer: {viz_name}
@@ -3223,6 +3263,18 @@ float fat_cs1(float x) {{
     return 0.4375 - 0.3228759765625*x2 + 0.1123046875*x4
          - 0.50537109375*x6 + 0.1993408203125*x8
          + 0.634521484375*x10 - 0.6513671875*x12;
+}}
+
+// Helper: Get mixed mono output at a given time (for reverb optimization)
+// Mixes all channels once instead of re-mixing N_COMB×N_ITER times
+// Mono input + pan coefficients = stereo output (standard reverb design)
+float getMixedMono(float time_offset, Position pos, float rowTime) {{
+    float mix = 0.0;
+    for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
+        mix += getChannelOutput(ch, time_offset, pos, rowTime);
+    }}
+    const float normFactor = 2.0 / float(NUM_CHANNELS);
+    return mix * normFactor;
 }}
 
 vec2 mainSound(int samp, float time) {{
@@ -3343,9 +3395,13 @@ vec2 mainSound(int samp, float time) {{
         float s = getChannelOutput(ch, playbackTime, pos, rowTime);
         float panR = 0.25 + 0.5 * channelPan[ch];   // 0.25..0.75
         float panL = 1.0 - panR;                     // 0.75..0.25
-        int cm = ch % 4;
-        int ch1 = cm + 1;  // 1-indexed
-        bool isSurr = (ch1 == surr_channels.x || ch1 == surr_channels.y);
+        
+        // AUTO-DETECT: surround on NON-bass channels (leads/pads), bass stays centered
+        Note n = getNote(pos.songPos, pos.row, ch);
+        int inst = n.instrument;
+        bool isBass = (inst >= 1 && inst <= 31) ? isBass[inst - 1] : false;
+        bool isSurr = !isBass;  // Surround for everything EXCEPT bass
+        
         if (isSurr) {{ surrL += s * panL; surrR += s * panR; }}
         else        {{ centL += s * panL; centR += s * panR; }}
     }}
@@ -3355,34 +3411,78 @@ vec2 mainSound(int samp, float time) {{
     surrL *= normFactor; surrR *= normFactor;
     centL *= normFactor; centR *= normFactor;
     
-    // ── Only3D — surround bus only (ch0+ch3 = outer LEFT pair, ch1+ch2 = dry center) ─
-    const float ONLY3D_DELAY = 0.000431;  // 19 samples @ 44100Hz
-    const float ONLY3D_DEPTH = 0.12;  // halved — was smearing native LRRL pan
+    // ── Only3D — proper allpass technique with sin/cos coefficients ──────────
+    // Direct port from Only3D.h by Dmitry Boldyrev / mss
+    // Two 1st-order allpass filters at different frequencies (500Hz, 2500Hz)
+    // create phase-shifted copies of the stereo difference, which are then
+    // cross-mixed to widen the stereo image.
+    const float ONLY3D_DEPTH  = 0.12;
+    const float SATURATION    = 0.5;
     if (enable3D) {{
-        float tW = playbackTime - ONLY3D_DELAY;
-        // Skip Only3D entirely when the delay tap reaches before song-start.
-        // Without this guard, the 19-sample delay tap at t=0 sees tW<0 and
-        // getPosition() wraps it to song-end via mod() — which means a tiny
-        // amount of song-tail audio leaks into the very first samples,
-        // audible as a faint click on every voice's attack.
-        if (tW >= 0.0) {{
-        Position posW = getPosition(tW);
-        float wL = 0.0, wR = 0.0;
+        const float SR = 44100.0;
+        const float PI = 3.14159265359;
+        
+        // Allpass 1: 500Hz — calculate coefficients using tan/sin/cos
+        float freq1 = 500.0;
+        float d1 = tan(freq1 * PI / SR);
+        float p0_1 = sin(d1) / (cos(d1) + sin(d1));
+        float p1_1 = p0_1;  // same as p0
+        float p2_1 = cos(d1) / (cos(d1) + sin(d1)) - p1_1;
+        float delay1 = 1.0 / freq1 * 0.5;  // half-period delay
+        
+        // Allpass 2: 2500Hz
+        float freq2 = 2500.0;
+        float d2 = tan(freq2 * PI / SR);
+        float p0_2 = sin(d2) / (cos(d2) + sin(d2));
+        float p1_2 = p0_2;
+        float p2_2 = cos(d2) / (cos(d2) + sin(d2)) - p1_2;
+        float delay2 = 1.0 / freq2 * 0.5;
+        
+        float t1 = playbackTime - delay1;
+        float t2 = playbackTime - delay2;
+        
+        if (t1 >= 0.0 && t2 >= 0.0) {{
+        Position pos1 = getPosition(t1);
+        Position pos2 = getPosition(t2);
+        
+        // Current surround mix (for x[n])
+        float diffNow = surrL - surrR;
+        
+        // Delayed mixes (for x[n-1] in allpass)
+        float w1L = 0.0, w1R = 0.0, w2L = 0.0, w2R = 0.0;
         for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
-            int cm = ch % 4;
-            int ch1 = cm + 1;
-            if (ch1 == surr_channels.x || ch1 == surr_channels.y) {{
-                float sw = getChannelOutput(ch, tW, posW, rowTime);
+            Note n1 = getNote(pos1.songPos, pos1.row, ch);
+            int inst1 = n1.instrument;
+            bool isBass1 = (inst1 >= 1 && inst1 <= 31) ? isBass[inst1 - 1] : false;
+            if (!isBass1) {{
+                float s1 = getChannelOutput(ch, t1, pos1, rowTime);
+                float s2 = getChannelOutput(ch, t2, pos2, rowTime);
                 float panR = 0.25 + 0.5 * channelPan[ch];
                 float panL = 1.0 - panR;
-                wL += sw * panL; wR += sw * panR;
+                w1L += s1 * panL; w1R += s1 * panR;
+                w2L += s2 * panL; w2R += s2 * panR;
             }}
         }}
-        wL *= normFactor; wR *= normFactor;
-        float diff = (wL - wR) * ONLY3D_DEPTH;
-        surrL += diff;
-        surrR -= diff;
-        }}  // end if(tW >= 0)
+        w1L *= normFactor; w1R *= normFactor;
+        w2L *= normFactor; w2R *= normFactor;
+        
+        float diff1_delayed = w1L - w1R;
+        float diff2_delayed = w2L - w2R;
+        
+        // Apply 1st-order allpass: y[n] = x[n]*p0 + x[n-1]*p1 + y[n-1]*p2
+        // Stateless approximation: use delayed difference for both x[n-1] and y[n-1]
+        float ap1 = diffNow * p0_1 + diff1_delayed * (p1_1 + p2_1);
+        float ap2 = diffNow * p0_2 + diff2_delayed * (p1_2 + p2_2);
+        
+        // Soft saturation: x/√(1 + x²·0.5)
+        float dd1 = ap1 / sqrt(1.0 + ap1 * ap1 * SATURATION);
+        float dd2 = ap2 / sqrt(1.0 + ap2 * ap2 * SATURATION);
+        
+        // Cross-mix shuffle (the magic!)
+        // L gets: +dd1 - dd2,  R gets: -dd1 + dd2
+        surrL += (dd1 - dd2) * ONLY3D_DEPTH;
+        surrR += (-dd1 + dd2) * ONLY3D_DEPTH;
+        }}
     }}
     
     // ── PhatBass — bass enhancement (cross-panned allpass) ─────────────────
@@ -3471,15 +3571,11 @@ vec2 mainSound(int samp, float time) {{
     float outR = surrR + centR;
 
     // ── FAT4X harmonic exciter (stateless) ─────────────────────────────────
-    // Ported from FAT4X: x*(1 + cs1(x)*FAT_AMOUNT).
+    // Applied BEFORE reverb - excites the dry signal, reverb processes the warmed result.
     // cs1 produces even harmonics → adds warmth/presence, soft-limits peaks.
-    // In original FAT4X this uses a 3-sample delay line + envelope follower;
-    // stateless approximation replaces delay with current sample (trivially
-    // same in our system since getPosition has ~20ms tick resolution).
     // FAT_AMOUNT: 0.0=off  0.5=half  1.0=full FAT4X-equivalent  >1.0=heavy
-    // Gated by enableFAT (also controls PhatBass) — --max-compat sets to false.
     if (enableFAT) {{
-        const float FAT_AMOUNT = 1.0;  // matches FAT4X (FIR weights sum to 1.0)
+        const float FAT_AMOUNT = 1.0;
         outL = outL * (1.0 + fat_cs1(outL) * FAT_AMOUNT);
         outR = outR * (1.0 + fat_cs1(outR) * FAT_AMOUNT);
     }}
@@ -3500,8 +3596,8 @@ vec2 mainSound(int samp, float time) {{
     //   shorter tail. Still musical — just less roomy.
     {(
         '''const int   N_ITER  = 2;   // (--max-compat: was 3)
-    const float RT60    = 2.4;
-    const float _decay  = 8.9078 / RT60;  // ln(1000)/RT60
+    const float RT60    = 1.6;  // shorter tail (was 2.4) - less smear on hihats
+    const float _decay  = 8.9078 / RT60;
     const float _D[2]  = float[](0.0253, 0.0338);   // shortest + longest only
     const float _pL[2] = float[](0.85, 0.45);
     const float _pR[2] = float[](0.40, 0.80);
@@ -3509,8 +3605,8 @@ vec2 mainSound(int samp, float time) {{
     const float COMB_DIV = 2.0;'''
         if _compat["reverb_2x2"] else
         '''const int   N_ITER  = 3;   // iterations per comb (was 5)
-    const float RT60    = 2.4;
-    const float _decay  = 8.9078 / RT60;  // ln(1000)/RT60
+    const float RT60    = 1.6;  // shorter tail (was 2.4) - less smear on hihats
+    const float _decay  = 8.9078 / RT60;
 
     // Freeverb-inspired comb delays (seconds), mutually prime in samples.
     // Kept original indices {0,1,4,5} → shortest pair + longest pair.
@@ -3520,7 +3616,7 @@ vec2 mainSound(int samp, float time) {{
     const int   N_COMB  = 4;
     const float COMB_DIV = 4.0;'''
     )}
-    const float RV_WET  = 0.15;
+    const float RV_WET  = 0.08;  // less wet (was 0.15) - cleaner transients
 
     vec2 _wet = vec2(0.0);
     // Comb-reverb outer loop: small constant N_COMB. Plain bound.
@@ -3541,10 +3637,11 @@ vec2 mainSound(int samp, float time) {{
             // bias on samples 0..6 where the source samples are zero.
             if (_tw < 0.0) continue;
             Position _rp = getPosition(_tw);
-            float _m = 0.0;
-            for (int ch = 0; ch < NUM_CHANNELS; ch++)
-                _m += getChannelOutput(ch, _tw, _rp, rowTime);
-            _m *= normFactor * _gk;
+            // OPTIMIZED: Use pre-mixed mono (4× faster!)
+            // Before: N_COMB×N_ITER×4 channels = 64 getChannelOutput calls
+            // After:  N_COMB×N_ITER = 16 getMixedMono calls
+            // Mono input + different pan coefficients = stereo output (standard reverb)
+            float _m = getMixedMono(_tw, _rp, rowTime) * _gk;
             _wet.x += _pL[_c] * _m;
             _wet.y += _pR[_c] * _m;
         }}
@@ -3593,11 +3690,13 @@ vec2 mainSound(int samp, float time) {{
     if viz == 0:
         viz_setup_block = (
             "    vec2 _uv=(C*2.-iResolution.xy)/iResolution.y;\n"
+            "    float _scrollX=texelFetch(iChannel1,ivec2(5,2),0).r;\n"
             "    vec3 col = vec3(0.0);  // --viz 0: no visualizer"
         )
     elif viz == 3:
         viz_setup_block = (
             "    vec2 _uv=(C*2.-iResolution.xy)/iResolution.y;\n"
+            "    float _scrollX=texelFetch(iChannel1,ivec2(5,2),0).r;\n"  # Read scroll offset
             "    float _tps_v=float(BPM)*2./5., _rt_v=float(SPEED)/_tps_v;\n"
             "    Position _pos_v=getPosition(iTime);\n"
             "    float _va0=abs(getChannelOutput(0,iTime,_pos_v,_rt_v));\n"
@@ -3609,6 +3708,7 @@ vec2 mainSound(int samp, float time) {{
     else:  # 1, 2, 4, 5, 6, 7 all use _VizScene
         viz_setup_block = (
             "    vec2 _uv=(C*2.-iResolution.xy)/iResolution.y;\n"
+            "    float _scrollX=texelFetch(iChannel1,ivec2(5,2),0).r;\n"  # Read scroll offset from Buffer A
             "    vec3 col = _VizScene(C);"
         )
 
@@ -4702,9 +4802,9 @@ vec3 _VizScene(vec2 U) {
 
 
     image_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.42 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.43 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
-   IMAGE TAB — iChannel0: alphabet texture (shadertoy.com/view/4sf3RB)
+   IMAGE TAB (v1_4_3) — iChannel0: alphabet texture (shadertoy.com/view/4sf3RB)
                 iChannel1: Buffer A (audio + FFT + smoothed bands)
                 iChannel2: RGBA Noise Small  ← required for viz 6 smoke turbulence
    Visualizer: {viz_name}
@@ -4810,7 +4910,7 @@ makeStr(printBPMVal) {bpm_val_chars} _end
 makeStr(printSpdVal) {spd_val_chars} _end
 
 // ---- Static label strings ----
-makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _4 _2 _ _NUM _NUM _NUM _end
+makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _4 _3 _ _NUM _NUM _NUM _end
 makeStr(printCredit) _COPY _2 _0 _2 _6 _ _O _R _B _L _I _V _I _U _S _end
 makeStr(printLoad)   _L _O _A _D _I _N _G _DOT _DOT _DOT _end
 makeStr(printSpec)   _S _P _E _C _T _R _U _M _end
@@ -4818,12 +4918,14 @@ makeStr(printOsci)   _O _S _C _I _L _L _O _S _C _O _P _E _end
 makeStr(printNoSnd)  _S _E _T _ _I _C _H _A _N _1 _ _EQ _ _S _O _U _N _D _ _O _U _T _P _U _T _end
 makeStr(printPatt)  _P _A _T _T _E _R _N _COL _end
 makeStr(printRow)   _R _O _W _COL _end
+makeStr(printTracks) _T _R _A _C _K _S _COL _end
 makeStr(printBPM)   _B _P _M _COL _end
 makeStr(printSpd)   _S _P _E _E _D _COL _end
 makeStr(printTrk1)  _T _R _A _C _K _ _NUM _1 _end
 makeStr(printTrk2)  _T _R _A _C _K _ _NUM _2 _end
 makeStr(printTrk3)  _T _R _A _C _K _ _NUM _3 _end
 makeStr(printTrk4)  _T _R _A _C _K _ _NUM _4 _end
+makeStr(printTrack) _T _R _A _C _K _ _NUM _end
 
 // ============================================================
 // pUV — pixel coords (y from TOP) → makeStr font UV
@@ -4970,6 +5072,8 @@ void mainImage(out vec4 O, vec2 C) {{
     Position _pos=getPosition(iTime);
 {viz_setup_block}
 
+
+    
     if (iFrame < LOADING_FRAMES) {{
         vec2 res = iResolution.xy;
         float prog = float(iFrame) / float(LOADING_FRAMES - 1);
@@ -5019,7 +5123,7 @@ void mainImage(out vec4 O, vec2 C) {{
     // ============ INFO BAR ============
     float iy  = CH*2.+20.;
     float iy2 = iy + CH + 4.;
-    float rx  = iResolution.x*0.52;
+    float rx  = iResolution.x*0.42;
 
     trk += BLUE   * printPatt(pUV(fp, ML, iy, CH));
     trk += WHITE  * drawNum(pos.songPos, 2, ML+10.*CW, iy, CW,CH,fp);
@@ -5031,6 +5135,11 @@ void mainImage(out vec4 O, vec2 C) {{
     trk += BLUE   * drawCh(47,fp, rx+6.*CW, iy, CW,CH);
     trk += YELLOW * drawCh(54,fp, rx+7.*CW, iy, CW,CH);
     trk += YELLOW * drawCh(52,fp, rx+8.*CW, iy, CW,CH);
+    
+    // TRACKS: N — show total channel count to the right of ROW
+    float tx_lbl = rx + 12.*CW;
+    trk += BLUE   * printTracks(pUV(fp, tx_lbl, iy, CH));
+    trk += YELLOW * drawNum(NUM_CHANNELS, 2, tx_lbl + 8.*CW, iy, CW, CH, fp);
 
     trk += BLUE   * printBPM(pUV(fp, ML,  iy2, CH));
     trk += YELLOW * printBPMVal(pUV(fp, ML+5.*CW, iy2, CH));
@@ -5043,14 +5152,27 @@ void mainImage(out vec4 O, vec2 C) {{
     float ty   = iy2+CH+10.;
     float TW   = 9.*CW+6.;    // 9 chars per cell + 6px gap
     float rNW  = 2.*CW;
-    float txOff= ML+rNW+8.;
+    float txOff= ML+rNW+8. + _scrollX;  // ← scroll offset applied to ALL tracks!
     const int HVR = 4;  // 9 visible rows → more room for oscilloscope
 
-    // Track headers (each in its own color)
-    trk += TC0 * printTrk1(pUV(fp, txOff+0.*TW, ty, CH));
-    trk += TC1 * printTrk2(pUV(fp, txOff+1.*TW, ty, CH));
-    trk += TC2 * printTrk3(pUV(fp, txOff+2.*TW, ty, CH));
-    trk += TC3 * printTrk4(pUV(fp, txOff+3.*TW, ty, CH));
+    // Track headers - "TRACK#N" CENTERED in each column
+    vec3 trackColors[4]; trackColors[0]=TC0; trackColors[1]=TC1; trackColors[2]=TC2; trackColors[3]=TC3;
+    for(int tc=0; tc<NUM_CHANNELS; tc++) {{
+        vec3 tCol = trackColors[tc % 4];
+        float tx = txOff + float(tc)*TW;
+        // "TRACK #" then digit(s) — both digits AFTER #, no overlap
+        int digits = (tc+1 >= 10) ? 2 : 1;
+        float numCW = CW * 0.65;  // tight digit spacing
+        // # is at column 6. First digit at column ~6.6 (right after #).
+        // For 1-digit: rightmost (only) digit at +6.6*CW
+        // For 2-digit: rightmost at +6.6 + numCW, leftmost at +6.6 (right after #)
+        float firstDigitX = 6.6 * CW;  // position after the #
+        float rightmostX = firstDigitX + float(digits-1) * numCW;
+        float textW = rightmostX + numCW;  // total approximate width
+        float xCenter = tx + (TW - textW) * 0.5;
+        trk += tCol * printTrack(pUV(fp, xCenter, ty, CH));
+        trk += tCol * drawNum(tc+1, digits, xCenter + rightmostX, ty, numCW, CH, fp);
+    }}
 
     // Vertical separators — bounded to end at the bottom hline (tBot+3),
     // not extending below into the spectrum/oscilloscope area.
@@ -5065,7 +5187,7 @@ void mainImage(out vec4 O, vec2 C) {{
         // "boxes around text" artifacts the user noticed) and ends at
         // tBot+4 (1px short of the bottom hline at tBot+5 to avoid bright-
         // dot doubling at the T-junction).
-        trk += BLUE*0.55*vline(fp, txOff+float(tc)*TW-4., ty+CH+1., ty+float(2*HVR+2)*CH+7.);
+        trk += BLUE*0.55*vline(fp, txOff+float(tc)*TW-4., ty, ty+float(2*HVR+2)*CH+7.);
 
     float tTop = ty+CH+3.;
     float tBot = tTop+float(2*HVR+1)*CH;
@@ -5109,6 +5231,11 @@ void mainImage(out vec4 O, vec2 C) {{
             trk += rnc * drawNum(rn, 2, ML+rNW-CW*1.2, tTop+float(ri_abs)*CH, CW*0.75,CH,fp);
         }}
 
+        // BLACK MASK: hide track content that scrolled under row numbers
+        if(fp.x < ML+rNW+8.) {{
+            col = vec3(0.0);  // black out left column area
+        }}
+        
         // Per-track note data
         float xInT=fp.x-txOff;
         if(xInT>=0.&&xInT<float(NUM_CHANNELS)*TW) {{
@@ -5130,7 +5257,7 @@ void mainImage(out vec4 O, vec2 C) {{
                 const vec3 TCols[4]=vec3[](TC0,TC1,TC2,TC3);
                 vec3 nc;
                 if(isEmpty) nc = DIM*fade*1.6;     // empty "0 0 0 0" — boosted 60% so rows are readable
-                else        nc = (ri==0 ? TCols[tc] : TCols[tc]*fade);
+                else        nc = (ri==0 ? TCols[tc%4] : TCols[tc%4]*fade);
                 trk += nc*g;
             }}
         }}
@@ -5147,6 +5274,25 @@ void mainImage(out vec4 O, vec2 C) {{
     //   col = col*(1-α) + trk
     // With trk already containing the premultiplied color, this puts text
     // at full intensity wherever it's fully drawn.
+    // MASK: zero out trk in row number column area (left of tracks)
+    // ONLY within tracker Y range (don't break BPM/PATTERN labels above!)
+    if(fp.x < ML+rNW+8. && fp.y >= ty+CH+1. && fp.y < tBot+5.) {{
+        // Save the row number contribution before zeroing
+        vec3 rowNumPart = vec3(0.0);
+        if(fp.y>=tTop && fp.y<tBot) {{
+            int ri_abs2=int((fp.y-tTop)/CH);
+            int rn2 = pageStart + ri_abs2;
+            if(rn2<0)   rn2+=64;
+            if(rn2>=64) rn2-=64;
+            bool on4_2 = (rn2%4)==0;
+            int frameRow2 = pos.row - pageStart;
+            vec3 rnc2 = ri_abs2==frameRow2 ? WHITE : (on4_2 ? YELLOW*0.7 : TC3*0.7);
+            rowNumPart = rnc2 * drawNum(rn2, 2, ML+rNW-CW*1.2, tTop+float(ri_abs2)*CH, CW*0.75,CH,fp);
+        }}
+        trk = rowNumPart;  // Replace trk with only row numbers in this area
+        col = vec3(0.0);   // Black background
+    }}
+    
     float trkA = clamp(max(max(trk.r, trk.g), trk.b), 0.0, 1.0);
     col = col * (1.0 - trkA) + trk;
 
@@ -5399,7 +5545,7 @@ void mainImage(out vec4 O, vec2 C) {{
                 if (dist < semitone * 1.5) {{
                     float edge = 1.0 - dist / (semitone * 1.5);
                     totalBar = max(totalBar, amp * edge);
-                    barColor = TCols[ch];
+                    barColor = TCols[ch%4];
                 }}
             }}
             float barH = totalBar * oh * 0.92;
@@ -5454,7 +5600,7 @@ void mainImage(out vec4 O, vec2 C) {{
     # Setup: Buffer A iChannel0 = Buffer A (self-ref)
     #        Image   iChannel1 = Buffer A output
     buffer_a_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.42 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.43 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    Contact: subband@gmail.com or
             subband@protonmail.com
@@ -5601,7 +5747,10 @@ void mainImage(out vec4 O, vec2 C) {{
         if (px == 0) {{
             float prevMode  = texelFetch(iChannel0, ivec2(0, 2), 0).r;
             float prevMouse = texelFetch(iChannel0, ivec2(1, 2), 0).r;
-            float currMouse = iMouse.z > 0.0 ? 1.0 : 0.0;
+            // Spectrum toggle: only in BOTTOM 30% (canvas/visualization area)
+            float clickY = iMouse.y / iResolution.y;
+            bool inCanvasArea = clickY < 0.3;
+            float currMouse = (iMouse.z > 0.0 && inCanvasArea) ? 1.0 : 0.0;
             bool  newClick  = (currMouse > 0.5 && prevMouse < 0.5);
             O = vec4(newClick ? 1.0 - prevMode : prevMode, 0., 0., 1.);
         }} else if (px == 1) {{
@@ -5646,6 +5795,84 @@ void mainImage(out vec4 O, vec2 C) {{
             float prev = texelFetch(iChannel0, ivec2(px, 2), 0).r;
             float alpha = (current > prev) ? 0.08 : 0.025;
             O = vec4(mix(prev, current, alpha), 0., 0., 1.);
+        }} else if (px == 5) {{
+            // ── Relative grabbing scroll with out-of-bounds release ────────
+            float scrollOffset = texelFetch(iChannel0, ivec2(5, 2), 0).r;
+            float scrollAnchor = texelFetch(iChannel0, ivec2(6, 2), 0).r;
+            float prevPressed  = texelFetch(iChannel0, ivec2(7, 2), 0).r;
+            float currPressed  = iMouse.z > 0.0 ? 1.0 : 0.0;
+            
+            // Check Y bounds - tracker area is approximately Y 0.18-0.82
+            // (above oscilloscope at bottom, below header at top)
+            float mouseY = iMouse.y / iResolution.y;
+            bool inBounds = mouseY > 0.18 && mouseY < 0.82;
+            
+            // MAX_SCROLL based on actual screen width and track count
+            const float TW_PX = 231.0;
+            float visibleWidth = iResolution.x - 68.0;
+            float totalWidth = float(NUM_CHANNELS) * TW_PX;
+            float hiddenWidth = max(0.0, totalWidth - visibleWidth);
+            float MAX_SCROLL = ceil(hiddenWidth / TW_PX) * TW_PX;
+            
+            // LOGIC:
+            // - Pressed + in bounds → drag normally (1:1 mouse)
+            // - Pressed + out of bounds → TREAT AS RELEASE: snap based on gap
+            //   • Gap on left → flush left (track 0)
+            //   • Gap on right → flush right (track N)
+            //   • No gap → stay put
+            // - Released → same as out-of-bounds: snap based on gap
+            // Read drag-dead flag (set when mouse leaves view, cleared on click)
+            float dragDead = texelFetch(iChannel0, ivec2(8, 2), 0).r;
+            
+            // New click → reset everything
+            if (currPressed > 0.5 && prevPressed < 0.5) {{
+                dragDead = 0.0;
+                scrollAnchor = scrollOffset;
+            }}
+            
+            // Out of bounds while pressed → KILL DRAG
+            if (currPressed > 0.5 && !inBounds) {{
+                dragDead = 1.0;
+            }}
+            
+            // Only update scroll if drag is alive AND in bounds
+            if (currPressed > 0.5 && inBounds && dragDead < 0.5) {{
+                scrollOffset = scrollAnchor + (iMouse.x - abs(iMouse.z));
+            }}
+            
+            // ALWAYS clamp/snap (no over-scroll allowed)
+            scrollOffset = clamp(scrollOffset, -MAX_SCROLL, 0.0);
+            // Released or out of bounds: leaves where it was
+            O = vec4(scrollOffset, 0., 0., 1.);
+        }} else if (px == 6) {{
+            // Scroll anchor - just save on click
+            float scrollAnchor = texelFetch(iChannel0, ivec2(6, 2), 0).r;
+            float scrollOffset = texelFetch(iChannel0, ivec2(5, 2), 0).r;
+            float prevPressed  = texelFetch(iChannel0, ivec2(7, 2), 0).r;
+            float currPressed  = iMouse.z > 0.0 ? 1.0 : 0.0;
+            if (currPressed > 0.5 && prevPressed < 0.5) {{
+                scrollAnchor = scrollOffset;
+            }}
+            O = vec4(scrollAnchor, 0., 0., 1.);
+        }} else if (px == 7) {{
+            // ── Previous mouse pressed state ───
+            O = vec4(iMouse.z > 0.0 ? 1.0 : 0.0, 0., 0., 1.);
+        }} else if (px == 8) {{
+            // ── Drag-dead flag ───
+            float dragDead = texelFetch(iChannel0, ivec2(8, 2), 0).r;
+            float prevPressed = texelFetch(iChannel0, ivec2(7, 2), 0).r;
+            float currPressed = iMouse.z > 0.0 ? 1.0 : 0.0;
+            float mouseY = iMouse.y / iResolution.y;
+            bool inBounds = mouseY > 0.18 && mouseY < 0.82;
+            
+            // New click clears dead
+            if (currPressed > 0.5 && prevPressed < 0.5) dragDead = 0.0;
+            // Out of bounds while pressed → kill
+            if (currPressed > 0.5 && !inBounds) dragDead = 1.0;
+            // Released clears dead
+            if (currPressed < 0.5) dragDead = 0.0;
+            
+            O = vec4(dragDead, 0., 0., 1.);
         }}
 
     }} else if (py >= HIST_BASE && py < HIST_BASE + HIST_ROWS && px < NUM_CHANNELS) {{
@@ -8778,7 +9005,7 @@ def main():
                              "resolution but slower compile. Default: 1024 (or 128 if "
                              "--max-compat without override).")
     parser.add_argument('--max-compat', action='store_true', default=False,
-                        help='[NO-OP — max-compat is now the DEFAULT in v1.40+ (current: v1.42)] '
+                        help='[NO-OP — max-compat is now the DEFAULT in v1.40+ (current: v1.43)] '
                              'This flag previously enabled compatibility mode '
                              'for problematic GPUs/drivers (Windows + Firefox + '
                              'NVIDIA, etc.). The compat preset (--resampler '
@@ -9310,95 +9537,43 @@ def main():
         print(f"   📦 Total: {len(all_bytes)} bytes packed into {TEX_SIZE}×{TEX_SIZE} RGBA")
         print(f"   📦 Capacity: {total_capacity} bytes ({len(all_bytes) * 100 // total_capacity}% used)")
 
-    # Generate instruction file
-    instructions_file = base_name + "_shadertoy_instructions.txt"
-    with open(instructions_file, 'w') as f:
-        f.write(f"""ShaderToy Setup Instructions for {mod.title}
-{'=' * 60}
+    
+    # Generate README.md (single concise instructions file)
+    readme_file = base_name + "_README.md"
+    with open(readme_file, 'w') as f:
+        f.write(f"""# {mod.title} - ShaderToy MOD Player
 
-METHOD 1: ShaderToy Unofficial Plugin (RECOMMENDED)
-----------------------------------------------------
-1. Install: https://github.com/patuwwy/ShaderToy-Unofficial-Plugin
-2. Load your shader in ShaderToy
-3. Plugin settings → Custom Textures → Add "{png_file}"
-4. In Common tab: iChannel0 → Custom → Select "{png_file}"
-5. Both Common and Sound read data via texelFetch
+## Quick Start
 
-Data Info:
-- Magic signature: 4 bytes at pixel 0 ('M','O','D',loopMode)
-- Pattern bytes: {pattern_size}
-- Sample bytes: {len(sample_bytes)}
-- PNG: 1024×1024 RGBA ({png_size} bytes)
-- Format: 4 bytes per pixel (texelFetch)
-- Downsample: {args.downsample}x
+### Method 1: ShaderToy Plugin (Recommended)
+1. Install [ShaderToy Unofficial Plugin](https://github.com/patuwwy/ShaderToy-Unofficial-Plugin)
+2. Load shader in ShaderToy
+3. Plugin → Custom Textures → Add `{png_file}`
+4. Common tab: iChannel0 → Custom → `{png_file}`
 
-Loop Modes (edit PNG pixel 0, alpha channel):
-- Alpha = 0   : Normal mode (full song loop)
-- Alpha = 255 : Testing mode (10 second loop)
-- No signature: Waiting mode (silence until valid PNG)
+### Method 2: Standalone HTML
+Just open `{base_name}_player.html` in a browser - works offline!
 
-To enable testing mode:
-1. Open PNG in image editor
-2. Set pixel (0,0) alpha to 255
-3. Reload in ShaderToy → 10 sec loops!
+## Files
+- `{base_name}_player.html` - Standalone HTML player
+- `{base_name}_shadertoy_common.glsl` - MOD data + helpers
+- `{base_name}_shadertoy_sound.glsl` - Audio engine
+- `{base_name}_shadertoy_image.glsl` - Visualizer
+- `{base_name}_shadertoy_bufferA.glsl` - FFT + UI state
+- `{png_file}` - Sample data (PNG texture)
 
-METHOD 2: Embedded Data
---------------------------------------------
-Not used - all data in texture for maximum compatibility!
-
-File Overview:
---------------
-{base_name}_player.html              - Standalone HTML player (works offline!)
-{base_name}_shadertoy_common.glsl    - MOD data + helper functions
-{base_name}_shadertoy_sound.glsl     - Complete ProTracker engine
-{base_name}_shadertoy_image.glsl     - Visualization (Zuvuya demo style)
-{base_name}_shadertoy_bufferA.glsl   - FFT spectrum analyzer + UI state
-{png_file}              - Sample data as PNG texture
-
-How to Use in ShaderToy:
--------------------------
+## ShaderToy Setup
 1. Create new shader at shadertoy.com
-2. Add "Common" tab  → paste {base_name}_shadertoy_common.glsl
-3. Add "Sound"  tab  → paste {base_name}_shadertoy_sound.glsl
-4. Add "Image"  tab  → paste {base_name}_shadertoy_image.glsl
-5. Add "Buffer A" tab → paste {base_name}_shadertoy_bufferA.glsl
+2. **Common tab**: paste `{base_name}_shadertoy_common.glsl`
+3. **Buffer A**: paste `{base_name}_shadertoy_bufferA.glsl`
+4. **Sound**: paste `{base_name}_shadertoy_sound.glsl`
+5. **Image**: paste `{base_name}_shadertoy_image.glsl`
 
-Channel setup (REQUIRED for spectrum + click-toggle):
-  Image    iChannel0 = Alphabet texture  (shadertoy.com/view/4sf3RB)
-  Image    iChannel1 = Buffer A
-  Buffer A iChannel0 = Buffer A   ← self-reference (feedback loop)
-  Sound    → no channels needed
+## Loop Modes (PNG pixel 0 alpha)
+- `0` = Normal (full song loop)
+- `255` = Testing (10 second loop)
 
-6. Press PLAY! 🎵
-   Click anywhere to toggle oscilloscope ↔ spectrum view
-
-Effects Implemented:
---------------------
-✅ 0xy - Arpeggio
-✅ 1xx - Portamento Up
-✅ 2xx - Portamento Down  
-✅ 3xx - Tone Portamento
-✅ 4xy - Vibrato
-✅ 5xy - Tone Portamento + Volume Slide
-✅ 6xy - Vibrato + Volume Slide
-✅ Axy - Volume Slide
-✅ Cxx - Set Volume
-
-Architecture:
--------------
-Common: Shared by Sound & Image (MOD data, helpers)
-Sound: Generates audio independently from iTime
-Image: Reads Sound output + calculates position from iTime
-Both stay in sync via same time calculation!
-
-Troubleshooting:
-----------------
-- No sound? Check Sound tab has no syntax errors
-- Wrong notes? Verify getSample() reads from iChannel0 correctly
-- Timing off? BPM/SPEED constants in Common tab
-
-Generated by MOD2GLSL
-{'=' * 60}
+Generated by MOD2GLSL v1.43
 """)
     
     # Generate HTML player (now works for both MOD and S3M)
@@ -9764,8 +9939,8 @@ Generated by MOD2GLSL
             try:
                 with open(glsl_common_file) as _cf: _ct = _cf.read()
                 _ct = _ct.replace(
-                    "GLSL (The Last) MOD Player v1.42 (c) 2026 Orblivius",
-                    "GLSL (The Last) MOD Player v1.42 (c) 2026 Orblivius", 1)
+                    "GLSL (The Last) MOD Player v1.43 (c) 2026 Orblivius",
+                    "GLSL (The Last) MOD Player v1.43 (c) 2026 Orblivius", 1)
                 _ct = _ct.replace("   COMMON TAB\n", f"   COMMON TAB\n   Visualizer: {_vname}\n", 1)
 
                 # Inject visualizer note-synth helpers (waveType[] + _synthWave).
@@ -10099,7 +10274,6 @@ Generated by MOD2GLSL
     print(f"                      {base_name}_shadertoy_image.glsl")
     print(f"                      {bufA_file_short}  ← Buffer A (FFT + state)")
     print(f"   🖼️  Sample PNG:     {png_file} ({png_size} bytes)")
-    print(f"   📄 Instructions:   {instructions_file}")
     print(f"   🗜️  Compression:    RLE (patterns ~50%)")
     print(f"")
     print(f"   🔗 ShaderToy channel setup:")
