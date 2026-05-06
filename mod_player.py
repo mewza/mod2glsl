@@ -73,6 +73,7 @@ import sys
 import os
 import json
 import argparse
+import math
 
 # Adaptive sample compression (BW analysis + anti-alias decimation)
 try:
@@ -1180,6 +1181,54 @@ class Only3D {{
     }}
 }}
 
+// ── AdaptiveLimiter (port of adaptive_limiter) ──────────────────────────────
+// Time-domain stateful limiter with adaptive attack/release. Stereo-linked
+// (peak = max(|L|, |R|)) so L/R can't drift to different gains and break the
+// stereo image. No lookahead; the 1ms minimum attack catches transients
+// fast enough at typical sample rates.
+//
+// Adaptive coefficients:
+//   exceed_ratio = clamp((|x| − maxLimit) / maxLimit, 0, 1)
+//   attack_ms    = base_attack·(1 − r)  + min_attack·r        // faster when over-shoot is bigger
+//   release_ms   = base_release·gain    + min_release         // slower as gain returns to unity
+//
+// The 70/30 smoothing kicks in when |Δgain| > 0.1 to avoid audible zipper
+// noise on sudden bursts.
+class AdaptiveLimiter {{
+    constructor(sampleRate) {{
+        this.sr             = sampleRate;
+        this.maxLimit       = 0.995;
+        this.baseAttackMs   = 8.0;
+        this.minAttackMs    = 1.0;
+        this.baseReleaseMs  = 80.0;
+        this.minReleaseMs   = 30.0;
+        this.smoothThresh   = 0.1;
+        this.gain           = 1.0;          // current_limit_gain
+    }}
+    process(l, r) {{
+        const absMag = Math.max(Math.abs(l), Math.abs(r));   // stereo-linked
+        const exceedAmount = Math.max(0.0, absMag - this.maxLimit);
+        const exceedRatio  = Math.min(1.0, exceedAmount / this.maxLimit);
+        const attackMs  = this.baseAttackMs  * (1.0 - exceedRatio) + this.minAttackMs * exceedRatio;
+        const releaseMs = this.baseReleaseMs * (1.0 - Math.max(0.0, 1.0 - this.gain)) + this.minReleaseMs;
+        const aCoeff = Math.exp(-1000.0 / (attackMs  * this.sr));
+        const rCoeff = Math.exp(-1000.0 / (releaseMs * this.sr));
+        const targetGain = Math.min(1.0, this.maxLimit / (absMag + 1e-6));
+        // Branch: are we attacking (target < current → reduce more) or releasing?
+        const nextGainRaw = (targetGain < this.gain)
+            ? (aCoeff * this.gain + (1.0 - aCoeff) * targetGain)
+            : (rCoeff * this.gain + (1.0 - rCoeff) * targetGain);
+        const nextGain = Math.max(0.01, Math.min(1.0, nextGainRaw));
+        // 70/30 smoothing on big jumps to suppress zipper noise
+        const change = Math.abs(nextGain - this.gain);
+        const finalGain = (change > this.smoothThresh)
+            ? (0.7 * this.gain + 0.3 * nextGain)
+            : nextGain;
+        this.gain = finalGain;
+        return [l * finalGain, r * finalGain];
+    }}
+}}
+
 class MODPlayer {{
     constructor() {{
         this.audioCtx = null;
@@ -1187,6 +1236,7 @@ class MODPlayer {{
         this.bpm   = Math.max(32, modData.initialBPM   || 125);  // mikIT: bpm min=32
         this.speed = Math.min(32, modData.initialSpeed || 6);    // mikIT: speed max=32
         this.sampleRate = 44100;
+        this._limiter = new AdaptiveLimiter(this.sampleRate);
         
         // CRITICAL: ProTracker timing
         // CIA tempo: ticks_per_second = (BPM * 2) / 5
@@ -1251,6 +1301,9 @@ class MODPlayer {{
         this.sampleRate = this.audioCtx.sampleRate;
         this._only3d = new Only3D(this.sampleRate);
         this._only3d.depth = this._only3dDepth;
+        // Re-build the limiter with the actual hardware sample rate so its
+        // attack/release coefficients are correct (likely 48000, not 44100).
+        this._limiter = new AdaptiveLimiter(this.sampleRate);
         this.nextPlayTime = this.audioCtx.currentTime; // Track next buffer start time
         this.updateTiming();
         this.log('Audio initialized: ' + this.sampleRate + ' Hz');
@@ -1673,6 +1726,36 @@ class MODPlayer {{
                                 this._patDelayActive = true;
                             }}
                             break;
+                        case 0x1: // E1x — Fine porta up (TICK 0 ONLY)
+                            if (tick0 && val > 0) {{
+                                state.period = Math.max(113, state.period - val);
+                                state.basePeriod = state.period;
+                            }}
+                            break;
+                        case 0x2: // E2x — Fine porta down (TICK 0 ONLY)
+                            if (tick0 && val > 0) {{
+                                state.period = Math.min(856, state.period + val);
+                                state.basePeriod = state.period;
+                            }}
+                            break;
+                        case 0xA: // EAx — Fine volume slide up (TICK 0 ONLY)
+                            if (tick0 && val > 0) {{
+                                const newVol = Math.min(64, state.volume + val);
+                                state.volume = newVol;
+                                state.currentVolume = newVol;
+                                state.targetVolume2 = newVol;
+                                state.volumeRamping = false;
+                            }}
+                            break;
+                        case 0xB: // EBx — Fine volume slide down (TICK 0 ONLY)
+                            if (tick0 && val > 0) {{
+                                const newVol = Math.max(0, state.volume - val);
+                                state.volume = newVol;
+                                state.currentVolume = newVol;
+                                state.targetVolume2 = newVol;
+                                state.volumeRamping = false;
+                            }}
+                            break;
                         default:
                             break;
                     }}
@@ -1827,9 +1910,15 @@ class MODPlayer {{
             }};
             outL = outL * (1.0 + fat_cs1(outL) * FAT_AMOUNT);
             outR = outR * (1.0 + fat_cs1(outR) * FAT_AMOUNT);
-            
-            leftChannel[offset + i]  = outL;
-            rightChannel[offset + i] = outR;
+
+            // ── AdaptiveLimiter (sits after PhatBass + FAT4X) ────────────
+            // Stereo-linked, 1–8 ms adaptive attack, 30–110 ms adaptive
+            // release. Catches the bass overshoot from PhatBass + the
+            // saturation overshoot from FAT4X without zipper artefacts on
+            // big transients (70/30 smoothing).
+            const _lim = this._limiter.process(outL, outR);
+            leftChannel[offset + i]  = _lim[0];
+            rightChannel[offset + i] = _lim[1];
             
             // Advance sample counter
             this.sampleCounter++;
@@ -2601,7 +2690,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
     # ========== COMMON TAB ==========
     data_source_comment = "Embedded data (no PNG required)" if use_embedded else f"All data in 1024×1024 RGBA PNG: {png_file}"
     common_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.43 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.45 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    COMMON TAB
    Visualizer: {viz_name}
@@ -3103,6 +3192,12 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
         // (speed-1) ticks because tick 0 is skipped — use trigger row's
         // actual speed from the per-row table, not the initial SPEED constant
         volume = clamp(volume + (_su>0?_su:-_sd)*(trigSpeed-1), 0, 64);
+    }} else if (trigNote.effect == 0xE) {{
+        // EAx fine vol slide up / EBx fine vol slide down — TICK 0 ONLY (one-shot)
+        int _esub = (trigNote.param >> 4) & 0xF;
+        int _eval =  trigNote.param        & 0xF;
+        if      (_esub == 0xA) volume = min(64, volume + _eval);
+        else if (_esub == 0xB) volume = max(0,  volume - _eval);
     }}
     // Forward scan through non-note rows from trigRow+1 to pos.row-1
     // Effect D can shorten patterns — skip phantom rows by using patRowOffset boundaries
@@ -3136,6 +3231,13 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
                 int _fSpd = rowSpeed[_fGlobalRow];
                 volume = clamp(volume+(_su>0?_su:-_sd)*(_fSpd-1), 0, 64);
             }}
+            else if (_fn.effect == 0xE) {{
+                // EAx / EBx — fine vol slide (TICK 0 only, one-shot per row)
+                int _esub = (_fn.param >> 4) & 0xF;
+                int _eval =  _fn.param        & 0xF;
+                if      (_esub == 0xA) volume = min(64, volume + _eval);
+                else if (_esub == 0xB) volume = max(0,  volume - _eval);
+            }}
             _fr++;
             if (_fr >= 64) {{ _fr=0; _fp++; }}
         }}
@@ -3148,6 +3250,14 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
                 int _su=(_cr.param>>4)&0xF, _sd=_cr.param&0xF;
                 int _ticks = max(0, int(pos.tick) - 1);  // tick 0 skipped
                 volume = clamp(volume+(_su>0?_su:-_sd)*_ticks, 0, 64);
+            }}
+            else if (_cr.effect == 0xE) {{
+                // EAx / EBx — fine vol slide (TICK 0 only, applied as soon as
+                // pos enters this row; one-shot, no per-tick accumulation)
+                int _esub = (_cr.param >> 4) & 0xF;
+                int _eval =  _cr.param        & 0xF;
+                if      (_esub == 0xA) volume = min(64, volume + _eval);
+                else if (_esub == 0xB) volume = max(0,  volume - _eval);
             }}
         }}
     }}
@@ -3237,9 +3347,37 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
         phatbass_mix_mode = 1 if not _bass_idx else 0
         _routing = 'mix-wide' if phatbass_mix_mode == 1 else 'per-sample'
         print(f"   🎚️  PhatBass routing: {_routing} (auto)")
-    
+
+    # ── Only3D allpass: precompute coefficients at generation time ─────────
+    # The per-sample code used to compute tan/sin/cos every audio sample
+    # (~441,000× per song-second). Since freq + SR are constants, the
+    # coefficients are too — compute them here and emit literals.
+    #
+    # For each freq, the closed-form derivation is:
+    #     d        = tan(freq * pi / SR)
+    #     p0       = sin(d) / (cos(d) + sin(d))
+    #     (p1+p2)  = cos(d) / (cos(d) + sin(d))   [since p1=p0 and p2 = ... - p1]
+    #     delay    = 0.5 / freq
+    # Emit AP_P0, AP_P1_PLUS_P2, AP_DELAY as const vec2 in the GLSL.
+    _ONLY3D_FREQ1 = 700.0    # tweaked from original 500 — wider stereo image
+    _ONLY3D_FREQ2 = 2500.0
+    _ONLY3D_DEPTH = 0.2      # shuffle gain (was 0.12)
+    _ONLY3D_SAT   = 1.0      # soft saturation strength (was 0.8)
+    _ONLY3D_SR    = 44100.0
+    def _only3d_coeffs(freq, sr=_ONLY3D_SR):
+        d        = math.tan(freq * math.pi / sr)
+        sin_d    = math.sin(d)
+        cos_d    = math.cos(d)
+        denom    = cos_d + sin_d
+        p0       = sin_d / denom
+        p1_p2    = cos_d / denom        # p1 + p2 simplifies to this
+        delay    = 0.5 / freq
+        return p0, p1_p2, delay
+    _ap_p0_1, _ap_p1p2_1, _ap_delay_1 = _only3d_coeffs(_ONLY3D_FREQ1)
+    _ap_p0_2, _ap_p1p2_2, _ap_delay_2 = _only3d_coeffs(_ONLY3D_FREQ2)
+
     sound_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.43 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.45 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    SOUND TAB
    Visualizer: {viz_name}
@@ -3263,6 +3401,40 @@ float fat_cs1(float x) {{
     return 0.4375 - 0.3228759765625*x2 + 0.1123046875*x4
          - 0.50537109375*x6 + 0.1993408203125*x8
          + 0.634521484375*x10 - 0.6513671875*x12;
+}}
+// vec2 overload: same polynomial applied per-channel in one call. GLSL
+// supports overloading by signature, so this coexists with the float version.
+vec2 fat_cs1(vec2 x) {{
+    vec2 x2=x*x, x4=x2*x2, x6=x4*x2, x8=x4*x4, x10=x4*x6, x12=x6*x6;
+    return vec2(0.4375) - 0.3228759765625*x2 + 0.1123046875*x4
+         - 0.50537109375*x6 + 0.1993408203125*x8
+         + 0.634521484375*x10 - 0.6513671875*x12;
+}}
+
+// ── Master limiter (rational soft-knee, stateless) ────────────────────────
+// Stateless equivalent of the JS AdaptiveLimiter — Shadertoy's mainSound is
+// per-sample with no persistent state, so we can't run a true envelope/
+// attack/release loop here. Instead we use a soft-knee curve tuned to the
+// same ceiling (0.995 ≈ −0.04 dB) as AdaptiveLimiter::maxLimit, with the
+// knee starting at 0.95 so signal under that level is bit-identical
+// pass-through.
+//
+// Math:
+//   over     = max(|x| − T, 0)
+//   reduced  = HEAD · over / (over + HEAD)
+//   y        = sign(x) · (min(|x|, T) + reduced)
+// where T = 0.95 (knee) and HEAD = ceiling − T = 0.045. As over→∞ the
+// reduced term asymptotes to HEAD, so |y|→ceiling=0.995. At over=0 the
+// function is exactly |x|, untouched. No exp/tanh — one mul, one div,
+// abs/min/max each. Catches PhatBass + FAT4X overshoot before the audio
+// context hard-clips, without compressing musical dynamics below ±0.95.
+vec2 softLimit(vec2 x) {{
+    const float T = 0.85;        // soft-knee threshold
+    const float HEAD = 1.0 - T;  // headroom above threshold (= 0.15)
+    vec2 ax = abs(x);
+    vec2 over = max(ax - T, vec2(0.0));
+    vec2 reduced = (HEAD * over) / (over + HEAD);
+    return sign(x) * (min(ax, vec2(T)) + reduced);
 }}
 
 // Helper: Get mixed mono output at a given time (for reverb optimization)
@@ -3388,100 +3560,104 @@ vec2 mainSound(int samp, float time) {{
     
     // Split into surround bus (ch0,ch3 = outer LEFT pair → Surround L/R)
     // and center bus (ch1,ch2 = inner RIGHT pair → dry center)
-    float surrL = 0.0, surrR = 0.0;
-    float centL = 0.0, centR = 0.0;
-    
+    // OPT: vec2 (.x = L, .y = R) — modern GPUs vectorize 2-lane FP ops at
+    // the same cost as scalar, and the source is half as noisy as the
+    // separate L/R floats it replaces.
+    vec2 surr = vec2(0.0);
+    vec2 cent = vec2(0.0);
+
     for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
         float s = getChannelOutput(ch, playbackTime, pos, rowTime);
-        float panR = 0.25 + 0.5 * channelPan[ch];   // 0.25..0.75
-        float panL = 1.0 - panR;                     // 0.75..0.25
-        
+        // pan: .x = panL (0.75..0.25), .y = panR (0.25..0.75)
+        float panR = 0.25 + 0.5 * channelPan[ch];
+        vec2  pan  = vec2(1.0 - panR, panR);
+
         // AUTO-DETECT: surround on NON-bass channels (leads/pads), bass stays centered
         Note n = getNote(pos.songPos, pos.row, ch);
-        int inst = n.instrument;
+        int  inst   = n.instrument;
         bool isBass = (inst >= 1 && inst <= 31) ? isBass[inst - 1] : false;
-        bool isSurr = !isBass;  // Surround for everything EXCEPT bass
-        
-        if (isSurr) {{ surrL += s * panL; surrR += s * panR; }}
-        else        {{ centL += s * panL; centR += s * panR; }}
+
+        vec2 panned = s * pan;
+        if (isBass) cent += panned;
+        else        surr += panned;
     }}
-    
+
     // OPT: const-qualified — NUM_CHANNELS is a #define.
     const float normFactor = 2.0 / float(NUM_CHANNELS);
-    surrL *= normFactor; surrR *= normFactor;
-    centL *= normFactor; centR *= normFactor;
+    surr *= normFactor;
+    cent *= normFactor;
     
-    // ── Only3D — proper allpass technique with sin/cos coefficients ──────────
+    // ── Only3D — proper allpass technique with precomputed coefficients ──────
     // Direct port from Only3D.h by Dmitry Boldyrev / mss
-    // Two 1st-order allpass filters at different frequencies (500Hz, 2500Hz)
-    // create phase-shifted copies of the stereo difference, which are then
+    // Two 1st-order allpass filters at different frequencies create
+    // phase-shifted copies of the stereo difference, which are then
     // cross-mixed to widen the stereo image.
-    const float ONLY3D_DEPTH  = 0.12;
-    const float SATURATION    = 0.5;
+    //
+    // OPT (compile-time): all coefficients are pure functions of freq + SR,
+    // so they're computed in Python (mod_player.py) and emitted as literal
+    // const vec2. Saves ~10 trig ops + a divide per audio sample
+    // (~441,000 ops/sec eliminated) vs the old per-sample tan/sin/cos.
+    //
+    // OPT (vec2): the two parallel allpass channels share identical math,
+    // so they're computed in vec2 form (one vector op instead of two
+    // scalars at every step).
+    const float ONLY3D_DEPTH = {_ONLY3D_DEPTH};
+    const float SATURATION   = {_ONLY3D_SAT};
+
+    // Precomputed for freq=({_ONLY3D_FREQ1:.0f}Hz, {_ONLY3D_FREQ2:.0f}Hz) @ SR={_ONLY3D_SR:.0f}Hz
+    //   d        = tan(freq*PI/SR)
+    //   p0       = sin(d) / (cos(d) + sin(d))
+    //   (p1+p2)  = cos(d) / (cos(d) + sin(d))   [p1 = p0, p2 = denom - p1, sum = denom]
+    //   delay    = 0.5 / freq
+    const vec2 AP_P0         = vec2({_ap_p0_1:.6f}, {_ap_p0_2:.6f});
+    const vec2 AP_P1_PLUS_P2 = vec2({_ap_p1p2_1:.6f}, {_ap_p1p2_2:.6f});
+    const vec2 AP_DELAY      = vec2({_ap_delay_1:.7f}, {_ap_delay_2:.7f});
+
     if (enable3D) {{
-        const float SR = 44100.0;
-        const float PI = 3.14159265359;
-        
-        // Allpass 1: 500Hz — calculate coefficients using tan/sin/cos
-        float freq1 = 500.0;
-        float d1 = tan(freq1 * PI / SR);
-        float p0_1 = sin(d1) / (cos(d1) + sin(d1));
-        float p1_1 = p0_1;  // same as p0
-        float p2_1 = cos(d1) / (cos(d1) + sin(d1)) - p1_1;
-        float delay1 = 1.0 / freq1 * 0.5;  // half-period delay
-        
-        // Allpass 2: 2500Hz
-        float freq2 = 2500.0;
-        float d2 = tan(freq2 * PI / SR);
-        float p0_2 = sin(d2) / (cos(d2) + sin(d2));
-        float p1_2 = p0_2;
-        float p2_2 = cos(d2) / (cos(d2) + sin(d2)) - p1_2;
-        float delay2 = 1.0 / freq2 * 0.5;
-        
-        float t1 = playbackTime - delay1;
-        float t2 = playbackTime - delay2;
-        
-        if (t1 >= 0.0 && t2 >= 0.0) {{
-        Position pos1 = getPosition(t1);
-        Position pos2 = getPosition(t2);
-        
-        // Current surround mix (for x[n])
-        float diffNow = surrL - surrR;
-        
-        // Delayed mixes (for x[n-1] in allpass)
-        float w1L = 0.0, w1R = 0.0, w2L = 0.0, w2R = 0.0;
-        for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
-            Note n1 = getNote(pos1.songPos, pos1.row, ch);
-            int inst1 = n1.instrument;
-            bool isBass1 = (inst1 >= 1 && inst1 <= 31) ? isBass[inst1 - 1] : false;
-            if (!isBass1) {{
-                float s1 = getChannelOutput(ch, t1, pos1, rowTime);
-                float s2 = getChannelOutput(ch, t2, pos2, rowTime);
+        vec2 t = vec2(playbackTime) - AP_DELAY;
+        if (t.x >= 0.0 && t.y >= 0.0) {{
+            Position pos1 = getPosition(t.x);
+            Position pos2 = getPosition(t.y);
+
+            // Current surround mix difference (for x[n])
+            float diffNow = surr.x - surr.y;
+
+            // Delayed L/R sums for both allpass taps, summed in parallel.
+            // wL.x, wL.y = L-channel sum at tap1, tap2.  Same for wR.
+            vec2 wL = vec2(0.0);
+            vec2 wR = vec2(0.0);
+            for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
+                // Bass channels bypass surround widening — putting low freqs
+                // through the allpass + cross-mix shuffle thrashes and
+                // saturates, audible as cracking on bass-heavy passages.
+                int  inst1   = getNote(pos1.songPos, pos1.row, ch).instrument;
+                bool isBass1 = (inst1 >= 1 && inst1 <= 31) ? isBass[inst1 - 1] : false;
+                if (isBass1) continue;
+
                 float panR = 0.25 + 0.5 * channelPan[ch];
-                float panL = 1.0 - panR;
-                w1L += s1 * panL; w1R += s1 * panR;
-                w2L += s2 * panL; w2R += s2 * panR;
+                vec2  pan  = vec2(1.0 - panR, panR);
+                vec2 s = vec2(getChannelOutput(ch, t.x, pos1, rowTime),
+                              getChannelOutput(ch, t.y, pos2, rowTime));
+                wL += s * pan.x;
+                wR += s * pan.y;
             }}
-        }}
-        w1L *= normFactor; w1R *= normFactor;
-        w2L *= normFactor; w2R *= normFactor;
-        
-        float diff1_delayed = w1L - w1R;
-        float diff2_delayed = w2L - w2R;
-        
-        // Apply 1st-order allpass: y[n] = x[n]*p0 + x[n-1]*p1 + y[n-1]*p2
-        // Stateless approximation: use delayed difference for both x[n-1] and y[n-1]
-        float ap1 = diffNow * p0_1 + diff1_delayed * (p1_1 + p2_1);
-        float ap2 = diffNow * p0_2 + diff2_delayed * (p1_2 + p2_2);
-        
-        // Soft saturation: x/√(1 + x²·0.5)
-        float dd1 = ap1 / sqrt(1.0 + ap1 * ap1 * SATURATION);
-        float dd2 = ap2 / sqrt(1.0 + ap2 * ap2 * SATURATION);
-        
-        // Cross-mix shuffle (the magic!)
-        // L gets: +dd1 - dd2,  R gets: -dd1 + dd2
-        surrL += (dd1 - dd2) * ONLY3D_DEPTH;
-        surrR += (-dd1 + dd2) * ONLY3D_DEPTH;
+            wL *= normFactor;
+            wR *= normFactor;
+
+            vec2 diffDelayed = wL - wR;   // (.x = tap1 delayed, .y = tap2 delayed)
+
+            // First-order allpass approximation in parallel for both freqs.
+            // Stateless: use delayed difference for both x[n-1] and y[n-1].
+            //   y[n] = x[n]*p0 + x[n-1]*(p1+p2)
+            vec2 ap = diffNow * AP_P0 + diffDelayed * AP_P1_PLUS_P2;
+
+            // Soft saturation: x / sqrt(1 + x²·SAT). inversesqrt() is one
+            // hardware instruction on modern GPUs (faster than 1.0/sqrt()).
+            vec2 dd = ap * inversesqrt(1.0 + ap * ap * SATURATION);
+
+            // Cross-mix shuffle: L gets +shuffle, R gets −shuffle
+            float shuffle = (dd.x - dd.y) * ONLY3D_DEPTH;
+            surr += vec2(shuffle, -shuffle);
         }}
     }}
     
@@ -3503,11 +3679,11 @@ vec2 mainSound(int samp, float time) {{
         // (which has cross-pan + 1.5× depth) ends up injecting song-tail
         // audio into voice-attack regions, audible as a click on the lead.
         if (tP < 0.0) {{
-            // Skip PhatBass for these initial samples; centL/centR remain
-            // unchanged.
+            // Skip PhatBass for these initial samples; cent remains unchanged.
         }} else {{
         Position posP = getPosition(tP);
-        float pbL = 0.0, pbR = 0.0;
+        // pb.x = pbL accumulator, pb.y = pbR accumulator
+        vec2 pb = vec2(0.0);
 #if PHATBASS_MIX_MODE
         // Mix-wide: take the same per-channel sum but with NO bass filter,
         // then let the listener treat the allpass as a global bass shaper.
@@ -3515,20 +3691,13 @@ vec2 mainSound(int samp, float time) {{
         // largely unaffected — net effect is sub-bass widening.
         for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
             float sp = getChannelOutput(ch, tP, posP, rowTime);
-            // PhatBass cross-panning: send L's contribution to pbR and R's
-            // to pbL (intentional Hilbert-allpass widening). Compute panR
-            // from the file's pan, then swap.
+            // Cross-pan: pan.yx swaps L and R — that's the intentional
+            // Hilbert-allpass widening. Same swizzle replaces the old
+            // pbL+=sp*panR / pbR+=sp*panL pair.
             float panR = 0.25 + 0.5 * channelPan[ch];
-            float panL = 1.0 - panR;
-            pbL += sp * panR;   // <-- swapped (was sp * chR[cm])
-            pbR += sp * panL;   // <-- swapped (was sp * chL[cm])
+            vec2  pan  = vec2(1.0 - panR, panR);
+            pb += sp * pan.yx;
         }}
-        // Mix-wide PhatBass — applied to entire mix at PHAT_DEPTH strength.
-        // Was previously attenuated 0.25× extra ("must not overwhelm") but
-        // user feedback was "I don't hear it at all" — so the cap is gone.
-        // PHAT_DEPTH itself controls overall intensity now.
-        centL += pbL * normFactor * PHAT_DEPTH;
-        centR += pbR * normFactor * PHAT_DEPTH;
 #else
         // Per-sample: only bass-detected instruments.
         // Walk back from posP to find the most recently TRIGGERED instrument
@@ -3556,31 +3725,39 @@ vec2 mainSound(int samp, float time) {{
             if (bass) {{
                 float sp = getChannelOutput(ch, tP, posP, rowTime);
                 float panR = 0.25 + 0.5 * channelPan[ch];
-                float panL = 1.0 - panR;
-                pbL += sp * panR;   // cross-panned (was chR[cm])
-                pbR += sp * panL;   // cross-panned (was chL[cm])
+                vec2  pan  = vec2(1.0 - panR, panR);
+                pb += sp * pan.yx;   // cross-panned (Hilbert widening)
             }}
         }}
-        centL += pbL * normFactor * PHAT_DEPTH;
-        centR += pbR * normFactor * PHAT_DEPTH;
 #endif
+        // Mix-wide PhatBass — applied to entire mix at PHAT_DEPTH strength.
+        // Was previously attenuated 0.25× extra ("must not overwhelm") but
+        // user feedback was "I don't hear it at all" — so the cap is gone.
+        // PHAT_DEPTH itself controls overall intensity now.
+        // OPT: combined scale folds at compile time (both consts).
+        cent += pb * (normFactor * PHAT_DEPTH);
         }}  // end else (tP >= 0)
     }}
     
-    float outL = surrL + centL;
-    float outR = surrR + centR;
+    vec2 _out = surr + cent;
+
+    // Limiter sits BEFORE FAT4X so the saturator sees already-tamed peaks
+    // (PhatBass overshoot is the main culprit; FAT4X then colors the limited
+    // signal instead of pushing it further over).
+    _out = softLimit(_out);
 
     // ── FAT4X harmonic exciter (stateless) ─────────────────────────────────
-    // Applied BEFORE reverb - excites the dry signal, reverb processes the warmed result.
+    // Applied BEFORE reverb (reverb currently disabled — see block below).
     // cs1 produces even harmonics → adds warmth/presence, soft-limits peaks.
     // FAT_AMOUNT: 0.0=off  0.5=half  1.0=full FAT4X-equivalent  >1.0=heavy
+    // Uses the vec2 overload of fat_cs1 so both channels go through one
+    // polynomial call instead of two separate scalar invocations.
     if (enableFAT) {{
-        const float FAT_AMOUNT = 1.0;
-        outL = outL * (1.0 + fat_cs1(outL) * FAT_AMOUNT);
-        outR = outR * (1.0 + fat_cs1(outR) * FAT_AMOUNT);
+        const float FAT_AMOUNT = 0.5;
+        _out = _out * (0.5 + 0.5 * fat_cs1(_out) * FAT_AMOUNT);
     }}
 
-    // ── Freeverb-inspired parallel comb reverb (stateless) ─────────────────
+    // ── Freeverb-inspired parallel comb reverb — DISABLED ──────────────────
     // OPTIMIZED: 6 combs × 5 iters → 4 combs × 3 iters
     //   per-sample cost:    120 getChannelOutput + 30 getPosition calls
     //                    →   48 getChannelOutput + 12 getPosition calls
@@ -3594,6 +3771,16 @@ vec2 mainSound(int samp, float time) {{
     //   default (4 combs × 3 iters): full Freeverb-style spread.
     //   --max-compat (2 combs × 2 iters): half the work, narrower stereo,
     //   shorter tail. Still musical — just less roomy.
+    //
+    // DISABLED by default — the dry mix sits well without it, and the comb
+    // loop is the hottest path in the shader. To re-enable, remove the /*
+    // and */ markers below AND insert before the block:
+    //     float outL = _out.x; float outR = _out.y;
+    // and after the block:
+    //     _out = vec2(outL, outR);
+    // (The body still uses outL/outR scalars — keeping it that way means
+    // re-enable is a 4-line edit, not a rewrite.)
+    /*
     {(
         '''const int   N_ITER  = 2;   // (--max-compat: was 3)
     const float RT60    = 1.6;  // shorter tail (was 2.4) - less smear on hihats
@@ -3649,6 +3836,7 @@ vec2 mainSound(int samp, float time) {{
     _wet /= COMB_DIV;       // RMS match
     outL += _wet.x * RV_WET;
     outR += _wet.y * RV_WET;
+    */
 
     // ── Buffer-end fade-out ─────────────────────────────────────────────
     // Shadertoy's audio buffer is ~180 seconds (precomputed at compile time,
@@ -3658,15 +3846,17 @@ vec2 mainSound(int samp, float time) {{
     // ending sounds intentional rather than truncated. 0.4s ≈ 17640 samples
     // at 44.1kHz — long enough to be smooth, short enough that user only
     // loses a fraction of a row at the very end.
-    const float BUFFER_CAP   = 180.0;
-    const float FADE_LEN     = 0.4;
-    float _fadeT = clamp((BUFFER_CAP - time) / FADE_LEN, 0.0, 1.0);
-    // Cosine ease-out: 1.0 at start of fade window, 0.0 at the end
-    float _bufFade = 0.5 - 0.5 * cos(_fadeT * 3.14159265);
-    outL *= _bufFade;
-    outR *= _bufFade;
+    // Buffer-end fade DISABLED — user removed it. The 180 s buffer cap
+    // still exists (Shadertoy renders Sound once into a fixed buffer), but
+    // the trailing 0.4 s cosine fade-out is no longer applied; audio just
+    // stops abruptly at the cap. Re-enable by uncommenting the block below.
+    // const float BUFFER_CAP   = 180.0;
+    // const float FADE_LEN     = 0.4;
+    // float _fadeT = clamp((BUFFER_CAP - time) / FADE_LEN, 0.0, 1.0);
+    // float _bufFade = 0.5 - 0.5 * cos(_fadeT * 3.14159265);
+    // _out *= _bufFade;
 
-    return vec2(clamp(outL, -1.0, 1.0), clamp(outR, -1.0, 1.0));
+    return _out;
 }}
 """
     
@@ -4802,9 +4992,9 @@ vec3 _VizScene(vec2 U) {
 
 
     image_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.43 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.45 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
-   IMAGE TAB (v1_4_3) — iChannel0: alphabet texture (shadertoy.com/view/4sf3RB)
+   IMAGE TAB (v1_4_5) — iChannel0: alphabet texture (shadertoy.com/view/4sf3RB)
                 iChannel1: Buffer A (audio + FFT + smoothed bands)
                 iChannel2: RGBA Noise Small  ← required for viz 6 smoke turbulence
    Visualizer: {viz_name}
@@ -4910,7 +5100,7 @@ makeStr(printBPMVal) {bpm_val_chars} _end
 makeStr(printSpdVal) {spd_val_chars} _end
 
 // ---- Static label strings ----
-makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _4 _3 _ _NUM _NUM _NUM _end
+makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _4 _5 _ _NUM _NUM _NUM _end
 makeStr(printCredit) _COPY _2 _0 _2 _6 _ _O _R _B _L _I _V _I _U _S _end
 makeStr(printLoad)   _L _O _A _D _I _N _G _DOT _DOT _DOT _end
 makeStr(printSpec)   _S _P _E _C _T _R _U _M _end
@@ -5600,7 +5790,7 @@ void mainImage(out vec4 O, vec2 C) {{
     # Setup: Buffer A iChannel0 = Buffer A (self-ref)
     #        Image   iChannel1 = Buffer A output
     buffer_a_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.43 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.45 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    Contact: subband@gmail.com or
             subband@protonmail.com
@@ -8898,6 +9088,220 @@ _VQ_ENCODER_B64 = (
     'Z2xzbCcKICAgIG1haW4obW9kX3BhdGgsIG91dF9wYXRoKQo='
 )
 
+
+def _repack_pat_indices(src):
+    """Repack the dictionary index stream in a generated common.glsl from
+    byte-stream layout (16 bits per index across patIdx0/1/2) to a single
+    patIdx0 with three 10-bit indices per int (4 ints per ivec4 = 12 indices
+    each). Replaces fetchIdxByte with fetchIdx10 and patches getNote.
+
+    Saves ~14 KB on a typical 100 KB common.glsl. Requires DICT_NOTES ≤ 1024
+    (anything larger needs more than 10 bits per index — function returns
+    `src` unchanged with a warning in that case).
+
+    Identical logic to repack_patidx.py — kept here so it runs as part of
+    `python3 mod_player.py` instead of as a separate post-step. Errors are
+    non-fatal: any failure leaves `src` unchanged so generation still
+    completes.
+    """
+    import re as _re_rp
+
+    def _g(name):
+        m = _re_rp.search(rf"#define\s+{name}\s+(\d+)", src)
+        return int(m.group(1)) if m else None
+
+    # Idempotency: if fetchIdx10 already exists, the file's already packed.
+    if "int fetchIdx10(" in src:
+        return src
+
+    DICT_NOTES    = _g("DICT_NOTES")
+    IDX_BYTES     = _g("IDX_BYTES")
+    IDX_BYTES_PER = _g("IDX_BYTES_PER")
+    if DICT_NOTES is None or IDX_BYTES is None or IDX_BYTES_PER is None:
+        print("   ⚠️  patIdx repack skipped — required #defines not found")
+        return src
+    if DICT_NOTES > 1024:
+        print(f"   ⚠️  patIdx repack skipped — DICT_NOTES={DICT_NOTES} exceeds 1024 "
+              f"(would need >10 bits per index)")
+        return src
+
+    total_indices = IDX_BYTES // IDX_BYTES_PER
+
+    def _parse_ivec4_array(name, optional=False):
+        m = _re_rp.search(
+            rf"const\s+ivec4\s+{name}\s*\[\s*\d+\s*\]\s*=\s*"
+            rf"ivec4\s*\[\s*\]\s*\((.*?)\)\s*;",
+            src, _re_rp.DOTALL)
+        if m is None:
+            if optional: return []
+            raise RuntimeError(f"patIdx repack: array {name} not found")
+        return [tuple(int(x) for x in tup) for tup in _re_rp.findall(
+            r"ivec4\s*\(\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\)",
+            m.group(1))]
+
+    try:
+        p0 = _parse_ivec4_array("patIdx0")
+        p1 = _parse_ivec4_array("patIdx1", optional=True)
+        p2 = _parse_ivec4_array("patIdx2", optional=True)
+        old_total = len(p0) + len(p1) + len(p2)
+
+        def _ivec4s_to_bytes(lst):
+            out = bytearray()
+            for v in lst:
+                for comp in v:
+                    u = comp & 0xFFFFFFFF
+                    out.append((u >> 24) & 0xFF)
+                    out.append((u >> 16) & 0xFF)
+                    out.append((u >>  8) & 0xFF)
+                    out.append( u        & 0xFF)
+            return out
+
+        byte_stream = (_ivec4s_to_bytes(p0) +
+                       _ivec4s_to_bytes(p1) +
+                       _ivec4s_to_bytes(p2))[:IDX_BYTES]
+        if len(byte_stream) != IDX_BYTES:
+            raise RuntimeError(
+                f"patIdx repack: byte stream is {len(byte_stream)}, expected {IDX_BYTES}")
+
+        indices = []
+        for i in range(0, len(byte_stream), 2):
+            lo = byte_stream[i]
+            hi = byte_stream[i+1] if i+1 < len(byte_stream) else 0
+            indices.append(lo | (hi << 8))
+        indices = indices[:total_indices]
+
+        if max(indices) >= 1024:
+            raise RuntimeError(
+                f"patIdx repack: max index {max(indices)} doesn't fit in 10 bits")
+
+        # Pack 3 × 10-bit indices into each int; bits 30..31 unused.
+        packed_ints = []
+        for i in range(0, len(indices), 3):
+            a = indices[i]
+            b = indices[i+1] if i+1 < len(indices) else 0
+            c = indices[i+2] if i+2 < len(indices) else 0
+            packed_ints.append(a | (b << 10) | (c << 20))
+
+        new_ivec4_count = (len(packed_ints) + 3) // 4
+        while len(packed_ints) < new_ivec4_count * 4:
+            packed_ints.append(0)
+        new_ivec4s = [tuple(packed_ints[i:i+4])
+                      for i in range(0, len(packed_ints), 4)]
+
+        # Roundtrip check — must decode every index back to its original value.
+        for r, expected in enumerate(indices):
+            intIdx, subIdx = divmod(r, 3)
+            got = (packed_ints[intIdx] >> (subIdx * 10)) & 0x3FF
+            if got != expected:
+                raise RuntimeError(
+                    f"patIdx repack: roundtrip failed at rank {r} "
+                    f"(expected {expected}, got {got})")
+
+        def _fmt(v): return f"ivec4({v[0]},{v[1]},{v[2]},{v[3]})"
+        lines = []
+        for i in range(0, len(new_ivec4s), 2):
+            pair = new_ivec4s[i:i+2]
+            lines.append("    " + ", ".join(_fmt(v) for v in pair))
+        new_array_src = (f"const ivec4 patIdx0[{len(new_ivec4s)}] = ivec4[](\n"
+                         + ",\n".join(lines) + "\n);\n")
+
+        out = src
+
+        def _kill_array(text, name):
+            pat = (rf"const\s+ivec4\s+{name}\s*\[\s*\d+\s*\]\s*=\s*"
+                   rf"ivec4\s*\[\s*\]\s*\(.*?\)\s*;")
+            return _re_rp.sub(pat, "", text, count=1, flags=_re_rp.DOTALL)
+
+        out = _kill_array(out, "patIdx0")
+        out = _kill_array(out, "patIdx1")
+        out = _kill_array(out, "patIdx2")
+
+        # Splice the packed array right after patBitmap0 (its semantic neighbour).
+        m = _re_rp.search(
+            r"(const\s+ivec4\s+patBitmap0\s*\[\s*\d+\s*\]\s*=\s*"
+            r"ivec4\s*\[\s*\]\s*\(.*?\)\s*;)", out, _re_rp.DOTALL)
+        if m is None:
+            raise RuntimeError("patIdx repack: patBitmap0 anchor not found")
+        out = (out[:m.end()]
+               + "\n\n// 10-bit-packed dictionary indices (3 per int, 12 per ivec4)\n"
+               + new_array_src + out[m.end():])
+
+        new_fetch = (
+            "// ── Index stream 10-bit fetch (consolidated single chunk) ────────────────\n"
+            "// Returns the dictionary index directly (0..1023). Replaces the previous\n"
+            "// fetchIdxByte + 2-byte combine in getNote with a single fetch + shift + mask.\n"
+            "int fetchIdx10(int rank) {\n"
+            "    int intIdx   = rank / 3;\n"
+            "    int subIdx   = rank - intIdx * 3;          // rank % 3\n"
+            "    int ivec4Idx = intIdx >> 2;\n"
+            "    int compIdx  = intIdx & 3;\n"
+            "    int packed   = patIdx0[ivec4Idx][compIdx];\n"
+            "    return (packed >> (subIdx * 10)) & 0x3FF;\n"
+            "}")
+
+        old_fetch = _re_rp.search(
+            r"// ── Index stream byte fetch.*?int\s+fetchIdxByte\s*\([^)]*\)"
+            r"\s*\{[^}]*\}", out, _re_rp.DOTALL)
+        if old_fetch is None:
+            raise RuntimeError("patIdx repack: fetchIdxByte not found to replace")
+        out = out[:old_fetch.start()] + new_fetch + out[old_fetch.end():]
+
+        old_block = _re_rp.search(
+            r"// 3\) Look up index and fetch note from dictionary\s*\n"
+            r"\s*int dictIdx;\s*\n"
+            r"#if IDX_BYTES_PER == 1\s*\n"
+            r"\s*dictIdx = fetchIdxByte\(rank\);\s*\n"
+            r"#else\s*\n"
+            r"\s*int lo = fetchIdxByte\(rank \* 2\);\s*\n"
+            r"\s*int hi = fetchIdxByte\(rank \* 2 \+ 1\);\s*\n"
+            r"\s*dictIdx = lo \| \(hi << 8\);\s*\n"
+            r"#endif", out)
+        if old_block is None:
+            print("   ⚠️  patIdx repack: getNote dictIdx block not in expected form — "
+                  "edit getNote manually so dictIdx = fetchIdx10(rank);")
+        else:
+            out = (out[:old_block.start()]
+                   + "// 3) Look up 10-bit index and fetch note from dictionary\n"
+                     "    int dictIdx = fetchIdx10(rank);"
+                   + out[old_block.end():])
+
+        # Remove any leftover progressive-load helper from older patches and
+        # leave a no-op stub so any caller still compiles.
+        out = _re_rp.sub(
+            r"// ── Progressive pattern-index loading.*?"
+            r"int g_curSongPos = SONG_LENGTH;",
+            "", out, flags=_re_rp.DOTALL)
+        out = _re_rp.sub(
+            r"// ═══ Progressive pattern-load setter.*?"
+            r"void setProgressiveLoadPosition\(float time\) \{\s*"
+            r"g_curSongPos = getPosition\(time\)\.songPos;\s*\}",
+            "", out, flags=_re_rp.DOTALL)
+        if "void setProgressiveLoadPosition" not in out:
+            out = out.rstrip() + (
+                "\n\n"
+                "// No-op stub for any tab still calling setProgressiveLoadPosition().\n"
+                "// Progressive loading was tied to the old patIdx chunking, which\n"
+                "// doesn't exist in the 10-bit-packed layout. Safe to delete once\n"
+                "// the call sites in BufferA / Image / Sound are gone.\n"
+                "void setProgressiveLoadPosition(float time) {}\n"
+            )
+
+        out = _re_rp.sub(
+            r"#define IDX_INTS\s+\d+",
+            f"#define IDX_INTS          {len(new_ivec4s)}   "
+            f"// 10-bit packed: 3 indices per int, 12 per ivec4",
+            out)
+
+        saved = len(src) - len(out)
+        pct = 100 * saved / max(1, len(src))
+        print(f"   🗜️  patIdx repacked: {old_total} → {len(new_ivec4s)} ivec4s, "
+              f"saved {saved:,} bytes ({pct:.1f}%)")
+        return out
+    except Exception as _e:
+        print(f"   ⚠️  patIdx repack skipped: {_e}")
+        return src
+
+
 def main():
     import argparse
     class _ArgFmt(argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHelpFormatter):
@@ -9005,7 +9409,7 @@ def main():
                              "resolution but slower compile. Default: 1024 (or 128 if "
                              "--max-compat without override).")
     parser.add_argument('--max-compat', action='store_true', default=False,
-                        help='[NO-OP — max-compat is now the DEFAULT in v1.40+ (current: v1.43)] '
+                        help='[NO-OP — max-compat is now the DEFAULT in v1.40+ (current: v1.45)] '
                              'This flag previously enabled compatibility mode '
                              'for problematic GPUs/drivers (Windows + Firefox + '
                              'NVIDIA, etc.). The compat preset (--resampler '
@@ -9573,7 +9977,7 @@ Just open `{base_name}_player.html` in a browser - works offline!
 - `0` = Normal (full song loop)
 - `255` = Testing (10 second loop)
 
-Generated by MOD2GLSL v1.43
+Generated by MOD2GLSL v1.45
 """)
     
     # Generate HTML player (now works for both MOD and S3M)
@@ -9938,9 +10342,13 @@ Generated by MOD2GLSL v1.43
             _vname = _viz_names.get(args.viz, f"viz{args.viz}")
             try:
                 with open(glsl_common_file) as _cf: _ct = _cf.read()
-                _ct = _ct.replace(
-                    "GLSL (The Last) MOD Player v1.43 (c) 2026 Orblivius",
-                    "GLSL (The Last) MOD Player v1.43 (c) 2026 Orblivius", 1)
+                # The VQ encoder's emitted Common still carries its own version
+                # (currently v1.42 inside the inner b64 blob). Rewrite any v1.4x
+                # to the current v1.45 so all four tabs stamp the same number.
+                import re as _re_v
+                _ct = _re_v.sub(
+                    r"GLSL \(The Last\) MOD Player v1\.\d+(?: \(c\) 2026 Orblivius)",
+                    "GLSL (The Last) MOD Player v1.45 (c) 2026 Orblivius", _ct, count=1)
                 _ct = _ct.replace("   COMMON TAB\n", f"   COMMON TAB\n   Visualizer: {_vname}\n", 1)
 
                 # Inject visualizer note-synth helpers (waveType[] + _synthWave).
@@ -10261,6 +10669,20 @@ Generated by MOD2GLSL v1.43
         except Exception as _splerr:
             print(f"   WARNING: Common→Sound split failed ({_splerr}); leaving Common intact")
 
+    # 10-bit-packed dictionary index repack — saves ~14% on common.glsl.
+    # Runs after the Common→Sound split so it sees the final form. The
+    # helper is a no-op (returns src unchanged) when DICT_NOTES > 1024 or
+    # when the expected anchors aren't present, so it's safe to invoke
+    # unconditionally.
+    try:
+        import os as _os3
+        if _os3.path.exists(glsl_common_file):
+            _orig = open(glsl_common_file).read()
+            _packed = _repack_pat_indices(_orig)
+            if _packed is not _orig:
+                with open(glsl_common_file, 'w') as _f: _f.write(_packed)
+    except Exception as _re_err:
+        print(f"   WARNING: patIdx repack failed ({_re_err}); Common left as-is")
 
 
     # Summary
