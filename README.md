@@ -60,6 +60,7 @@ $\color{limegreen}\textsf{+}$ &nbsp; **Fixed most of the pattern playback bugs i
 </p>
 <p align="center">
 <samp>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>BEYOND.MOD</b> • <a href="https://www.shadertoy.com/view/s3l3R8">shadertoy.com/view/s3l3R8</a></samp><br>
+<samp>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>GADGET.IT</b> • <a href="https://www.shadertoy.com/view/s3sGWM">shadertoy.com/view/s3l3R8</a></samp><br>
 </p>
 
 ---
