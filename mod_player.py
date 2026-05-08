@@ -597,6 +597,1300 @@ class S3MFile:
         
         return pattern
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  XM / IT helpers — note→period conversion, IT compressed-sample decoder
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_xm_release_factor(env_pts, sus_pt):
+    """Return 0..1 = time-weighted average vol of envelope points after
+    sustain, divided by 64. Used by the stateless GLSL Sound tab to give
+    XM key-off voices a "post-envelope hold" level — a reasonable
+    approximation when we can't simulate the full envelope per tick.
+    Returns 1.0 when no envelope (so the GLSL path collapses to "no drop").
+    """
+    if not env_pts or sus_pt + 1 >= len(env_pts):
+        return 1.0
+    rel = env_pts[sus_pt:]
+    if len(rel) < 2:
+        return 1.0
+    total_dur = max(1, rel[-1][0] - rel[0][0])
+    wsum = 0.0
+    for i in range(len(rel) - 1):
+        d = rel[i+1][0] - rel[i][0]
+        wsum += d * (rel[i][1] + rel[i+1][1]) / 2.0
+    return max(0.0, min(1.0, (wsum / total_dur) / 64.0))
+
+
+def _note_to_mod_period(note_xm_or_it):
+    """Convert an XM (1..96) or IT (0..119) note number to a MOD-style period.
+
+    Convention: note that maps to MOD period 428 = the sample's "natural"
+    pitch (1× source sample rate). Each octave halves/doubles the period:
+        period = 428 * 2^((49 - note) / 12)
+
+    XM note 49 = A-4 = native; IT note 49 also = native (after IT's note=60-
+    means-middle-C convention, but mikIT remaps so 49 stays native too). The
+    JS engine clamps periods to [113, 856] in `getEffectivePeriod`, so notes
+    more than ±1 octave from the native pitch get squashed to the rail —
+    acceptable for a Phase-1 port; high-pitched leads / sub-bass may sit at
+    the wrong octave in the worst case.
+
+    Returns 0 for "no note" (note > 120), else an int period.
+    Negative notes (IT C-0..B-0 after the IT→XM shift) are still valid
+    musical notes and map to large periods; we let those through.
+    """
+    if note_xm_or_it > 120:
+        return 0
+    import math as _m
+    return max(1, int(round(428.0 * (2.0 ** ((49 - note_xm_or_it) / 12.0)))))
+
+
+def _xm_finetune_to_mod_nibble(xm_finetune):
+    """XM finetune is a signed -128..+127 byte (-128 = -1 semitone, +127 ≈
+    +1 semitone in 1/128-semitone units). MOD finetune is a 4-bit nibble
+    where 0..7 = +1..+7 cents-ish and 8..15 = -8..-1 (two's-complement).
+    Squash to nearest MOD nibble.
+    """
+    n = int(round(xm_finetune / 16.0))
+    n = max(-8, min(7, n))
+    return n & 0xF
+
+
+def _it_c5speed_to_mod_nibble(c5_speed):
+    """IT samples carry a C-5 playback rate (Hz). Convert that to a MOD
+    finetune nibble using the same 16-entry c4speeds table the engine uses
+    (the c4speeds[ft] * 428 / period frequency formula). MOD period 428
+    corresponds to IT C-5 in our note→period mapping (IT note 60 → 428),
+    so c5_speed maps DIRECTLY onto the c4_speeds table — no /2 conversion.
+    The previous /2 bug made every IT sample default to nibble 8 (= c4=7895)
+    instead of nibble 0 (= 8363) for the standard c5_speed=8363, dropping
+    pitch by ~5% on every IT sample. Default 0 if input is invalid.
+    """
+    if c5_speed <= 0:
+        return 0
+    c4_speeds = [8363, 8413, 8463, 8529, 8581, 8651, 8723, 8757,
+                 7895, 7941, 7985, 8046, 8107, 8169, 8232, 8280]
+    target = float(c5_speed)
+    best = 0; best_err = 1e30
+    for i, c4 in enumerate(c4_speeds):
+        err = abs(c4 - target)
+        if err < best_err:
+            best_err = err; best = i
+    return best
+
+
+def _it_decompress_sample(packed_bytes, num_samples, is_16bit, it215_delta):
+    """Decompress an IT-packed sample block.
+
+    Direct port of mikIT's MCONVERT::ReadITCompress8/ReadITCompress16
+    (mod/mikIT/mdriver.cpp). Each block is prefixed by a 16-bit packed-byte
+    count; we accept the packed_bytes as a single block (caller handles
+    multi-block reads when num_samples > 0x4000 for 16-bit / 0x8000 for
+    8-bit). Returns a list of int16 samples (already sign-extended;
+    converted to 16-bit by left-shift 8 for 8-bit inputs to match mikIT's
+    output convention).
+
+    `it215_delta` corresponds to mikIT's `it215` flag — when True (IT 2.15+),
+    the decoder accumulates twice (d1 + d2). For older IT files (which is
+    most), it215_delta=False and the output is just the running sum d1.
+    """
+    out = []
+    pos_byte = 0
+    pos_bit = 0
+    n_bytes = len(packed_bytes)
+    bits = 17 if is_16bit else 9
+    d1 = 0
+    d2 = 0
+
+    def _read_bits(n):
+        nonlocal pos_byte, pos_bit
+        x = 0
+        have = 0
+        while n > 0:
+            if pos_byte >= n_bytes:
+                # Out of input: return zeros (matches mikIT's `buf=0` fallback)
+                buf_avail = 8 - pos_bit
+                take = min(n, buf_avail)
+                # contribute zeros of width 'take'
+                pos_bit += take
+                if pos_bit >= 8:
+                    pos_byte += pos_bit // 8
+                    pos_bit %= 8
+                n -= take
+                have += take
+                continue
+            buf = packed_bytes[pos_byte] >> pos_bit
+            buf_avail = 8 - pos_bit
+            take = min(n, buf_avail)
+            x |= (buf & ((1 << take) - 1)) << have
+            pos_bit += take
+            if pos_bit >= 8:
+                pos_byte += pos_bit // 8
+                pos_bit %= 8
+            n -= take
+            have += take
+        return x
+
+    width = bits
+    new_count = 0
+    while len(out) < num_samples:
+        needbits = (4 if is_16bit else 3) if new_count else width
+        x = _read_bits(needbits)
+        if new_count:
+            new_count = 0
+            x += 1
+            if x >= width:
+                x += 1
+            width = x
+            continue
+        if is_16bit:
+            if width < 7:
+                if x == (1 << (width - 1)):
+                    new_count = 1
+                    continue
+            elif width < 17:
+                y = (0xFFFF >> (17 - width)) - 8
+                if y < x <= y + 16:
+                    x -= y
+                    width = x if x < width else x + 1
+                    continue
+            elif width == 17:
+                if x & 0x10000:
+                    width = (x + 1) & 0xFF
+                    continue
+            else:
+                return out  # error in compressed data
+        else:  # 8-bit
+            if width < 7:
+                if x == (1 << (width - 1)):
+                    new_count = 1
+                    continue
+            elif width < 9:
+                y = (0xFF >> (9 - width)) - 4
+                if y < x <= y + 8:
+                    x -= y
+                    if x >= width:
+                        x += 1
+                    width = x
+                    continue
+            elif width < 10:
+                if x >= 0x100:
+                    width = x - 0x100 + 1
+                    continue
+            else:
+                return out
+
+        # Sign-extend x as `width`-bit signed (matches mikIT's
+        # `((BYTE)(x<<(8-bits)))>>(8-bits)` arithmetic-shift trick).
+        # When width >= base bits, there's no truncation in C — it just
+        # interprets the low `base` bits as signed via the BYTE/SWORD wrap.
+        if is_16bit:
+            ext = width if width < 16 else 16
+        else:
+            ext = width if width < 8 else 8
+        if x & (1 << (ext - 1)):
+            x -= (1 << ext)
+        if is_16bit:
+            d1 = (d1 + x) & 0xFFFF
+            if d1 >= 0x8000: d1 -= 0x10000
+            d2 = (d2 + d1) & 0xFFFF
+            if d2 >= 0x8000: d2 -= 0x10000
+            out.append(d2 if it215_delta else d1)
+        else:
+            d1 = (d1 + x) & 0xFF
+            if d1 >= 0x80: d1 -= 0x100
+            d2 = (d2 + d1) & 0xFF
+            if d2 >= 0x80: d2 -= 0x100
+            out.append(d1 << 8)
+    return out
+
+
+def _xm_or_it_effect_to_mod(eff, param, is_xm=True):
+    """Translate XM/IT effect+param to MOD-compatible (effect_nibble, param).
+
+    XM effect bytes 0x00..0x0F are MOD-compatible (pass through). Letters
+    G..Z (encoded as eff=0x10..0x23 in the file = 'G'-55..'Z'-55) are XM-
+    specific and have no MOD equivalent → return (0, 0) and they'll be
+    counted as "skipped".
+
+    IT uses letters A..Z (encoded as eff=1..26) — same scheme as S3M (which
+    IT inherits from). The translation table below is inlined here so
+    mod_player.py is fully self-contained (no s3m2mod.py dependency).
+    """
+    if eff == 0:
+        return (0, param)
+    if is_xm:
+        # XM 0x0..0xF map directly to MOD 0..F.
+        if eff <= 0xF:
+            return (eff, param)
+        # XM-specific letters → no-op for Phase 1.
+        return (0, 0)
+
+    # ── IT (S3M-style letter effects, 1=A .. 26=Z) → MOD numeric. ──
+    # Same table-of-contents as the well-known S3M→MOD effect map. xx=param,
+    # x=high nibble, y=low nibble. Anything without a clean MOD equivalent
+    # returns (0, 0) and gets counted as a "skipped" cell.
+    cmd = eff - 1            # 0=A, 1=B, …, 25=Z
+    hi = (param >> 4) & 0xF
+    lo =  param       & 0xF
+
+    if cmd == 0:   return (0xF, param)                     # A: speed
+    if cmd == 1:   return (0xB, param)                     # B: position jump
+    if cmd == 2:                                           # C: pattern break
+        row = min(param, 63)
+        return (0xD, ((row // 10) << 4) | (row % 10))      # binary→BCD
+    if cmd == 3:                                           # D: vol slide
+        if lo == 0xF and hi > 0:  return (0xE, 0xA0 | hi)  # fine up
+        if hi == 0xF and lo > 0:  return (0xE, 0xB0 | lo)  # fine down
+        return (0xA, param)
+    if cmd == 4:                                           # E: porta down
+        if hi in (0xE, 0xF):  return (0xE, 0x20 | lo)      # (extra-)fine
+        return (0x2, param)
+    if cmd == 5:                                           # F: porta up
+        if hi in (0xE, 0xF):  return (0xE, 0x10 | lo)
+        return (0x1, param)
+    if cmd == 6:   return (0x3, param)                     # G: tone porta
+    if cmd == 7:   return (0x4, param)                     # H: vibrato
+    if cmd == 8:   return (0, 0)                           # I: tremor (no MOD eq)
+    if cmd == 9:   return (0x0, param)                     # J: arpeggio
+    if cmd == 10:                                          # K: vib + volslide
+        if lo == 0xF and hi > 0:  return (0xE, 0xA0 | hi)
+        if hi == 0xF and lo > 0:  return (0xE, 0xB0 | lo)
+        return (0x6, param)
+    if cmd == 11:                                          # L: porta + volslide
+        if lo == 0xF and hi > 0:  return (0xE, 0xA0 | hi)
+        if hi == 0xF and lo > 0:  return (0xE, 0xB0 | lo)
+        return (0x5, param)
+    if cmd == 14:  return (0x9, param)                     # O: sample offset
+    if cmd == 16:  return (0xE, 0x90 | lo)                 # Q: retrigger
+    if cmd == 17:  return (0x7, param)                     # R: tremolo
+    if cmd == 18:                                          # S: special subcmds
+        return {
+            0x3: (0xE, 0x40 | lo),    # S3 vibrato waveform → E4x
+            0x4: (0xE, 0x70 | lo),    # S4 tremolo waveform → E7x
+            0x6: (0xE, 0x60 | lo),    # S6 pattern loop     → E6x
+            0xB: (0xE, 0x60 | lo),    # SB pattern loop     → E6x
+            0xC: (0xE, 0xC0 | lo),    # SC note cut         → ECx
+            0xD: (0xE, 0xD0 | lo),    # SD note delay       → EDx
+            0xE: (0xE, 0xE0 | lo),    # SE pattern delay    → EEx
+        }.get(hi, (0, 0))
+    if cmd == 19:  return (0xF, param)                     # T: tempo (Fxx with xx>=0x20)
+    if cmd == 20:  return (0xE, 0x40 | lo)                 # U: fine vibrato → E4x (approx)
+    if cmd == 21:  return (0, 0)                           # V: global vol — no MOD eq
+    if cmd == 23:  return (0x8, param)                     # X: set panning (param 0..FF)
+    return (0, 0)                                          # M, N, P, W, Y, Z: no MOD eq
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  XM PARSER (FastTracker 2 — Phase 1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class XMFile:
+    """FastTracker 2 .xm parser.
+
+    Phase-1 scope: load header + flatten instruments to one sample each
+    (first sample only) + read variable-row patterns (clamped/truncated to
+    64 for engine compatibility) + delta-decode 8/16-bit samples (16-bit
+    downconverted to 8-bit). Effect translation: 0x0..0xF pass through;
+    XM-specific letter effects (Gxx, Hxx, Kxx, Lxx, Pxx, Rxx, Txx, Xxx) are
+    silently dropped with a count printed once.
+
+    The output object exposes the same shape as MODFile so the existing
+    engine/ encoder/ HTML player code path needs no changes:
+        title, num_channels, num_patterns, samples[], patterns[][][],
+        song_positions[], initial_speed, initial_tempo
+    """
+    def __init__(self, filename):
+        self.filename = filename
+        self.title = ""
+        self.num_channels = 4
+        self.num_patterns = 0
+        self.samples = []
+        self.patterns = []
+        self.song_positions = []
+        self.initial_speed = 6
+        self.initial_tempo = 125
+        self.is_s3m = False         # for downstream code that flags S3M-isms
+        self._unsupported_effects = 0
+        self._parse(filename)
+
+    def _parse(self, filename):
+        with open(filename, 'rb') as f:
+            blob = f.read()
+        if blob[:17] != b'Extended Module: ':
+            raise ValueError("Not an XM file (missing 'Extended Module: ' signature)")
+
+        self.title = blob[17:17+20].rstrip(b'\x00 \r\n').decode('latin-1', errors='ignore')
+
+        # ── Header (fields are little-endian) ──
+        # offset 58: version (2B); 60: header size (4B); 64: song length (2B);
+        # 66: restart pos (2B); 68: num channels (2B); 70: num patterns (2B);
+        # 72: num instruments (2B); 74: flags (2B); 76: tempo/speed (2B);
+        # 78: BPM (2B); 80: pattern order table (256B).
+        version = struct.unpack_from('<H', blob, 58)[0]
+        hdr_size = struct.unpack_from('<I', blob, 60)[0]
+        song_len = struct.unpack_from('<H', blob, 64)[0]
+        # restart   = struct.unpack_from('<H', blob, 66)[0]   # unused (Phase 1)
+        self.num_channels = struct.unpack_from('<H', blob, 68)[0]
+        num_patterns      = struct.unpack_from('<H', blob, 70)[0]
+        num_instruments   = struct.unpack_from('<H', blob, 72)[0]
+        # flags     = struct.unpack_from('<H', blob, 74)[0]   # bit 0 = linear freq (TODO Phase 2)
+        self.initial_speed = max(1, struct.unpack_from('<H', blob, 76)[0])
+        self.initial_tempo = max(32, struct.unpack_from('<H', blob, 78)[0])
+
+        order_table = list(blob[80:80+song_len])
+        self.song_positions = [b for b in order_table if b < num_patterns]
+        if not self.song_positions:
+            self.song_positions = [0]
+        self.num_patterns = num_patterns
+
+        # XM stores up to 256 patterns, but pattern indices in the order
+        # table address into that pool. We must build all `num_patterns`
+        # slots even if some are unreferenced, so engine indexing matches.
+
+        # ── Patterns ──
+        # File pointer starts at offset (60 + hdr_size). Each pattern has a
+        # small header followed by `packed_size` bytes of compressed notes.
+        cur = 60 + hdr_size
+        self.patterns = []
+        for pat_i in range(num_patterns):
+            ph_size = struct.unpack_from('<I', blob, cur)[0]
+            # ph[0..3]=size, ph[4]=packing, ph[5..6]=numrows (LE), ph[7..8]=packsize (LE)
+            num_rows  = struct.unpack_from('<H', blob, cur+5)[0]
+            pack_size = struct.unpack_from('<H', blob, cur+7)[0]
+            pat_data_start = cur + ph_size
+            pat = self._decode_pattern(blob, pat_data_start, pack_size,
+                                       num_rows, self.num_channels)
+            # Clamp rows to 64 for engine compatibility (truncate).
+            if len(pat) > 64:
+                pat = pat[:64]
+            elif len(pat) < 64:
+                # Pad with empty rows so engine's fixed-64 indexing is safe.
+                empty_row = [{'sample':0,'period':0,'effect':0,'param':0}
+                             for _ in range(self.num_channels)]
+                pat = pat + [list(empty_row) for _ in range(64 - len(pat))]
+            self.patterns.append(pat)
+            cur = pat_data_start + pack_size
+
+        # ── Instruments → flat samples list ──
+        # MOD format limits us to 31 sample slots; truncate if more.
+        self.samples = [self._empty_sample() for _ in range(31)]
+        flatten_count = min(num_instruments, 31)
+        warn_skipped_inst = max(0, num_instruments - 31)
+        for inst_i in range(num_instruments):
+            inst_size = struct.unpack_from('<I', blob, cur)[0]
+            inst_name = blob[cur+4:cur+4+22].rstrip(b'\x00 \r\n').decode('latin-1', errors='ignore')
+            num_samples_in_inst = struct.unpack_from('<H', blob, cur+27)[0]
+
+            if num_samples_in_inst == 0:
+                # Empty instrument slot — advance by inst_size only.
+                if inst_i < flatten_count:
+                    self.samples[inst_i] = self._empty_sample(inst_name)
+                cur += inst_size
+                continue
+
+            # XMPATCHHEADER continues at cur+29, then sample headers follow
+            # at (cur + inst_size). Each sample header is 40 bytes; sample
+            # data follows after ALL sample headers.
+            # Volume envelope (XM "vol_type" semantics):
+            #   @+225  vol_pts_n     (1)  number of envelope points (≤12)
+            #   @+227  sustain_pt    (1)  point index where env pauses while keyed-on
+            #   @+228  loop_st_pt    (1)  loop start point index
+            #   @+229  loop_en_pt    (1)  loop end point index
+            #   @+233  vol_type      (1)  bit0=on, bit1=sustain, bit2=loop
+            #   @+239  fadeout       (2)  per-tick volfade decrement (0..0xFFF)
+            # Each env point is 4 bytes (x:2 LE, y:2 LE) at offsets +129..+177.
+            vol_type = blob[cur+233] if inst_size > 233 else 0
+            fadeout  = struct.unpack_from('<H', blob, cur+239)[0] if inst_size > 240 else 0
+            xm_env_on    = bool(vol_type & 0x01)
+            xm_env_sus   = bool(vol_type & 0x02)
+            xm_env_loop  = bool(vol_type & 0x04)
+            xm_env_pts = []
+            xm_env_sus_pt = 0
+            xm_env_loop_st = 0
+            xm_env_loop_en = 0
+            if xm_env_on and inst_size > 240:
+                vol_pts_n      = min(blob[cur+225], 12)
+                xm_env_sus_pt  = blob[cur+227]
+                xm_env_loop_st = blob[cur+228]
+                xm_env_loop_en = blob[cur+229]
+                for p in range(vol_pts_n):
+                    x = struct.unpack_from('<H', blob, cur+129+p*4)[0]
+                    y = struct.unpack_from('<H', blob, cur+131+p*4)[0]
+                    xm_env_pts.append([x, y])
+            samp_hdr_size = struct.unpack_from('<I', blob, cur+29)[0]
+            sh_base = cur + inst_size
+            # Read all sample headers for this instrument
+            samp_meta = []
+            for s_i in range(num_samples_in_inst):
+                sh = sh_base + s_i * samp_hdr_size
+                length    = struct.unpack_from('<I', blob, sh+0)[0]
+                loop_st   = struct.unpack_from('<I', blob, sh+4)[0]
+                loop_len  = struct.unpack_from('<I', blob, sh+8)[0]
+                vol       = blob[sh+12]
+                ftune     = struct.unpack('b', bytes([blob[sh+13]]))[0]  # signed
+                stype     = blob[sh+14]
+                # pan       = blob[sh+15]                               # ignored Phase 1
+                rel_note  = struct.unpack('b', bytes([blob[sh+16]]))[0]  # signed
+                # reserved  = blob[sh+17]
+                sname     = blob[sh+18:sh+40].rstrip(b'\x00 \r\n').decode('latin-1', errors='ignore')
+                samp_meta.append(dict(length=length, loop_st=loop_st,
+                                      loop_len=loop_len, vol=vol, ftune=ftune,
+                                      stype=stype, rel_note=rel_note,
+                                      name=sname))
+            # Sample data follows after all headers; length is in BYTES
+            # (not samples) for both 8 and 16-bit forms.
+            data_cur = sh_base + num_samples_in_inst * samp_hdr_size
+            for sm in samp_meta:
+                raw = blob[data_cur:data_cur + sm['length']]
+                data_cur += sm['length']
+                sm['raw'] = raw
+
+            # Phase 1: only flatten the first sample of each instrument.
+            sm0 = samp_meta[0]
+            decoded = self._decode_xm_sample(sm0['raw'], sm0['stype'])
+            # Convert byte-domain loop points to sample-domain (16-bit halves
+            # the index space).
+            byte_per_samp = 2 if (sm0['stype'] & 0x10) else 1
+            loop_st_smp  = sm0['loop_st']  // byte_per_samp
+            loop_len_smp = sm0['loop_len'] // byte_per_samp
+            length_smp   = sm0['length']   // byte_per_samp
+            if not (sm0['stype'] & 0x03):
+                # No loop set — clear loop fields so engine doesn't loop.
+                loop_st_smp = 0
+                loop_len_smp = 0
+
+            # Combine XM finetune (-128..+127) and rel_note (signed semitones)
+            # into MOD's 4-bit finetune. The rel_note semitone shift can't be
+            # encoded in MOD finetune; it gets approximated by "always
+            # transposing the note column by rel_note semitones" at convert
+            # time — but since we don't know which channel will play this
+            # sample at codegen time, we punt and store rel_note in a side
+            # attribute the (currently MOD-centric) engine ignores.
+            mod_ft = _xm_finetune_to_mod_nibble(sm0['ftune'])
+
+            if inst_i < flatten_count:
+                # XM raw samples are SIGNED; engine wants signed int8 too.
+                slot = self._empty_sample(sm0['name'] or inst_name)
+                slot.update(dict(
+                    name=sm0['name'] or inst_name,
+                    length=length_smp,
+                    finetune=mod_ft,
+                    volume=min(sm0['vol'], 64),    # MOD vol range is 0..64
+                    repeat_point=loop_st_smp,
+                    repeat_length=loop_len_smp,
+                    data=np.frombuffer(bytes(decoded), dtype=np.int8),
+                    _xm_rel_note=sm0['rel_note'],  # for note period biasing
+                    # XM envelope/fadeout — only used when env is enabled.
+                    # Engine treats fadeout=0 with env-off as hard cut on
+                    # key-off; non-zero fadeout drives ghost-voice decay
+                    # at fadeout/65536 of full vol per tick (mikIT/openMPT
+                    # convention; we scale that into the engine's vol units
+                    # at dispatch time).
+                    fadeout=fadeout if xm_env_on else 0,
+                    # Full XM volume envelope state — JS engine simulates per
+                    # tick. env_pts is empty when env is off; engine treats
+                    # that as constant vol = 64. sus_pt holds env_x while
+                    # voice is keyed on; loop_st/en defines the loop range
+                    # active when env_loop is set.
+                    env_pts=xm_env_pts if xm_env_on else [],
+                    env_sus=xm_env_sus,
+                    env_loop=xm_env_loop,
+                    env_sus_pt=xm_env_sus_pt,
+                    # XM sustain is a single hold point — model it as a
+                    # zero-length sustain "loop" (start==end) so the unified
+                    # IT-style advance code in the engine still produces
+                    # the same hold-at-point behavior.
+                    env_sus_en=xm_env_sus_pt,
+                    env_loop_st=xm_env_loop_st,
+                    env_loop_en=xm_env_loop_en,
+                    # release_factor: time-weighted avg of post-sustain env
+                    # points / 64 (0..1). Used by the stateless GLSL Sound
+                    # tab to approximate the envelope release "hold" level
+                    # without per-voice state. Defaults to 1.0 (no drop) for
+                    # samples without envelope.
+                    release_factor=_compute_xm_release_factor(
+                        xm_env_pts if xm_env_on else [], xm_env_sus_pt),
+                ))
+                self.samples[inst_i] = slot
+
+            cur = data_cur
+
+        if warn_skipped_inst:
+            print(f"   ⚠️  XM has {num_instruments} instruments — engine cap is 31; "
+                  f"skipped {warn_skipped_inst} (instruments {31}+)")
+        if self._unsupported_effects:
+            print(f"   ⚠️  XM has {self._unsupported_effects} XM-specific effect cells "
+                  f"(G/H/K/L/P/R/T/X) — silently dropped (Phase 1)")
+
+        # Apply each sample's _xm_rel_note as a bias to its period during
+        # cell construction — we do that in _decode_pattern by remembering
+        # the active sample number and biasing the note. But that requires
+        # forward-knowing the sample. Cleanest: shift inside the cell after
+        # the fact, using the sample's _xm_rel_note attribute.
+        for pat in self.patterns:
+            for row in pat:
+                for ch in row:
+                    if ch['sample'] > 0 and ch['period'] > 0:
+                        s = self.samples[ch['sample']-1]
+                        rn = s.get('_xm_rel_note', 0)
+                        if rn:
+                            # Each semitone = 2^(1/12) period ratio.
+                            ch['period'] = max(1, int(round(
+                                ch['period'] * (2.0 ** (-rn / 12.0)))))
+
+    @staticmethod
+    def _empty_sample(name=""):
+        return {
+            'name': name, 'length': 0, 'finetune': 0, 'volume': 64,
+            'repeat_point': 0, 'repeat_length': 0,
+            'data': np.zeros(0, dtype=np.int8),
+            '_xm_rel_note': 0,
+        }
+
+    def _decode_pattern(self, blob, start, pack_size, num_rows, num_chan):
+        """Decode XM packed pattern data into [row][ch] = {sample,period,effect,param} cells.
+        See XM agent report §2 for the bit-7 prefix scheme."""
+        rows = []
+        if pack_size == 0:
+            empty_row = [{'sample':0,'period':0,'effect':0,'param':0}
+                         for _ in range(num_chan)]
+            return [list(empty_row) for _ in range(num_rows)]
+        cur = start
+        for _r in range(num_rows):
+            row = []
+            for _c in range(num_chan):
+                if cur >= start + pack_size:
+                    note = inst = vol = eff = par = 0
+                else:
+                    prefix = blob[cur]; cur += 1
+                    if prefix & 0x80:
+                        note = blob[cur] if prefix & 0x01 else 0
+                        if prefix & 0x01: cur += 1
+                        inst = blob[cur] if prefix & 0x02 else 0
+                        if prefix & 0x02: cur += 1
+                        vol  = blob[cur] if prefix & 0x04 else 0
+                        if prefix & 0x04: cur += 1
+                        eff  = blob[cur] if prefix & 0x08 else 0
+                        if prefix & 0x08: cur += 1
+                        par  = blob[cur] if prefix & 0x10 else 0
+                        if prefix & 0x10: cur += 1
+                    else:
+                        # Uncompressed: prefix IS the note byte.
+                        note = prefix
+                        inst = blob[cur]; cur += 1
+                        vol  = blob[cur]; cur += 1
+                        eff  = blob[cur]; cur += 1
+                        par  = blob[cur]; cur += 1
+
+                # Map XM cell → MOD cell.
+                period = _note_to_mod_period(note) if (1 <= note <= 96) else 0
+                # Note 97 = key off — encoded by setting bit 7 of the sample
+                # byte. The engine reads bit 7 to dispatch the active voice
+                # to a ghost (with fadeout-based decay if env is on, hard
+                # cut otherwise). We retain the instrument bits so the
+                # engine can look up the sample's fadeout, but skip the
+                # period (no retrigger).
+                keyoff = (note == 97)
+                # Translate effect.
+                m_eff, m_par = _xm_or_it_effect_to_mod(eff, par, is_xm=True)
+                if eff != 0 and m_eff == 0 and m_par == 0:
+                    self._unsupported_effects += 1
+
+                # Volume column → translate to MOD effect when nothing else
+                # is using the slot. 0x10..0x50 = set volume 0..64.
+                if vol >= 0x10 and vol <= 0x50 and m_eff == 0 and m_par == 0:
+                    m_eff = 0xC
+                    m_par = vol - 0x10
+                # Other volume-column commands (slides, vibrato, panning, etc.)
+                # are dropped in Phase 1 — too many to handle without breaking
+                # the existing single-effect-per-cell engine model.
+
+                samp_byte = inst & 0x1F
+                if keyoff:
+                    samp_byte |= 0x80
+                    period = 0
+                row.append({
+                    'sample': samp_byte,
+                    'period': period,
+                    'effect': m_eff,
+                    'param':  m_par,
+                })
+            rows.append(row)
+        return rows
+
+    def _decode_xm_sample(self, raw, stype):
+        """Δ-decode XM sample data (always delta-encoded). 16-bit samples are
+        downconverted to 8-bit (high byte only) for engine compatibility."""
+        if not raw:
+            return b''
+        out = bytearray()
+        if stype & 0x10:  # 16-bit
+            acc = 0
+            n = len(raw) // 2
+            for i in range(n):
+                d = struct.unpack('<h', raw[i*2:i*2+2])[0]
+                acc = (acc + d) & 0xFFFF
+                if acc >= 0x8000: acc -= 0x10000
+                # downconvert to int8 by taking high byte (signed)
+                hi = (acc >> 8) & 0xFF
+                if hi >= 0x80: hi -= 0x100
+                out.append(hi & 0xFF)
+        else:             # 8-bit
+            acc = 0
+            for b in raw:
+                d = struct.unpack('b', bytes([b]))[0]
+                acc = (acc + d) & 0xFF
+                if acc >= 0x80: acc -= 0x100
+                out.append(acc & 0xFF)
+        return bytes(out)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  IT PARSER (Impulse Tracker — Phase 1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ITFile:
+    """Impulse Tracker .it parser.
+
+    Phase-1 scope: header + samples (8/16-bit, signed/unsigned, IT-packed
+    decompression, NOT stereo) + uncompressed patterns + 'instrument-as-
+    sample' flattening (use sample[0] of each instrument's note-map). IT-
+    specific letter effects translate via the inline IT-effect table (IT inherits
+    S3M's command set 1:1 plus extras we drop). Output object matches
+    MODFile shape — same downstream code path applies.
+    """
+    def __init__(self, filename):
+        self.filename = filename
+        self.title = ""
+        self.num_channels = 0
+        self.num_patterns = 0
+        self.samples = []
+        self.patterns = []
+        self.song_positions = []
+        self.initial_speed = 6
+        self.initial_tempo = 125
+        self.is_s3m = False
+        self._unsupported_effects = 0
+        self._parse(filename)
+
+    def _parse(self, filename):
+        with open(filename, 'rb') as f:
+            blob = f.read()
+        if blob[:4] != b'IMPM':
+            raise ValueError("Not an IT file (missing 'IMPM' signature)")
+
+        # ── Fixed header (192 bytes) ──
+        self.title = blob[4:4+26].rstrip(b'\x00 \r\n').decode('latin-1', errors='ignore')
+        ord_num = struct.unpack_from('<H', blob, 32)[0]
+        ins_num = struct.unpack_from('<H', blob, 34)[0]
+        smp_num = struct.unpack_from('<H', blob, 36)[0]
+        pat_num = struct.unpack_from('<H', blob, 38)[0]
+        cmwt    = struct.unpack_from('<H', blob, 42)[0]
+        # flags   = struct.unpack_from('<H', blob, 44)[0]  # not used Phase 1
+        self.initial_speed = max(1, blob[50])
+        self.initial_tempo = max(32, blob[51])
+        # IT global volume (0..128) and mix volume (0..128). openMPT applies
+        # both as multiplicative gain reducers — mix_vol is the MASTER level
+        # the user set in the tracker UI ("output level"), distinct from
+        # global_vol (which can be slid via 'V' effect during play). For
+        # GADGET.IT mix_vol=48 (~37%) — without applying this, my engine
+        # plays the song ~3× louder than openMPT.
+        self.global_volume = blob[48]    # 0..128 (default 128 = unity)
+        self.mix_volume    = blob[49]    # 0..128 (master/preamp)
+
+        chn_pan = blob[64:128]
+
+        # ── Order list (orders, then sample/pattern offset tables) ──
+        cur = 192
+        orders = list(blob[cur:cur+ord_num])
+        cur += ord_num
+        ins_offsets = struct.unpack_from(f'<{ins_num}I', blob, cur); cur += 4*ins_num
+        smp_offsets = struct.unpack_from(f'<{smp_num}I', blob, cur); cur += 4*smp_num
+        pat_offsets = struct.unpack_from(f'<{pat_num}I', blob, cur); cur += 4*pat_num
+
+        # Channel count: scan all pattern data for the highest channel
+        # index that's actually used. The header pan flags ('disabled bit'
+        # 0x80, 'no channel' 0xFF) are routinely wrong — many IT files
+        # have all 64 channels marked enabled even when only 8-18 are
+        # used. Cap at 32 for the engine. Falls back to the header pan
+        # scan if pre-decoding the patterns fails.
+        try:
+            highest = self._scan_pattern_max_channel(blob, pat_offsets)
+        except Exception:
+            highest = 0
+            for i, p in enumerate(chn_pan):
+                if (p & 0x80) == 0: highest = i + 1
+        self.num_channels = max(4, min(32, highest)) if highest else 4
+        self.channel_settings = [(0 if (chn_pan[i] & 0x40) == 0 else 1)
+                                 for i in range(self.num_channels)]
+        # IT per-channel default pan (0..64; 0=L, 32=center, 64=R). Bit 7
+        # (0x80) is the MUTE flag; values 0..64 use bit 6 (0x40) as part
+        # of the pan value, NOT a flag — masking with 0x3F clips 64 → 0
+        # which silently broke channels panned hard-right. Use 0x7F.
+        self.channel_pan = [chn_pan[i] & 0x7F for i in range(self.num_channels)]
+
+        self.song_positions = [b for b in orders
+                                if b not in (0xFE, 0xFF) and b < pat_num]
+        if not self.song_positions:
+            self.song_positions = [0]
+        self.num_patterns = pat_num
+
+        # ── Instrument headers (cmwt >= 0x200 = "new" format) ──
+        # We extract NNA, DCT, DCA, fadeout and the note→sample table.
+        # Older IT files (cmwt < 0x200) and "sample-mode" files (no
+        # IMPI signature at the offset) get a default identity inst→
+        # sample mapping with NNA=cut. inst_table is keyed 1-based to
+        # match pattern cell instrument numbers.
+        self.inst_table = {}
+        if cmwt >= 0x200 and ins_num > 0:
+            for i, off in enumerate(ins_offsets):
+                if off == 0 or off + 64 > len(blob): continue
+                if blob[off:off+4] != b'IMPI': continue
+                nna     = blob[off+17]                                      # 0=cut 1=cont 2=noteoff 3=notefade
+                dct     = blob[off+18]                                      # 0=off 1=note 2=sample 3=instrument
+                dca     = blob[off+19]                                      # 0=cut 1=noteoff 2=notefade
+                fadeout = struct.unpack_from('<H', blob, off+20)[0]
+                # IMPI offset +24: GlobalVolume (0..128, default 128). Per
+                # IT spec, the played voice volume is sample.vol * inst.gv /
+                # 128. Without this, openMPT-mixed instruments at GV=90 (=
+                # 70%) play at 100% in our engine, contributing to the
+                # uniformly-loud-mix problem on songs like GADGET.IT.
+                inst_gv = blob[off+24] if off+24 < len(blob) else 128
+                # Note→sample mapping at offset 64: 120 entries × (note,sample)
+                # Each entry is 2 bytes: [byte0=transposed note, byte1=sample].
+                n2s = [blob[off + 64 + n*2 + 1] for n in range(120)]   # sample
+                n2n = [blob[off + 64 + n*2 + 0] for n in range(120)]   # transposed note
+                inst_name = blob[off+32:off+58].rstrip(b'\x00 \r\n').decode('latin-1', errors='ignore')
+                # ── IT volume envelope ──────────────────────────────────
+                # IMPI@+304: Volume envelope (82 bytes). Layout:
+                #   @0  Flg (bit0=on, bit1=loop, bit2=sustain)
+                #   @1  Num (point count, 0..25)
+                #   @2  LpB / @3 LpE (loop begin/end point INDICES)
+                #   @4  SLB / @5 SLE (sustain loop begin/end point INDICES)
+                #   @6.. 25 nodes × 3 bytes (UBYTE value, UWORD tick LE)
+                # Without parsing this, instruments named "Sinewave-envelope"
+                # (gadget.it inst 27) play with no env shape — every staccato
+                # note hits at full vol with no release tail, the same XM
+                # symptom from earlier. Reuse the engine's XM envelope path.
+                env_pts = []
+                env_on = env_sus = env_loop = False
+                env_sus_pt = env_loop_st = env_loop_en = 0
+                # IMPI envelope offsets (mikIT mmod_it1.cpp ITINSTRUMENT::Load):
+                # IMPI@4..16 filename, @17..30 NNA/DCT/DCA/FadeOut/PPS/PPC/
+                # GbV/DfP/RV/RP/TrkVers/NoS, @31 pad, @32..57 name, @58..63 pad,
+                # @64..303 notesample (120×2), @304..385 VOL ENV, @386..467 PAN
+                # ENV, @468..549 PITCH ENV. Each envelope is 82 bytes:
+                #   @0 Flg, @1 Num, @2 LpB, @3 LpE, @4 SLB, @5 SLE,
+                #   @6.. 25 nodes × 3 bytes (UBYTE value, UWORD tick LE),
+                #   @81 trailing pad.
+                env_off = off + 304   # IMPI vol-env start (mikIT spec)
+                env_sus_en = 0   # IT-only: sustain loop END point (SLE)
+                if env_off + 82 <= len(blob):
+                    flg = blob[env_off + 0]
+                    num = blob[env_off + 1]
+                    if (flg & 0x01) and num > 0:
+                        env_on        = True
+                        env_loop      = bool(flg & 0x02)
+                        env_sus       = bool(flg & 0x04)
+                        env_loop_st   = blob[env_off + 2]
+                        env_loop_en   = blob[env_off + 3]
+                        # IT sustain is a LOOP between SLB and SLE points,
+                        # not a single hold (mikIT mmod_it1.cpp:228 — when
+                        # tick > SLE, tick=SLB while keyOn). Store both.
+                        env_sus_pt    = blob[env_off + 4]    # SLB
+                        env_sus_en    = blob[env_off + 5]    # SLE
+                        # 25 points × 3 bytes; only Num are valid
+                        for p in range(min(num, 25)):
+                            v = blob[env_off + 6 + p*3 + 0]   # signed-ish 0..64 for vol
+                            t = struct.unpack_from('<H', blob, env_off + 6 + p*3 + 1)[0]
+                            env_pts.append([t, v])
+                self.inst_table[i+1] = dict(
+                    name=inst_name, nna=nna, dct=dct, dca=dca,
+                    fadeout=fadeout, note_to_sample=n2s, note_to_note=n2n,
+                    global_volume=inst_gv,
+                    env_pts=env_pts, env_on=env_on, env_sus=env_sus,
+                    env_loop=env_loop, env_sus_pt=env_sus_pt,
+                    env_sus_en=env_sus_en,
+                    env_loop_st=env_loop_st, env_loop_en=env_loop_en,
+                )
+
+        # ── Samples ──
+        # Each sample is loaded into a MOD slot; we cap at 31 sample slots
+        # (engine constraint). NNA/DCT/DCA/fadeout are inherited from the
+        # FIRST instrument that references each sample via its note→sample
+        # table — sufficient for engine-side per-sample NNA dispatch.
+        self.samples = [self._empty_sample() for _ in range(31)]
+        slot_count = min(smp_num, 31)
+        warn_skipped = max(0, smp_num - 31)
+        compressed_skipped = 0
+        for s_i in range(smp_num):
+            so = smp_offsets[s_i]
+            if so == 0 or so + 80 > len(blob):
+                continue
+            if blob[so:so+4] != b'IMPS':
+                continue
+            sname  = blob[so+20:so+20+26].rstrip(b'\x00 \r\n').decode('latin-1', errors='ignore')
+            flags  = blob[so+18]
+            vol    = blob[so+19]
+            cvt    = blob[so+46]
+            length = struct.unpack_from('<I', blob, so+48)[0]
+            loop_b = struct.unpack_from('<I', blob, so+52)[0]
+            loop_e = struct.unpack_from('<I', blob, so+56)[0]
+            c5spd  = struct.unpack_from('<I', blob, so+60)[0]
+            data_off = struct.unpack_from('<I', blob, so+72)[0]
+
+            is_16bit    = bool(flags & 0x02)
+            is_compressed = bool(flags & 0x08)
+            is_signed   = bool(cvt & 0x01)
+            is_stereo   = bool(flags & 0x04)
+            has_loop    = bool(flags & 0x10)
+            byte_per_samp = 2 if is_16bit else 1
+            channels    = 2 if is_stereo else 1
+
+            if is_stereo:
+                # Phase 1: skip stereo samples (rare; would need L+R merge)
+                compressed_skipped += 1
+                continue
+            if length == 0 or data_off == 0:
+                continue
+            # Read raw / decompress
+            if is_compressed:
+                raw_decoded = self._read_it_compressed_sample(
+                    blob, data_off, length, is_16bit, cmwt >= 0x215)
+            else:
+                # Uncompressed: data_off is absolute byte offset into file.
+                # Length is in SAMPLES (not bytes) for IT.
+                nbytes = length * byte_per_samp
+                raw = blob[data_off:data_off+nbytes]
+                raw_decoded = self._read_it_uncompressed_sample(
+                    raw, length, is_16bit, is_signed)
+
+            # Downconvert 16-bit → 8-bit (signed) for engine compatibility.
+            int8_data = bytearray()
+            if is_16bit:
+                for v in raw_decoded:
+                    if v >= 0x8000: v -= 0x10000
+                    hi = (v >> 8)
+                    if hi < -128: hi = -128
+                    if hi > 127: hi = 127
+                    int8_data.append(hi & 0xFF)
+            else:
+                # raw_decoded is already 16-bit shifted (left << 8) by the
+                # decoder for uniformity — take high byte.
+                for v in raw_decoded:
+                    if v >= 0x8000: v -= 0x10000
+                    hi = (v >> 8)
+                    if hi < -128: hi = -128
+                    if hi > 127: hi = 127
+                    int8_data.append(hi & 0xFF)
+
+            ftune_nibble = _it_c5speed_to_mod_nibble(c5spd)
+
+            # IT loop range is in samples; if no loop, clear.
+            if not has_loop:
+                loop_b = 0
+                loop_e = 0
+            loop_len = max(0, loop_e - loop_b)
+
+            if s_i < slot_count:
+                self.samples[s_i] = {
+                    'name': sname, 'length': length, 'finetune': ftune_nibble,
+                    'volume': min(vol, 64), 'repeat_point': loop_b,
+                    'repeat_length': loop_len,
+                    'data': np.frombuffer(bytes(int8_data), dtype=np.int8),
+                    '_xm_rel_note': 0,
+                    # NNA fields populated by the annotation pass below.
+                    'nna': 0, 'dct': 0, 'dca': 0, 'fadeout': 0,
+                    # Raw IT c5_speed — engine prefers this over the lossy
+                    # finetune-nibble lookup. Many IT samples (drums, leads,
+                    # sinewaves) ship with c5_speed far above MOD's 8000-8800
+                    # finetune range; the table-lookup path squashed them by
+                    # multiple octaves. Engine uses `c5_speed * 428 / period`
+                    # directly when this field is present and >0.
+                    'c5_speed': c5spd,
+                    # XM/IT envelope fields — populated from instrument
+                    # data during annotation pass below. Empty here so
+                    # samples without an instrument-driven envelope behave
+                    # as straight-through (full vol, no release tail).
+                    'env_pts': [], 'env_sus': False, 'env_loop': False,
+                    'env_sus_pt': 0, 'env_sus_en': 0,
+                    'env_loop_st': 0, 'env_loop_en': 0,
+                }
+
+        # ── Annotate samples with NNA/DCT/DCA/fadeout + apply inst gvol ──
+        # For each instrument, look at every (note → sample) entry; when a
+        # sample is referenced by an instrument, copy that instrument's
+        # NNA settings AND apply its global volume to the sample's default
+        # volume. When multiple instruments reference the same sample
+        # (e.g. GADGET.IT has both inst 17 "Sinewave" with NO envelope and
+        # inst 27 "Sinewave-envelope" both pointing to sample 17), prefer
+        # the instrument that actually carries an envelope or fadeout —
+        # otherwise the song-critical envelope gets silently dropped and
+        # the sinewave plays as a continuous tone forever (Inspector Gadget
+        # main melody → suspended low tone bug).
+        # Sort: env-bearing instruments first, then by fadeout, then by idx
+        # for determinism.
+        _ord_insts = sorted(
+            self.inst_table.items(),
+            key=lambda kv: (
+                -int(bool(kv[1].get('env_on') and kv[1].get('env_pts'))),
+                -int(kv[1].get('fadeout', 0)),
+                kv[0]))
+        _annotated = set()
+        for inst_idx, inst in _ord_insts:
+            inst_gv = inst.get('global_volume', 128)
+            for samp_n in inst['note_to_sample']:
+                if 1 <= samp_n <= 31 and samp_n not in _annotated:
+                    s = self.samples[samp_n - 1]
+                    if s['nna'] == 0 and s['dct'] == 0 and s['fadeout'] == 0:
+                        s['nna']     = inst['nna']
+                        s['dct']     = inst['dct']
+                        s['dca']     = inst['dca']
+                        s['fadeout'] = inst['fadeout']
+                    # Scale sample default volume by instrument global vol
+                    # (IT spec: voice_vol = sample.vol * inst.gv / 128).
+                    if inst_gv < 128 and s['volume'] > 0:
+                        s['volume'] = max(1, (s['volume'] * inst_gv) // 128)
+                    # Copy envelope from instrument if active. The engine
+                    # already has the per-tick env-advance + sustain-loop
+                    # path used for XM; this just hands IT data to it.
+                    if inst.get('env_on') and inst.get('env_pts'):
+                        s['env_pts']     = inst['env_pts']
+                        s['env_sus']     = inst.get('env_sus', False)
+                        s['env_loop']    = inst.get('env_loop', False)
+                        s['env_sus_pt']  = inst.get('env_sus_pt', 0)
+                        s['env_sus_en']  = inst.get('env_sus_en', 0)
+                        s['env_loop_st'] = inst.get('env_loop_st', 0)
+                        s['env_loop_en'] = inst.get('env_loop_en', 0)
+                        # Compute release_factor for the GLSL fallback path
+                        # (used when env can't be simulated stateful).
+                        s['release_factor'] = _compute_xm_release_factor(
+                            inst['env_pts'], inst.get('env_sus_pt', 0))
+                    _annotated.add(samp_n)
+
+        if warn_skipped:
+            print(f"   ⚠️  IT has {smp_num} samples — engine cap is 31; "
+                  f"skipped {warn_skipped} (samples {31}+)")
+        if compressed_skipped:
+            print(f"   ⚠️  IT has {compressed_skipped} stereo sample(s) — "
+                  f"silently dropped (Phase 1)")
+        if self.inst_table:
+            nna_counts = {0:0, 1:0, 2:0, 3:0}
+            for s in self.samples:
+                if s['length'] > 0:
+                    nna_counts[s['nna']] = nna_counts.get(s['nna'], 0) + 1
+            non_cut = nna_counts[1] + nna_counts[2] + nna_counts[3]
+            if non_cut:
+                names = {0:'cut', 1:'continue', 2:'noteoff', 3:'notefade'}
+                summary = ', '.join(f"{names[k]}={v}" for k, v in sorted(nna_counts.items()) if v)
+                print(f"   🎼 IT NNA distribution across samples: {summary}")
+
+        # ── Patterns ──
+        self.patterns = []
+        for pat_i in range(pat_num):
+            po = pat_offsets[pat_i]
+            if po == 0:
+                self.patterns.append(self._empty_pattern(64))
+                continue
+            length = struct.unpack_from('<H', blob, po)[0]
+            num_rows = struct.unpack_from('<H', blob, po+2)[0]
+            data = blob[po+8:po+8+length]
+            pat = self._decode_pattern(data, num_rows)
+            # Engine wants 64 rows per pattern.
+            if len(pat) > 64:
+                pat = pat[:64]
+            elif len(pat) < 64:
+                empty_row = [{'sample':0,'period':0,'effect':0,'param':0}
+                             for _ in range(self.num_channels)]
+                pat = pat + [list(empty_row) for _ in range(64 - len(pat))]
+            self.patterns.append(pat)
+
+        if self._unsupported_effects:
+            print(f"   ⚠️  IT had {self._unsupported_effects} effect cells "
+                  f"with no MOD equivalent — silently dropped (Phase 1)")
+
+    @staticmethod
+    def _empty_sample(name=""):
+        return {
+            'name': name, 'length': 0, 'finetune': 0, 'volume': 64,
+            'repeat_point': 0, 'repeat_length': 0,
+            'data': np.zeros(0, dtype=np.int8),
+            '_xm_rel_note': 0,
+            # NNA-related metadata. Default = cut (matches MOD/S3M/XM
+            # implicit behaviour). For IT, these get overwritten with the
+            # owning instrument's values during the inst→sample annotation
+            # pass after sample loading.
+            'nna': 0,        # 0=cut 1=continue 2=noteoff 3=notefade
+            'dct': 0,        # 0=off 1=note 2=sample 3=instrument
+            'dca': 0,        # 0=cut 1=noteoff 2=notefade
+            'fadeout': 0,    # 0..1024; per-tick voice attenuation = fadeout/512
+        }
+
+    def _empty_pattern(self, num_rows):
+        empty_row = [{'sample':0,'period':0,'effect':0,'param':0}
+                     for _ in range(self.num_channels)]
+        return [list(empty_row) for _ in range(num_rows)]
+
+    @staticmethod
+    def _scan_pattern_max_channel(blob, pat_offsets):
+        """Walk all patterns' raw byte streams and return (max channel
+        index used + 1). Doesn't decode cells fully — just follows the
+        IT channel-mask compression to advance the cursor correctly so
+        we can spot the highest channel byte. Cheap upfront pass."""
+        max_ch = 0
+        last_mask = [0] * 64
+        for po in pat_offsets:
+            if po == 0 or po + 8 > len(blob): continue
+            length = struct.unpack_from('<H', blob, po)[0]
+            data = blob[po+8:po+8+length]
+            n = len(data); cur = 0
+            # Reset per-pattern caches (mask is per-channel, scoped to pattern)
+            for i in range(64): last_mask[i] = 0
+            while cur < n:
+                c = data[cur]; cur += 1
+                if c == 0: continue          # row terminator
+                ch = (c - 1) & 0x3F
+                if ch + 1 > max_ch: max_ch = ch + 1
+                if c & 0x80:
+                    if cur >= n: break
+                    mask = data[cur]; cur += 1
+                    last_mask[ch] = mask
+                else:
+                    mask = last_mask[ch]
+                # Skip the field bytes per mask bits (1=note, 2=inst,
+                # 4=vol, 8=fx pair). Don't read them — just advance.
+                if mask & 0x01: cur += 1
+                if mask & 0x02: cur += 1
+                if mask & 0x04: cur += 1
+                if mask & 0x08: cur += 2
+        return max_ch
+
+    def _decode_pattern(self, data, num_rows):
+        """Decode IT compressed pattern stream into [row][ch] cells.
+
+        See IT agent report §3 — channel-mask byte with bit-7 'reuse last
+        mask' optimization.
+        """
+        rows = self._empty_pattern(num_rows)
+        # Per-channel last-mask + last-data caches (IT's compression trick:
+        # if mask byte has bit-7 set, the LSB-only reuse-last-data flags
+        # come from the cached mask).
+        last_mask = [0] * 64
+        last_note = [0] * 64
+        last_inst = [0] * 64
+        last_vol  = [0] * 64
+        last_eff  = [0] * 64
+        last_par  = [0] * 64
+        # IT effect memory: per-channel last non-zero param for slide/porta
+        # effects that use "continue last" semantics on param=0. PT/MOD A
+        # (vol slide) does NOT have memory (A00 = no slide), but IT's D
+        # (mapped to MOD A) DOES — same for E/F (pitch slides) and G (tone
+        # porta). Without this, IT vol-slide chains like D04 D00 D00 D00
+        # only slide on the first row and the volume curve flattens out.
+        last_D = [0] * 64  # D: vol slide
+        last_E = [0] * 64  # E: porta down
+        last_F = [0] * 64  # F: porta up
+        last_G = [0] * 64  # G: tone porta
+        cur = 0; row = 0
+        n = len(data)
+        while row < num_rows and cur < n:
+            chvar = data[cur]; cur += 1
+            if chvar == 0:
+                row += 1
+                continue
+            ch = (chvar - 1) & 0x3F
+            if chvar & 0x80:
+                if cur >= n: break
+                mask = data[cur]; cur += 1
+                last_mask[ch] = mask
+            else:
+                mask = last_mask[ch]
+            note = inst = vol = eff = par = 0
+            if mask & 0x01:
+                if cur >= n: break
+                note = data[cur]; cur += 1
+                last_note[ch] = note
+            if mask & 0x02:
+                if cur >= n: break
+                inst = data[cur]; cur += 1
+                last_inst[ch] = inst
+            if mask & 0x04:
+                if cur >= n: break
+                vol = data[cur]; cur += 1
+                last_vol[ch] = vol
+            if mask & 0x08:
+                if cur+1 >= n: break
+                eff = data[cur]; par = data[cur+1]; cur += 2
+                last_eff[ch] = eff; last_par[ch] = par
+            if mask & 0x10:
+                note = last_note[ch]
+            if mask & 0x20:
+                inst = last_inst[ch]
+            if mask & 0x40:
+                vol = last_vol[ch]
+            if mask & 0x80:
+                eff = last_eff[ch]; par = last_par[ch]
+
+            if ch >= self.num_channels:
+                continue   # cell is for a channel beyond our cap; skip
+
+            # Translate: IT note 0..119 = note (with 60 = middle C); 254 =
+            # note-cut, 255 = note-off. Map note 0..119 → MOD period; treat
+            # cut/off as Cxx vol=0 if no other effect.
+            period = 0
+            if 0 < note < 120:
+                # IT note 60 = C-5 = native pitch (period 428).
+                # `_note_to_mod_period` is XM-anchored at note 49 (XM C-4 =
+                # native = period 428), so shift IT notes down by 11 (= 60-49)
+                # to put native at the right anchor. Without this, every IT
+                # melody plays one octave too high.
+                period = _note_to_mod_period(note - 11)
+            elif note == 254:
+                # IT note-cut: instant silence regardless of envelope.
+                # Was: only translated to Cxx 0 when eff==0 — silently
+                # dropped the cut whenever the cell had any other effect
+                # (e.g. pat 8 r10 ch0 has note-cut + F.b0 tempo, so the
+                # cut got swallowed and the bass sustained another 14s).
+                # Fix: mark via bit 6 of the sample byte (mirrors the
+                # bit-7 note-off marker), which the engine handles
+                # independently of the effect column. Period also goes
+                # to 0 to suppress retrigger logic.
+                pass   # handled below via samp_byte |= 0x40
+            elif note == 255:
+                # IT note-off: triggers envelope release (NOT instant cut).
+                # We mark this via the same bit-7 sample-byte marker that
+                # the engine already handles for XM key-off — flips keyOn
+                # off so the envelope leaves sustain and fadeout starts.
+                # Without this, every IT note-off cell silenced the voice
+                # immediately, producing the "staccato w/ no reverb tail"
+                # complaint. (For samples without envelopes/fadeout, this
+                # still cuts cleanly — the engine handles that case too.)
+                pass   # handled below via samp_byte |= 0x80
+
+            # ── IT effect memory: substitute last param when param==0 ──
+            # IT semantics for D/E/F/G with param==0 = "continue with last
+            # value". MOD/PT semantics for the equivalent MOD effects A/2/1/3
+            # treat param==0 differently (A00 is no-op, etc.). To bridge,
+            # rewrite IT param=0 cells into IT cells carrying the last
+            # non-zero param BEFORE translating to MOD format.
+            if eff == 4 and par == 0 and last_D[ch] != 0:    # IT D
+                par = last_D[ch]
+            elif eff == 5 and par == 0 and last_E[ch] != 0:  # IT E
+                par = last_E[ch]
+            elif eff == 6 and par == 0 and last_F[ch] != 0:  # IT F
+                par = last_F[ch]
+            elif eff == 7 and par == 0 and last_G[ch] != 0:  # IT G
+                par = last_G[ch]
+            # Save non-zero params into memory for next time.
+            if par != 0:
+                if eff == 4:   last_D[ch] = par
+                elif eff == 5: last_E[ch] = par
+                elif eff == 6: last_F[ch] = par
+                elif eff == 7: last_G[ch] = par
+            m_eff, m_par = _xm_or_it_effect_to_mod(eff, par, is_xm=False)
+            if eff != 0 and m_eff == 0 and m_par == 0:
+                self._unsupported_effects += 1
+
+            # Volume column: 0..64 = set volume (most common). IT vol-col
+            # supports many sub-commands but we only translate plain set-vol
+            # in Phase 1.
+            if 0 < vol <= 64 and m_eff == 0 and m_par == 0:
+                m_eff = 0xC
+                m_par = vol
+
+            # Resolve sample number AND transposed note. In IT instrument-mode
+            # (cmwt >= 0x200), each cell's "instrument" byte is an instrument
+            # index, and `inst.notesample[note]` returns BOTH the sample to
+            # play AND the transposed note to play it at. mikIT formula:
+            #   smp     = inst.notesample[note].sample
+            #   smpnote = inst.notesample[note].note
+            #   frq     = PitchTable[smpnote] * sample.C5Speed / 65536
+            # So the played pitch is determined by the TRANSPOSED note, not
+            # the user-pressed note. Without applying this, IT files that
+            # use note transposition to map drums/leads onto specific sample
+            # regions play every note at the wrong pitch (often whole octaves
+            # off — the "wrong samples + wrong pitch" GADGET.IT symptom).
+            samp_resolved = inst & 0x1F
+            if self.inst_table and 1 <= inst <= 128 and 0 < note < 120:
+                inst_data = self.inst_table.get(inst)
+                if inst_data:
+                    table_samp = inst_data['note_to_sample'][note]
+                    if 1 <= table_samp <= 31:
+                        samp_resolved = table_samp & 0x1F
+                    # Apply note transposition: recompute period from the
+                    # table-resolved smpnote rather than the played note.
+                    table_note = inst_data['note_to_note'][note]
+                    if 0 < table_note < 120 and table_note != note:
+                        period = _note_to_mod_period(table_note - 11)
+
+            # IT note-off (255) and note-cut (254): mark via high bits of
+            # the sample byte so the engine handles them independently of
+            # the effect column. Period also goes to 0 to suppress
+            # retrigger logic.
+            #   bit 7 (0x80) = note-off → envelope release + fadeout
+            #   bit 6 (0x40) = note-cut → instant silence (state.active=false)
+            samp_byte = samp_resolved
+            if note == 255:
+                samp_byte |= 0x80
+                period = 0
+            elif note == 254:
+                samp_byte |= 0x40
+                period = 0
+            rows[row][ch] = {
+                'sample': samp_byte,
+                'period': period,
+                'effect': m_eff,
+                'param':  m_par,
+            }
+        return rows
+
+    def _read_it_uncompressed_sample(self, raw, length, is_16bit, is_signed):
+        """Read uncompressed IT sample data, return list of int16-shifted
+        samples (signed). 8-bit samples are left-shifted by 8 to match the
+        decompressor's output format."""
+        out = []
+        if is_16bit:
+            n = min(length, len(raw)//2)
+            for i in range(n):
+                v = struct.unpack_from('<h', raw, i*2)[0]
+                if not is_signed:
+                    v = (v + 0x8000) & 0xFFFF
+                    if v >= 0x8000: v -= 0x10000
+                out.append(v)
+        else:
+            n = min(length, len(raw))
+            for i in range(n):
+                v = raw[i]
+                if is_signed:
+                    if v >= 0x80: v -= 0x100
+                else:
+                    v -= 128
+                out.append(v << 8)
+        return out
+
+    def _read_it_compressed_sample(self, blob, data_off, length, is_16bit, it215):
+        """Read IT-compressed sample data, decompressing in blocks. IT packs
+        data in chunks of 0x8000 samples (8-bit) or 0x4000 samples (16-bit);
+        each chunk starts with a 16-bit packed-byte count, then `count`
+        bytes of compressed bits.
+        """
+        chunk_samples = 0x4000 if is_16bit else 0x8000
+        out = []
+        cur = data_off
+        remaining = length
+        while remaining > 0 and cur + 2 <= len(blob):
+            packed_count = struct.unpack_from('<H', blob, cur)[0]
+            cur += 2
+            block = blob[cur:cur+packed_count]
+            cur += packed_count
+            n_this = min(remaining, chunk_samples)
+            decoded = _it_decompress_sample(block, n_this, is_16bit, it215)
+            out.extend(decoded[:n_this])
+            remaining -= n_this
+        return out
+
+
 def detect_module_format(filename):
     """Detect module format. Tries signature first, then file extension as
     fallback. Returns 'MOD', 'S3M', 'XM', 'IT', 'STM', 'MTM', or 'UNKNOWN'.
@@ -688,9 +1982,40 @@ def create_fixed_player_html(mod, output_file, downsample=1, compress=False, vec
                 'bw_factor':   bf,
                 'volume':      sample['volume'],
                 'finetune':    sample['finetune'],
-                'name':        sample['name']
+                'name':        sample['name'],
+                # NNA per-sample fields (default 0/0/0/0 for non-IT). The
+                # JS engine reads these to dispatch on note trigger:
+                # nna=1 (continue) and nna=3 (notefade) move the OLD voice
+                # to a ghost slot instead of cutting it. nna=2 (noteoff)
+                # falls back to notefade since we have no envelope release.
+                'nna':         sample.get('nna', 0),
+                'dct':         sample.get('dct', 0),
+                'dca':         sample.get('dca', 0),
+                'fadeout':     sample.get('fadeout', 0),
+                # XM volume envelope (empty for non-XM and env-off XM).
+                # env_pts is a list of [x, y] pairs; engine advances env_x
+                # by 1 per tick, holds at sus_pt while keyOn, loops between
+                # loop_st_pt and loop_en_pt if env_loop is set.
+                'env_pts':     sample.get('env_pts', []),
+                'env_sus':     sample.get('env_sus', False),
+                'env_loop':    sample.get('env_loop', False),
+                'env_sus_pt':  sample.get('env_sus_pt', 0),
+                # IT-only: sustain LOOP end-point index. For XM where
+                # sustain is a single hold, this stays 0 and the engine
+                # treats env_sus_pt as the hold point. For IT, env_sus_en
+                # marks the OTHER end of the sustain loop range.
+                'env_sus_en':  sample.get('env_sus_en', 0),
+                'env_loop_st': sample.get('env_loop_st', 0),
+                'env_loop_en': sample.get('env_loop_en', 0),
+                # IT c5_speed (Hz at MOD period 428 = IT C-5). When > 0 the
+                # engine uses this directly in periodToFreq instead of the
+                # MOD finetune-nibble lookup. IT samples often have c5_speed
+                # values (drums @ 33000 Hz, sinewaves @ 168000 Hz) far above
+                # the finetune-table range (~7895-8757 Hz), and squashing
+                # them through that table drops their pitch by 2-4 octaves.
+                'c5_speed':    sample.get('c5_speed', 0),
             })
-            
+
             all_samples.extend(data_float.tolist())
             individual_samples.append(compressed.tolist())
             current_pos += len(data_float)
@@ -698,7 +2023,8 @@ def create_fixed_player_html(mod, output_file, downsample=1, compress=False, vec
             sample_map.append({
                 'index': i, 'start': 0, 'length': 0,
                 'loop_start': 0, 'loop_length': 0, 'bw_factor': 1,
-                'volume': 0, 'finetune': 0, 'name': ''
+                'volume': 0, 'finetune': 0, 'name': '',
+                'nna': 0, 'dct': 0, 'dca': 0, 'fadeout': 0,
             })
             individual_samples.append([])
     
@@ -801,12 +2127,13 @@ function decompressPatterns(compressed) {
         }
     }
     
-    console.log('Decompressed bytes:', decompressed.length, 'expected:', modData.numPatterns * 64 * 4 * 5);
-    
+    const _nc = modData.numChannels || 4;
+    console.log('Decompressed bytes:', decompressed.length, 'expected:', modData.numPatterns * 64 * _nc * 5);
+
     // Reconstruct pattern objects
     const patterns = [];
     let offset = 0;
-    const totalNotes = modData.numPatterns * 64 * 4;
+    const totalNotes = modData.numPatterns * 64 * _nc;
     
     for (let n = 0; n < totalNotes && offset + 4 < decompressed.length; n++) {
         patterns.push({
@@ -1055,8 +2382,16 @@ const modData = {{
     songLength: {len(mod.song_positions)},
     songPositions: {json.dumps(mod.song_positions)},
     numPatterns: {mod.num_patterns},
+    numChannels: {num_channels},
     initialBPM: {mod.initial_tempo},
     initialSpeed: {mod.initial_speed},
+    // IT global/mix volume (0..128). Defaults to 128 for non-IT formats
+    // (no attenuation). Engine multiplies output by (gv*mv)/(128*128).
+    globalVol: {getattr(mod, 'global_volume', 128)},
+    mixVol:    {getattr(mod, 'mix_volume', 128)},
+    // IT per-channel default pan (0..64). Empty for non-IT formats; in
+    // that case the engine falls back to MOD-style ch%4 LRRL panning.
+    channelPan: {json.dumps(list(getattr(mod, 'channel_pan', [])))},
     bassSamples: {json.dumps(_html_bass_idx)},
     {data_fields},
     samples: {chunk_concat},
@@ -1197,7 +2532,11 @@ class Only3D {{
 class AdaptiveLimiter {{
     constructor(sampleRate) {{
         this.sr             = sampleRate;
-        this.maxLimit       = 0.995;
+        // Loud mode: push the limiter ceiling far above unity so it only
+        // engages on catastrophic peaks (FAT4X bursts). The downstream
+        // post-limiter makeup gain + hard-clip stage handles the rest,
+        // pinning the signal against ±1 for maximum perceived loudness.
+        this.maxLimit       = 1.50;
         this.baseAttackMs   = 8.0;
         this.minAttackMs    = 1.0;
         this.baseReleaseMs  = 80.0;
@@ -1258,21 +2597,41 @@ class MODPlayer {{
         
         for (let i = 0; i < this.numChannels; i++) {{
             this.channels.push({{
-                sample: 0, period: 0, basePeriod: 0, samplePos: 0.0, 
+                sample: 0, period: 0, basePeriod: 0, samplePos: 0.0,
                 volume: 64, active: false,
                 effect: 0, effectParam: 0, targetPeriod: 0, vibratoPos: 0, vibratoSpeed: 1, vibratoDepth: 0, arpeggioCounter: 0,
                 volumeFade: 1.0, volumeFadeInc: 0, targetVolume: 1.0,
                 currentVolume: 64, targetVolume2: 64, volumeRampInc: 0, volumeRamping: false,
                 mixVol: 0, volInc: 0,
-                loopbackPoint: 0, loopCount: 0, _delayedNote: null
+                loopbackPoint: 0, loopCount: 0, _delayedNote: null,
+                // XM volume envelope state. envX is the current envelope-x
+                // position in player ticks. keyOn=true while sustaining,
+                // false after key-off. volFade is the 16-bit fixedpoint
+                // fadeout multiplier (65536 = full, 0 = silent); only
+                // decrements when keyOn=false. envFin=true means env has
+                // reached its final point (no further advancement).
+                envX: 0, keyOn: true, volFade: 65536, envFin: false,
+                // ── NNA ghost voice array ───────────────────────────────
+                // Up to 4 "ghost" voices per channel that keep playing
+                // after a new note triggers, when the OLD sample's NNA
+                // is `continue` (1) or `notefade` (3). Each ghost holds
+                // a frozen snapshot of the previous voice (sample,
+                // period, volume, samplePos) plus a fadeAmt that
+                // attenuates the volume by `fadeAmt/512` per tick when
+                // non-zero (notefade and noteoff modes).
+                ghostVoices: [],
             }});
-            
+
             // Dying channel for crossfade (matches C++ dying[] array)
             this.dyingChannels.push({{
                 sample: 0, period: 0, samplePos: 0.0, volume: 64, active: false,
                 volumeFade: 0, volumeFadeInc: 0, samplesLeft: 0
             }});
         }}
+        // Max ghost voices kept alive per channel before the oldest gets
+        // evicted. 4 is enough for typical IT NNA songs (drum stacking,
+        // pad bloom). Higher = more polyphony but more shader/CPU cost.
+        this._maxGhosts = 4;
         
         // Song position
         this.currentPattern = 0;
@@ -1311,12 +2670,19 @@ class MODPlayer {{
     
     // Finetune table from mikIT (C4 playback speed for each of 16 finetune values)
     // finetune nibble 0-7 = positive (higher pitch), 8-15 = negative (lower pitch)
-    periodToFreq(period, finetune) {{
+    // For IT samples we prefer raw c5_speed (passed via the 3rd arg) over
+    // the 16-entry table, since IT files routinely use c5_speed values
+    // (drums @ 33000 Hz, sinewaves @ 168000 Hz, leads @ 19800 Hz) that
+    // can't be represented by MOD's finetune nibble at all.
+    periodToFreq(period, finetune, c5_speed) {{
         if (period === 0) return 0;
+        if (c5_speed && c5_speed > 0) {{
+            return (c5_speed * 428) / period;
+        }}
         const c4speeds = [8363,8413,8463,8529,8581,8651,8723,8757,
                           7895,7941,7985,8046,8107,8169,8232,8280];
         const c4 = c4speeds[(finetune || 0) & 0xF];
-        return (c4 * 428) / period;  // 428 = period for middle C (C-3) at standard tuning
+        return (c4 * 428) / period;
     }}
     
     getSampleData(sampleIdx, position) {{
@@ -1342,14 +2708,31 @@ class MODPlayer {{
         const base = info.start;
         
         const looping = info.loop_length > 2;
+        // Wrap any cubic-tap index back into the legal range. For looping
+        // samples, taps that fall before loop_start or at/after loop_end
+        // must wrap THROUGH the loop boundary so the interpolation stays
+        // continuous — otherwise p2/p3 read past the loop end into
+        // unrelated bytes, producing a hard discontinuity once per loop
+        // cycle (= audible high-harmonic buzz). For non-looping samples,
+        // clamp to [0, length-1] so we don't read past the sample.
+        const loopEnd = info.loop_start + info.loop_length;
         const wrap = (i) => {{
-            if (looping && i < info.loop_start) return info.loop_start + info.loop_length - 1;
-            return Math.max(0, i);
+            if (looping) {{
+                if (i < info.loop_start) {{
+                    const off = ((i - info.loop_start) % info.loop_length + info.loop_length) % info.loop_length;
+                    return info.loop_start + off;
+                }}
+                if (i >= loopEnd) {{
+                    return info.loop_start + (i - info.loop_start) % info.loop_length;
+                }}
+                return i;
+            }}
+            return Math.max(0, Math.min(i, info.length - 1));
         }};
         const p0 = modData.samples[base + wrap(pos0 - 1)];
-        const p1 = modData.samples[base + pos0];
-        const p2 = modData.samples[base + pos0 + 1];
-        const p3 = modData.samples[base + pos0 + 2];
+        const p1 = modData.samples[base + wrap(pos0)];
+        const p2 = modData.samples[base + wrap(pos0 + 1)];
+        const p3 = modData.samples[base + wrap(pos0 + 2)];
         
         const a = -0.5*p0 + 1.5*p1 - 1.5*p2 + 0.5*p3;
         const b =      p0 - 2.5*p1 + 2.0*p2 - 0.5*p3;
@@ -1358,35 +2741,290 @@ class MODPlayer {{
     }}
     
     getNote(pattern, row, channel) {{
-        const idx = (pattern * 64 * 4) + (row * 4) + channel;
+        const nc = this.numChannels;
+        const idx = (pattern * 64 * nc) + (row * nc) + channel;
         return modData.patterns[idx] || {{ sample: 0, period: 0, effect: 0, param: 0 }};
+    }}
+
+    // ── NNA dispatch: convert old voice to a ghost ────────────────────────
+    // Called BEFORE overwriting channel state on a new note trigger. Reads
+    // the OLD sample's NNA byte (set in modData.sampleMap[i].nna by the IT
+    // parser; defaults to 0=cut for MOD/S3M/XM):
+    //   0 cut       → no ghost; old voice silenced (current default)
+    //   1 continue  → ghost with no fade (drum stacking, percussion)
+    //   2 noteoff   → ghost with fade (no envelope release in Phase 2 —
+    //                  approximated by treating like notefade)
+    //   3 notefade  → ghost with fade rate fadeout/512 per tick
+    _dispatchNNA(ch) {{
+        const state = this.channels[ch];
+        if (!state.active || state.sample < 0 || state.volume <= 0) return;
+        const oldInfo = modData.sampleMap[state.sample];
+        if (!oldInfo) return;
+        const nna = oldInfo.nna || 0;
+        if (nna === 0) return;     // cut — fall through to retrigger as before
+        // Build a frozen snapshot ghost.
+        const ghost = {{
+            sample:     state.sample,
+            period:     state.period,
+            basePeriod: state.basePeriod,
+            samplePos:  state.samplePos,
+            volume:     state.volume,
+            mixVol:     state.mixVol,
+            // Per-tick volume decrement when non-zero (notefade/noteoff).
+            // fadeout=64 ⇒ 1 unit/tick → ~1s to silence at typical speed.
+            fadeAmt:    (nna === 1) ? 0 : ((oldInfo.fadeout || 64) / 512.0 * 64.0),
+            active:     true,
+        }};
+        if (state.ghostVoices.length >= this._maxGhosts) {{
+            state.ghostVoices.shift();   // FIFO eviction of the oldest
+        }}
+        state.ghostVoices.push(ghost);
+    }}
+
+    // ── DCT (Duplicate Check Type) on incoming note ───────────────────────
+    // Scan ghosts across ALL channels for matches against the NEW note's
+    // sample/note, then apply DCA (Duplicate Check Action). Implemented
+    // per per-sample DCT/DCA byte (the IT parser annotates these).
+    //   DCT: 0=off 1=note 2=sample 3=instrument (we map inst→sample 1:1)
+    //   DCA: 0=cut 1=noteoff 2=notefade
+    _applyDCT(newSample, newPeriod) {{
+        const newInfo = modData.sampleMap[newSample];
+        if (!newInfo) return;
+        const dct = newInfo.dct || 0;
+        if (dct === 0) return;
+        const dca = newInfo.dca || 0;
+        for (let ch = 0; ch < this.numChannels; ch++) {{
+            const st = this.channels[ch];
+            for (let i = st.ghostVoices.length - 1; i >= 0; i--) {{
+                const g = st.ghostVoices[i];
+                if (!g.active) continue;
+                let match = false;
+                if (dct === 1 && g.period === newPeriod)  match = true;   // by note
+                if (dct === 2 && g.sample === newSample)  match = true;   // by sample
+                if (dct === 3 && g.sample === newSample)  match = true;   // by instrument (proxy)
+                if (!match) continue;
+                if (dca === 0) {{
+                    st.ghostVoices.splice(i, 1);                          // cut
+                }} else {{
+                    g.fadeAmt = ((newInfo.fadeout || 64) / 512.0) * 64.0; // notefade/noteoff fallback
+                }}
+            }}
+        }}
+    }}
+
+    // ── XM volume envelope: linear-interpolate y at env_x ────────────────
+    // Returns the y value (0..64) interpolated between adjacent envelope
+    // points. Clamps to first/last point's y outside the range.
+    _xmEnvLookup(info, envX) {{
+        const pts = info.env_pts;
+        if (pts.length === 0) return 64;
+        if (envX <= pts[0][0]) return pts[0][1];
+        if (envX >= pts[pts.length - 1][0]) return pts[pts.length - 1][1];
+        for (let i = 0; i < pts.length - 1; i++) {{
+            const [x0, y0] = pts[i], [x1, y1] = pts[i + 1];
+            if (envX >= x0 && envX <= x1) {{
+                const t = x1 === x0 ? 0 : (envX - x0) / (x1 - x0);
+                return y0 + (y1 - y0) * t;
+            }}
+        }}
+        return pts[pts.length - 1][1];
+    }}
+
+    // ── Per-tick envelope advance + fadeout ───────────────────────────────
+    // Advances each active voice's envX by 1 tick, honouring sustain (env
+    // pauses at sus_pt while keyOn) and loop (jump from loop_en back to
+    // loop_st when reached). After key-off, decrements volFade by
+    // 2*fadeout per tick (mikIT/openMPT XM convention).
+    _advanceEnvelopes() {{
+        for (let ch = 0; ch < this.numChannels; ch++) {{
+            const state = this.channels[ch];
+            if (!state.active) continue;
+            const info = modData.sampleMap[state.sample];
+            if (!info) continue;
+
+            const pts = info.env_pts;
+            if (pts && pts.length >= 2 && !state.envFin) {{
+                const susPt  = info.env_sus_pt | 0;
+                const susEn  = info.env_sus_en | 0;       // IT: sustain LOOP end
+                const lpStPt = info.env_loop_st | 0;
+                const lpEnPt = info.env_loop_en | 0;
+                const susStX = pts[Math.min(susPt,  pts.length - 1)][0];
+                const susEnX = pts[Math.min(susEn,  pts.length - 1)][0];
+                const lpStX  = pts[Math.min(lpStPt, pts.length - 1)][0];
+                const lpEnX  = pts[Math.min(lpEnPt, pts.length - 1)][0];
+
+                // mikIT IT semantics (mmod_it1.cpp:228 ITPROCESS::Process):
+                //   tick++;
+                //   if (keyon && env_sus): if (tick > SLE) tick = SLB
+                //   else if (env_loop):    if (tick > LpE) tick = LpB
+                //   if (tick > Lst):       tick = Lst, env DONE
+                // For XM, sustain is a single hold point — represented as
+                // SLB == SLE so the wrap is a no-op (tick stays clamped at
+                // SLE = the hold point). This unified form covers both.
+                let nextX = state.envX + 1;
+                if (info.env_sus && state.keyOn && nextX > susEnX) {{
+                    nextX = susStX;
+                }} else if (info.env_loop && nextX > lpEnX && lpEnX > lpStX) {{
+                    nextX = lpStX;
+                }} else if (nextX > pts[pts.length - 1][0]) {{
+                    nextX = pts[pts.length - 1][0];
+                    state.envFin = true;
+                }}
+                state.envX = nextX;
+
+                // Envelope-end deactivation. When the envelope has finished
+                // at its final point AND that point's y is 0 (a "release-
+                // to-silence" tail), mark the voice inactive. Without this,
+                // the channel keeps mixing sample × envMul=0 forever — a
+                // numerical no-op, but it also keeps the underlying sample
+                // loop running and prevents the slot from being reclaimed.
+                // Matches openMPT/mikIT behavior: an env that ends at 0
+                // fully kills the voice. Fixes GADGET.IT inst 27
+                // "Sinewave-envelope" leaking a sustained sinewave loop
+                // past the envelope's natural end.
+                if (state.envFin && pts[pts.length - 1][1] === 0) {{
+                    state.active = false;
+                }}
+            }}
+
+            // Fadeout: only after key-off, decrements volFade by 2*fadeout
+            // per tick. When volFade hits 0 the voice goes silent and is
+            // marked inactive.
+            if (!state.keyOn) {{
+                const fo = (info.fadeout | 0);
+                if (fo > 0) {{
+                    state.volFade -= 2 * fo;
+                    if (state.volFade <= 0) {{
+                        state.volFade = 0;
+                        state.active = false;
+                    }}
+                }} else if (!info.env_pts || info.env_pts.length < 2) {{
+                    // No env, no fadeout: key-off cuts cleanly.
+                    state.active = false;
+                }}
+            }}
+        }}
+    }}
+
+    // ── Per-tick ghost decay ──────────────────────────────────────────────
+    // Decrement notefade-marked ghost volumes once per tick. Cleanup
+    // exhausted ghosts (volume → 0). Called at the end of processTick.
+    _decayGhosts() {{
+        for (let ch = 0; ch < this.numChannels; ch++) {{
+            const st = this.channels[ch];
+            for (let i = st.ghostVoices.length - 1; i >= 0; i--) {{
+                const g = st.ghostVoices[i];
+                if (g.fadeAmt > 0) {{
+                    g.volume -= g.fadeAmt;
+                    if (g.volume <= 0) {{
+                        st.ghostVoices.splice(i, 1);
+                    }}
+                }} else if (!g.active) {{
+                    st.ghostVoices.splice(i, 1);
+                }}
+            }}
+        }}
     }}
     
     processTick() {{
         const patternIdx = modData.songPositions[this.currentPattern];
-        
+
+        // ── Envelope advance happens BEFORE event processing ──────────────
+        // mikIT/openMPT XM convention: at tick T, the envelope advances
+        // using the keyOn state from tick T-1. Then tick-T events (note
+        // triggers, key-offs) fire. So at the moment of key-off, envX is
+        // still at the sustain point — the release doesn't begin until
+        // tick T+1. Without this ordering, the first release tick fires
+        // one tick early and the perceived envelope drop is too quick.
+        // (Note triggers explicitly reset envX/keyOn/volFade afterwards,
+        // so the advance done here is harmlessly overwritten on retrig.)
+        this._advanceEnvelopes();
+
         // On tick 0, trigger new notes
         if (this.currentTick === 0) {{
-            for (let ch = 0; ch < 4; ch++) {{
+            for (let ch = 0; ch < this.numChannels; ch++) {{
                 const note = this.getNote(patternIdx, this.currentRow, ch);
-                
+
+                // ── IT note-cut: bit 6 of the sample byte signals
+                // "instant silence" (vs note-off bit 7 which only releases
+                // the envelope). Required for cells like GADGET.IT pat 8
+                // r10 ch0 where note=254 lives alongside an F-effect —
+                // the cut MUST fire even when there's a non-empty effect
+                // on the same row, AND the effect itself MUST still run
+                // (e.g. pat 7 r0 ch0 has note-cut + F.59 setting BPM 89,
+                // and skipping the effect leaves the song at 125 BPM —
+                // pat 7 ends up 2× too long, bass line at 0:04 misses).
+                // Cut the voice, then fall through so effect handlers
+                // (and effect-memory updates) at the bottom of this branch
+                // still execute.
+                let _isNoteCut = false;
+                if (note.sample & 0x40) {{
+                    const _state = this.channels[ch];
+                    _state.active = false;
+                    _state.mixVol = 0;
+                    _state.volume = 0;
+                    _state.currentVolume = 0;
+                    _state.volFade = 0;
+                    _state.envFin = true;
+                    _isNoteCut = true;
+                }}
+
+                // ── XM key-off: bit 7 of the sample byte signals "release"
+                // Dispatch the active voice to a ghost (with fadeout-based
+                // decay if the sample has fadeout>0, hard-cut otherwise),
+                // then skip note-trigger logic for this cell. The remaining
+                // bits 0..4 are still a valid sample index — used to look
+                // up fadeout, but never retriggered.
+                if (note.sample & 0x80) {{
+                    // XM key-off: leave the voice playing but flip keyOn
+                    // off so the envelope leaves sustain, and the per-tick
+                    // fadeout begins multiplying volFade down. Voice goes
+                    // silent naturally when volFade hits 0 OR when env
+                    // reaches its end and envelope's final-y value is 0.
+                    // No ghost needed — channel state continues until the
+                    // next note retriggers it.
+                    this.channels[ch].keyOn = false;
+                    continue;
+                }}
+                const noteSample = note.sample & 0x1F;
+
                 // Handle new sample trigger
-                if (note.sample > 0) {{
+                if (noteSample > 0) {{
                     const state = this.channels[ch];
                     this.dyingChannels[ch].active = false;
-                    
+                    // XM cuts any lingering key-off-fade voice on retrigger.
+                    // (IT key-off handling goes through the NNA path which
+                    // produces tagged ghosts of its own — leave those alone.)
+                    for (let gi = state.ghostVoices.length - 1; gi >= 0; gi--) {{
+                        if (state.ghostVoices[gi].xmKeyoff) state.ghostVoices.splice(gi, 1);
+                    }}
+
                     // EDx note delay: stash and trigger x ticks later
                     if (note.effect === 0xE && ((note.param >> 4) & 0xF) === 0xD) {{
                         state._delayedNote = note;
                         // Don't trigger sample now
                     }} else {{
-                        const sampleInfo = modData.sampleMap[note.sample - 1];
-                        state.sample = note.sample - 1;
+                        const sampleInfo = modData.sampleMap[noteSample - 1];
+
+                        // ── NNA dispatch on the OLD voice ─────────────────
+                        // Before overwriting state, check the OLD sample's
+                        // NNA. cut (0) → no ghost. continue (1) → ghost
+                        // with no fade. notefade (3) / noteoff (2) → ghost
+                        // that fades out by fadeout/512 per tick. Tone
+                        // porta keeps the same voice, so skip dispatch.
+                        if (note.effect !== 0x3) {{
+                            this._dispatchNNA(ch);
+                            // DCT: scan ALL channels' ghosts for matches on
+                            // the NEW note's sample/instrument and apply DCA.
+                            this._applyDCT(noteSample - 1, note.period);
+                        }}
+
+                        state.sample = noteSample - 1;
                         state.volume = sampleInfo.volume;
                         state.currentVolume = sampleInfo.volume;
                         state.active = true;
                         state.volumeRamping = false;
-                        
+
                         if (note.effect === 0x3) {{
                             // Tone portamento: keep current position, don't retrigger
                         }} else {{
@@ -1396,10 +3034,15 @@ class MODPlayer {{
                             state.volumeFadeInc = 0;
                             state.targetVolume = 1.0;
                             if (note.effect === 0x9) state.samplePos = note.param * 256;
+                            // XM envelope reset on retrigger.
+                            state.envX = 0;
+                            state.keyOn = true;
+                            state.volFade = 65536;
+                            state.envFin = false;
                         }}
                     }}
                 }}
-                
+
                 // Handle new period (pitch)
                 if (note.period > 0) {{
                     if (note.effect === 0x3) {{
@@ -1412,9 +3055,9 @@ class MODPlayer {{
                         this.channels[ch].targetPeriod = note.period;
                         this.channels[ch].vibratoPos = 0;
                         this.channels[ch].arpeggioCounter = 0;
-                        
+
                         // Period-only (no new sample): retrigger sample from start
-                        if (note.sample === 0 && this.channels[ch].active) {{
+                        if (noteSample === 0 && this.channels[ch].active) {{
                             const state = this.channels[ch];
                             state.samplePos = 0.0;
                             state.mixVol = 0;
@@ -1461,11 +3104,19 @@ class MODPlayer {{
             }}
         }} else {{
             // Process effects on non-zero ticks
-            for (let ch = 0; ch < 4; ch++) {{
+            for (let ch = 0; ch < this.numChannels; ch++) {{
                 this.processEffect(ch, this.channels[ch].effect, this.channels[ch].effectParam, false);
             }}
         }}
-        
+
+        // ── NNA ghost-voice decay ─────────────────────────────────────────
+        // Once per tick, fade notefade-marked ghosts. Continue ghosts
+        // (fadeAmt=0) keep playing until their sample exhausts (handled in
+        // the mixing loop).
+        this._decayGhosts();
+        // (Envelope advance is now at the TOP of processTick — see comment
+        //  there for the ordering rationale.)
+
         // Advance tick — honour Effect B (jump), D (pattern break), E6x (loop), EEx (delay)
         this.currentTick++;
         if (this._patDelayActive && this._patDelayTicks > 0) {{
@@ -1639,6 +3290,15 @@ class MODPlayer {{
                     state.volumeRamping = false;
                 }}
                 break;
+
+            case 0x8: // Set Panning (IT X effect, MOD 8xx). Param 0..FF
+                // where 0=hard L, 0x80=center, 0xFF=hard R. Stored on the
+                // channel state and consumed by the mix loop's per-channel
+                // pan override path. Tick-0 only — no slide variant here.
+                if (tick0) {{
+                    state.panOverride = Math.max(0, Math.min(255, param));
+                }}
+                break;
                 
             case 0xB: // Position Jump
                 if (tick0) {{
@@ -1707,13 +3367,18 @@ class MODPlayer {{
                             if (!tick0 && this.currentTick === val && state._delayedNote) {{
                                 const dn = state._delayedNote;
                                 state._delayedNote = null;
-                                const info = modData.sampleMap[dn.sample - 1];
-                                state.sample = dn.sample - 1;
+                                const dnSample = dn.sample & 0x1F;
+                                const info = modData.sampleMap[dnSample - 1];
+                                state.sample = dnSample - 1;
                                 state.volume = info.volume;
                                 state.currentVolume = info.volume;
                                 state.active = true;
                                 state.samplePos = 0.0;
                                 state.mixVol = 0;
+                                state.envX = 0;
+                                state.keyOn = true;
+                                state.volFade = 65536;
+                                state.envFin = false;
                                 if (dn.period > 0) {{
                                     state.period = dn.period;
                                     state.basePeriod = dn.period;
@@ -1722,7 +3387,16 @@ class MODPlayer {{
                             break;
                         case 0xE: // EEx — Pattern delay: extra ticks per row
                             if (tick0 && !this._patDelayActive) {{
-                                this._patDelayTicks = val * this.speed;
+                                // PT spec: row plays for (1+val) row-times.
+                                // The old `val * speed` was off by one row's
+                                // ticks because the delay decrement runs on
+                                // every tick (including tick 0..speed-1, the
+                                // row's natural time). Initialise with
+                                // (val+1)*speed - 1 so total ticks at this
+                                // row come out to (1+val)*speed exactly.
+                                // Caught with TINYTUNE.MOD pat 32 r49 (EE8
+                                // at speed 15) — was 280 ms short per row.
+                                this._patDelayTicks = (val + 1) * this.speed - 1;
                                 this._patDelayActive = true;
                             }}
                             break;
@@ -1806,6 +3480,14 @@ class MODPlayer {{
             }}
         }}
         
+        // Period clamp. Original 4-channel MOD spec: [113, 856] (3 octaves
+        // around C-2). XM/IT support 10 octaves; their notes routinely
+        // produce periods outside that range. Widen to [13, 13696] for
+        // multi-channel formats (= IT note range C-0 to B-9). 4-channel
+        // MOD keeps the original tight clamp for protracker compatibility.
+        if (this.numChannels > 4) {{
+            return Math.max(13, Math.min(13696, effectivePeriod));
+        }}
         return Math.max(113, Math.min(856, effectivePeriod));
     }}
     
@@ -1830,15 +3512,42 @@ class MODPlayer {{
             const SEP = 0.75;
             const panL_left  = 0.5 + SEP * 0.5;   // 0.875
             const panL_right = 0.5 - SEP * 0.5;   // 0.125
-            const chPanLeft  = [panL_left, panL_right, panL_right, panL_left];
-            const chPanRight = [panL_right, panL_left, panL_left, panL_right];
+            // IT formats supply per-channel default pan in the header (0..64,
+            // 32=center). When present, build pan-left/right arrays from
+            // those values so multi-channel IT files (e.g. GADGET ch4-11
+            // are CENTER not LRRL-cycled). Otherwise fall back to MOD-style
+            // hardcoded ch%4 alternation that matches Amiga panning.
+            let chPanLeft, chPanRight;
+            if (modData.channelPan && modData.channelPan.length >= this.numChannels) {{
+                chPanLeft  = new Array(this.numChannels);
+                chPanRight = new Array(this.numChannels);
+                for (let _ci = 0; _ci < this.numChannels; _ci++) {{
+                    // IT pan 0=hard-L, 32=center, 64=hard-R. Compress around
+                    // SEP so hard-pan still leaves a small bleed (matches
+                    // Amiga 87.5/12.5 ratio at hard pan).
+                    const _pIT = Math.max(0, Math.min(64, modData.channelPan[_ci])) / 64.0;
+                    const _r = panL_right + (panL_left - panL_right) * _pIT;  // 0=0.125, 0.5=0.5, 1=0.875
+                    chPanLeft[_ci]  = 1.0 - _r;
+                    chPanRight[_ci] = _r;
+                }}
+            }} else {{
+                chPanLeft  = [panL_left, panL_right, panL_right, panL_left];
+                chPanRight = [panL_right, panL_left, panL_left, panL_right];
+            }}
             
+            // When the song supplies per-channel pan (IT files), every
+            // channel mixes directly into the cent (= main) bus using its
+            // own pan — the MOD-style surr/cent ch%4-routing assumption
+            // doesn't hold for arbitrary IT pan layouts. Fall back to the
+            // surr+cent split only for MOD/XM where pan is implicit.
+            const _useITPan = (modData.channelPan && modData.channelPan.length >= this.numChannels);
+
             for (let ch = 0; ch < this.numChannels; ch++) {{
                 const state = this.channels[ch];
             // Surround channel pair (1-indexed, matches GLSL surr_channels).
             // [1,4] = outer LEFT pair (ch0,ch3); [2,3] = inner RIGHT pair (ch1,ch2)
             const surroundPair = [1, 4];
-            const isSurrCh = (surroundPair.includes((ch % 4) + 1));
+            const isSurrCh = (!_useITPan) && (surroundPair.includes((ch % 4) + 1));
                 
                 if (state.active && state.period > 0) {{
                     const sample = this.getSampleData(state.sample, state.samplePos);
@@ -1848,15 +3557,71 @@ class MODPlayer {{
                     }} else if (state.volInc < 0 && state.mixVol < state.currentVolume) {{
                         state.mixVol = state.currentVolume; state.volInc = 0;
                     }}
-                    const cv = state.mixVol / 64.0;
+                    // XM env+fadeout multiplier (1.0 for non-XM/env-off voices).
+                    const _info = modData.sampleMap[state.sample];
+                    let envMul = 1.0;
+                    if (_info && _info.env_pts && _info.env_pts.length >= 2) {{
+                        envMul = (this._xmEnvLookup(_info, state.envX) / 64.0)
+                               * (state.volFade / 65536.0);
+                    }} else if (!state.keyOn) {{
+                        // No envelope but key-off was issued: just fade via volFade.
+                        envMul = state.volFade / 65536.0;
+                    }}
+                    // Anti-alias gain compensation. When a sample's playback
+                    // freq exceeds Nyquist (e.g. IT chip leads at c5_speed
+                    // 33000 Hz playing C-7 → freq 133 kHz), my cubic interp
+                    // produces aliased output at FULL sample amplitude while
+                    // openMPT's lanczos-3 attenuates above-Nyquist content.
+                    // Without compensation the chip-lead-heavy passages end
+                    // up 2-3× louder than openMPT. Use sqrt(nyq/freq) — a
+                    // gentle one-pole-ish rolloff that approximates lanczos's
+                    // attenuation slope. Only kicks in when actually above
+                    // Nyquist, so non-IT samples are unaffected.
+                    if (_info && _info.c5_speed && _info.c5_speed > 0) {{
+                        const _freq = (_info.c5_speed * 428) / state.period;
+                        const _nyq = this.sampleRate * 0.5;
+                        if (_freq > _nyq) {{
+                            // Linear (6 dB/oct) rolloff above Nyquist —
+                            // matches openMPT's lanczos-3 slope for
+                            // chip-lead-heavy passages. EXCEPT when
+                            // c5_speed is unusually high (> 50000 Hz),
+                            // which signals a single-cycle synth waveform
+                            // (e.g. inst 27 "Sinewave-envelope" at
+                            // c5=168000): the source content is just a
+                            // smooth fundamental with NO significant high-
+                            // freq content, so cubic interp doesn't
+                            // actually alias and the 95%+ rolloff buries
+                            // the voice. Floor at 0.3 to keep inst 27
+                            // audible — without it, GADGET.IT's main
+                            // sinewave melody gets buried by the bass and
+                            // is heard as an unwanted "suspended lower
+                            // tone".
+                            const _aaFloor = (_info.c5_speed > 50000) ? 0.3 : 0.0;
+                            envMul *= Math.max(_aaFloor, _nyq / _freq);
+                        }}
+                    }}
+                    const cv = (state.mixVol / 64.0) * envMul;
                     const s  = sample * cv;
                     
-                    if (isSurrCh) {{
-                        surrL += s * chPanLeft[ch % 4];
-                        surrR += s * chPanRight[ch % 4];
+                    // Per-channel pan: prefer panOverride from MOD 8xx /
+                    // IT X effect when set, else fall back to header-default
+                    // chPanLeft/chPanRight (IT-pan-aware or MOD-style ch%4).
+                    let _pl, _pr;
+                    if (state.panOverride !== undefined) {{
+                        // Param 0..FF, 0=L, 0x80=center, 0xFF=R.
+                        const _p = state.panOverride / 255.0;
+                        _pr = panL_right + (panL_left - panL_right) * _p;
+                        _pl = 1.0 - _pr;
                     }} else {{
-                        mixL += s * chPanLeft[ch % 4];
-                        mixR += s * chPanRight[ch % 4];
+                        _pl = chPanLeft[ch % chPanLeft.length];
+                        _pr = chPanRight[ch % chPanRight.length];
+                    }}
+                    if (isSurrCh) {{
+                        surrL += s * _pl;
+                        surrR += s * _pr;
+                    }} else {{
+                        mixL += s * _pl;
+                        mixR += s * _pr;
                     }}
                     
                     // PhatBass: per-sample when bass samples were detected, otherwise mix-wide.
@@ -1874,28 +3639,87 @@ class MODPlayer {{
                     }}
                     
                     const effectivePeriod = this.getEffectivePeriod(ch);
-                    const smpFt = (modData.sampleMap[state.sample] || {{}}).finetune || 0;
+                    const _smInfo = modData.sampleMap[state.sample] || {{}};
+                    const smpFt   = _smInfo.finetune || 0;
+                    const smpC5   = _smInfo.c5_speed || 0;
                     // samplePos is in original (uncompressed) sample space.
                     // getSampleData maps it to compressed space via pos/bw_factor — so
                     // freq must NOT be divided by bw_factor here (would double-divide).
-                    const freq = this.periodToFreq(effectivePeriod, smpFt);
+                    const freq = this.periodToFreq(effectivePeriod, smpFt, smpC5);
                     state.samplePos += freq / this.sampleRate;
+                }}
+
+                // ── Ghost voices (NNA) ────────────────────────────────────
+                // Continue/notefade voices left over from previous note
+                // triggers. We mix them in at their frozen pitch and volume,
+                // panned to the same channel pair the voice belongs to.
+                // Per-tick fade is applied in processTick (see below) — not
+                // here per sample, so amplitude is constant within a tick.
+                for (let gi = 0; gi < state.ghostVoices.length; gi++) {{
+                    const g = state.ghostVoices[gi];
+                    if (!g.active || g.period <= 0 || g.volume <= 0) continue;
+                    const gs = this.getSampleData(g.sample, g.samplePos);
+                    const gcv = g.volume / 64.0;
+                    const gOut = gs * gcv;
+                    if (isSurrCh) {{
+                        surrL += gOut * chPanLeft[ch % chPanLeft.length];
+                        surrR += gOut * chPanRight[ch % chPanRight.length];
+                    }} else {{
+                        mixL += gOut * chPanLeft[ch % chPanLeft.length];
+                        mixR += gOut * chPanRight[ch % chPanRight.length];
+                    }}
+                    const _gInfo2 = modData.sampleMap[g.sample] || {{}};
+                    const gFt = _gInfo2.finetune || 0;
+                    const gC5 = _gInfo2.c5_speed || 0;
+                    const gFreq = this.periodToFreq(g.period, gFt, gC5);
+                    g.samplePos += gFreq / this.sampleRate;
+                    // Deactivate ghost when its sample is exhausted (non-
+                    // looping) — getSampleData returns 0 past the end, but
+                    // keeping the ghost active wastes mix work.
+                    const gInfo = modData.sampleMap[g.sample];
+                    if (gInfo && gInfo.loop_length <= 2 &&
+                        g.samplePos >= gInfo.length / (gInfo.bw_factor || 1)) {{
+                        g.active = false;
+                    }}
                 }}
             }}
             
-            const normFactor = 2.0 / this.numChannels;
+            // Mix normalization. For 4-channel MOD: 0.5 (keeps total ≤ 2.0
+            // when 4 voices play at full vol — original tuning). For
+            // multi-channel XM/IT/S3M formats: 1/N is too aggressive
+            // (10ch XM ends up 2.5× quieter than MOD). openMPT scales by
+            // ~1/sqrt(N) so songs maintain similar perceived loudness as
+            // channel count grows. Use sqrt-based scaling for >4 channels,
+            // capped so a 4-ch song still gets the original 0.5.
+            // Normalization: 4-ch MOD keeps the original 0.5 (preserves the
+            // long-tuned mix). For multi-channel XM/IT/S3M, scale so a single
+            // voice at full volume reaches near unity — that's what
+            // saturates the oscilloscope. The AdaptiveLimiter (1ms minimum
+            // attack, 8ms base attack, stereo-linked) catches peaks when
+            // multiple voices stack, so going hot here doesn't blow up.
+            //
+            // 1.0/sqrt(N) was conservative; with the limiter we can go to
+            // ~0.7 (single voice fills the buffer at vol=64).
+            const normFactor = (this.numChannels <= 4)
+                ? 2.0 / this.numChannels
+                : 0.85;
             const vol = this._volume !== undefined ? this._volume : 0.8;
-            
+            // IT mix/global volume — 128 = unity. For non-IT formats both
+            // default to 128 → multiplier=1. For IT, GADGET-style files
+            // ship with mix_vol=48 which openMPT applies as a master cut.
+            // Use ?? for "default if missing"; `|` is bitwise OR (= bug).
+            const _gMix = ((modData.globalVol ?? 128) * (modData.mixVol ?? 128)) / (128.0 * 128.0);
+
             // Apply Only3D to surround bus (ch0 + ch3 = outer LEFT pair = "Surround L/R")
-            let sL = surrL * normFactor * vol;
-            let sR = surrR * normFactor * vol;
+            let sL = surrL * normFactor * vol * _gMix;
+            let sR = surrR * normFactor * vol * _gMix;
             if (this._only3d && this._only3dDepth > 0) {{
                 [sL, sR] = this._only3d.process(sL, sR);
             }}
             
             // Center bus (ch1 + ch2 = inner RIGHT pair) passes through dry
-            const cL = mixL * normFactor * vol;
-            const cR = mixR * normFactor * vol;
+            const cL = mixL * normFactor * vol * _gMix;
+            const cR = mixR * normFactor * vol * _gMix;
             
             let outL = sL + cL;
             let outR = sR + cR;
@@ -1917,8 +3741,13 @@ class MODPlayer {{
             // saturation overshoot from FAT4X without zipper artefacts on
             // big transients (70/30 smoothing).
             const _lim = this._limiter.process(outL, outR);
-            leftChannel[offset + i]  = _lim[0];
-            rightChannel[offset + i] = _lim[1];
+            // Post-limiter makeup gain + hard-clip. Pushes the signal up
+            // against the ±1 boundary for maximum perceived loudness.
+            // The limiter has already softly tamed catastrophic peaks; this
+            // gain stage hard-clips whatever's left to fill the rail.
+            const _MAKEUP = 1.7;
+            leftChannel[offset + i]  = Math.max(-1, Math.min(1, _lim[0] * _MAKEUP));
+            rightChannel[offset + i] = Math.max(-1, Math.min(1, _lim[1] * _MAKEUP));
             
             // Advance sample counter
             this.sampleCounter++;
@@ -1976,7 +3805,7 @@ class MODPlayer {{
         this.currentTick = 0;
         this.sampleCounter = 0;
         
-        for (let ch = 0; ch < 4; ch++) {{
+        for (let ch = 0; ch < this.numChannels; ch++) {{
             this.channels[ch].active = false;
             this.dyingChannels[ch].active = false;  // OPTIMIZATION 2: Clear dying channels
         }}
@@ -2035,7 +3864,7 @@ function drawFrame(){{
     ctx2d.beginPath();ctx2d.strokeStyle='#3d8ef0';ctx2d.lineWidth=1.8;
     ctx2d.shadowBlur=8;ctx2d.shadowColor='#3d8ef0';
     for(let x=0;x<W;x++){{
-      const y=H/2-Math.max(-0.95,Math.min(0.95,buf[Math.floor(x*step)]*8.0))*H*0.45;
+      const y=H/2-Math.max(-1.0,Math.min(1.0,buf[Math.floor(x*step)]*64.0))*H*0.48;
       x===0?ctx2d.moveTo(x,y):ctx2d.lineTo(x,y);
     }}
     ctx2d.stroke();ctx2d.shadowBlur=0;
@@ -2443,6 +4272,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
         5: "Dodecahedron (Philip Bertani — DR2 IFS fractal raymarcher)",
         6: "Disco Inferno + UFOff Dancer (orblivius/finalman/Lallis — dance-floor scene with poi)",
         7: "Sparkly 4D (Philip Bertani — 4D IFS volumetric raymarcher)",
+        8: "Skywalker (orblivius — synchronized flying-curve terrain + star field + cloud)",
     }
     viz_name = _VIZ_NAMES.get(viz, f"viz{viz}")
 
@@ -2616,22 +4446,31 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
         for _local_r in range(_rows_here):
             _ri = _start_r + _local_r
             # Apply F effects FIRST (ProTracker processes them on tick 0, so
-            # they affect the duration of the row they appear in)
+            # they affect the duration of the row they appear in). Also scan
+            # for EEx (pattern delay) — extends the row's duration by val
+            # extra row-times. Bug fix: TINYTUNE.MOD pat 32 r49 has EE8 at
+            # speed 15 → row should occupy (1+8)*15 = 135 ticks; the walker
+            # was giving it 15 ticks, drifting the GLSL rowStartTick table
+            # by ~280 ms across each EEx row.
             try:
                 _row = mod.patterns[_pi][_ri]
             except Exception:
                 _row = []
+            _ee_val = 0
             for _ch in range(_num_ch):
                 try:
                     _n = _row[_ch]
-                    if _n.get('effect', 0) == 0xF and _n.get('param', 0) > 0:
-                        _p = _n['param']
-                        if _p < 0x20: _cur_speed = _p
-                        else:         _cur_tempo = _p
+                    _eff = _n.get('effect', 0)
+                    _par = _n.get('param', 0)
+                    if _eff == 0xF and _par > 0:
+                        if _par < 0x20: _cur_speed = _par
+                        else:           _cur_tempo = _par
+                    elif _eff == 0xE and ((_par >> 4) & 0xF) == 0xE:
+                        _ee_val = max(_ee_val, _par & 0xF)
                 except Exception:
                     pass
             _tps = _cur_tempo * 2.0 / 5.0
-            _row_dur = _cur_speed / _tps if _tps > 0 else 0.0
+            _row_dur = (_cur_speed * (1 + _ee_val)) / _tps if _tps > 0 else 0.0
             _row_speeds.append(_cur_speed)
             _row_start_times.append(_row_start_times[-1] + _row_dur)
             _row_idx += 1
@@ -2689,8 +4528,10 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
 
     # ========== COMMON TAB ==========
     data_source_comment = "Embedded data (no PNG required)" if use_embedded else f"All data in 1024×1024 RGBA PNG: {png_file}"
+    # USE_142_DSP toggle — emit as 0/1 for the GLSL #define
+    use_142_dsp_int = 1 if compat.get('use_142_dsp', False) else 0
     common_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.45 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.46 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    COMMON TAB
    Visualizer: {viz_name}
@@ -2714,14 +4555,41 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
 #define BPM {float(mod.initial_tempo)}
 #define SPEED {float(mod.initial_speed)}
 
+// ── DSP MODE SWITCH (compile-time) ────────────────────────────────────────────
+// USE_142_DSP = 0 → full v1.45 path: per-sample bass routing, 2-tap Only3D,
+//                   PhatBass with 64-iter inst-walkback (best fidelity)
+// USE_142_DSP = 1 → v1.42-style simpler path: surr_channels routing, 1-tap
+//                   Only3D, single-row PhatBass inst lookup. Lower shader
+//                   complexity → compiles on weaker drivers (ANGLE/Mali/older
+//                   Adreno) that may otherwise crash on the v1.45 path.
+//                   All correctness fixes (EAx/EBx, EEx, etc.) and the
+//                   master softLimit are preserved either way.
+#define USE_142_DSP {use_142_dsp_int}
+
 // ── Audio effects — toggle here in Common tab ─────────────────────────────────
-// enable3D : Only3D surround widening on the surr_channels pair
-// enableFAT: PhatBass Hilbert allpass enhancement on bass instruments
+// Each module is independently toggleable. Flip false to disable.
+//   enable3D           : Only3D surround widening (surr_channels pair only)
+//   enablePhatBass     : PhatBass Hilbert allpass cross-pan on bass instruments
+//   enableFAT          : FAT4X harmonic exciter on master output (cs1 polynomial)
+//   enableVelvetReverb : sparse-tap velvet-noise reverb (6 random-sign taps in
+//                        an ~80 ms tail). Cheaper and smoother than the
+//                        disabled Freeverb path — adds ~24 getChannelOutput
+//                        calls/sample (4 channels × 6 taps). Default OFF.
 // surr_channels: 1-indexed channel pair that gets Only3D (the other two = dry center)
 //   ivec2(1,4) = outer LEFT pair (ch0,ch3) — default Amiga layout
 //   ivec2(2,3) = inner RIGHT pair (ch1,ch2) — swap surround and center
-const bool  enable3D     = {str(not _compat["no_surround"]).lower()};
-const bool  enableFAT    = {str(not _compat["no_fat"]).lower()};
+const bool  enable3D           = {str(not _compat["no_surround"]).lower()};
+const bool  enablePhatBass     = {str(not _compat["no_fat"]).lower()};
+const bool  enableFAT          = {str(not _compat["no_fat"]).lower()};
+const bool  enableVelvetReverb = false;   // opt-in; flip true to engage
+
+// PhatBass routing — flip here to switch without re-running the encoder:
+//   0 → per-sample: cross-pan ONLY isBass[]-tagged instruments (cleanest)
+//   1 → mix-wide:   cross-pan the WHOLE mix (wider stereo, every voice
+//                   gets the Hilbert character, mids may smear slightly)
+// Defined in Common with #ifndef so a Sound-tab override is also possible
+// (Sound's prelude only defines it if Common didn't).
+#define PHATBASS_MIX_MODE __PHATBASS_MIX_MODE__
 // Surround: AUTO-DETECT — applied to NON-bass channels (leads/pads get width, bass stays centered)
 
 // Channel panning (0=left, 0.5=center, 1.0=right)
@@ -2734,9 +4602,20 @@ const bool  enableFAT    = {str(not _compat["no_fat"]).lower()};
 // a left-heavy mix that sounds clipped/distorted on the loud lead side.
 const float channelPan[32] = float[]({', '.join([
     (
+        # IT: use channel_pan (range 0..64, where 0=L, 32=center, 64=R).
+        # IT files carry per-channel pan in the header; without this, the
+        # GLSL falls through to S3M's channel_settings logic which IT files
+        # also have but populate as mute flags (0/1) — making every IT
+        # channel map to '0.0' (full LEFT). Fix: prefer channel_pan when
+        # the file provides it (length matches num_channels and any value
+        # exceeds 1, which distinguishes pan data from S3M mute flags).
+        f'{(min(64, max(0, getattr(mod, "channel_pan", [32]*32)[i])) / 64.0):.3f}'
+        if (getattr(mod, 'channel_pan', None) and
+            len(mod.channel_pan) > i and
+            max(mod.channel_pan[:mod.num_channels] or [0]) > 1)
         # S3M: use file-specified pan when available (channel_settings list
         # exists and contains valid entries: <8=L, 8..15=R, else fall back).
-        ('0.0' if (getattr(mod, 'channel_settings', None) and
+        else ('0.0' if (getattr(mod, 'channel_settings', None) and
                    i < len(mod.channel_settings) and
                    (mod.channel_settings[i] & 0x7F) < 8)
          else '1.0' if (getattr(mod, 'channel_settings', None) and
@@ -2886,13 +4765,21 @@ struct SampleInfo {{
 }};
 const SampleInfo samples[31] = SampleInfo[](
 """
-    
+
     for i, s in enumerate(sample_map[:31]):
         comma = "," if i < 30 else ""
         vol = mod.samples[i]['volume'] if i < len(mod.samples) else 64
         common_glsl += f"    SampleInfo({s['start']}, {s['length']}, {s['repeat_point']}, {s['repeat_length']}, {vol}, {s.get('bw_factor',1)}){comma}\n"
     
     common_glsl += ");\n\n"
+    # XM key-off support — parallel arrays (kept separate from SampleInfo so
+    # the VQ encoder's struct layout doesn't need to change).
+    # sampleFadeout[i]    = XM volfade decrement per tick × 2 / 65536, 0 if no fade
+    # sampleReleaseHold[i] = post-sustain env-vol average, 0..64 (64 = no drop)
+    _fo_list = ', '.join(str(s.get('fadeout', 0)) for s in sample_map[:31])
+    _rh_list = ', '.join(str(int(round(s.get('release_factor', 1.0) * 64))) for s in sample_map[:31])
+    common_glsl += f"const int sampleFadeout[31]     = int[]({_fo_list});\n"
+    common_glsl += f"const int sampleReleaseHold[31] = int[]({_rh_list});\n\n"
     common_glsl += _emit_visualizer_synth_glsl(wave_types)
     common_glsl += f"""
 // ProTracker period table (C-1 to B-3)
@@ -3083,7 +4970,11 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     Note trigNote = getNote(pos.songPos, pos.row, ch);
     int  trigRow  = pos.row;
     int  trigPat  = pos.songPos;
-    if (trigNote.instrument <= 0 || trigNote.period <= 0) {{
+    // XM key-off cells (instrument byte ≥ 128, no period) are NOT triggers —
+    // skip them in the trigger-search so the backward scan finds the real
+    // note that's still being released.
+    bool _trigIsKO = (trigNote.instrument >= 128) && (trigNote.period <= 0);
+    if (_trigIsKO || trigNote.instrument <= 0 || trigNote.period <= 0) {{
         int scanRow = pos.row;
         int scanPat = pos.songPos;
         // The early `break` makes this data-dependent — modern shader compilers
@@ -3099,7 +4990,10 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
                 }} else {{ break; }}
             }}
             Note prev = getNote(scanPat, scanRow, ch);
-            if (prev.instrument > 0 || prev.period > 0) {{
+            // XM key-off cells (instrument byte bit 7 set, period == 0)
+            // are not triggers — keep scanning past them.
+            bool _prevIsKO = (prev.instrument >= 128) && (prev.period <= 0);
+            if (!_prevIsKO && (prev.instrument > 0 || prev.period > 0)) {{
                 trigNote = prev; trigRow = scanRow; trigPat = scanPat;
                 break;
             }}
@@ -3184,6 +5078,14 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     // ── Volume: forward scan trigger→current to honour Cxx cuts & Axx slides ─
     // ProTracker volume slide (Effect A/6) SKIPS tick 0 → applies (SPEED-1) ticks per row.
     int volume = smp.volume;
+    // ── XM key-off detection ────────────────────────────────────────
+    // Stateless approximation: scan rows trigRow+1..pos.row for a key-off
+    // marker (instrument byte has bit 7 set, period == 0). If found, record
+    // its time so we can apply env-release + fadeout for `currentTime -
+    // keyOffTime` seconds at the end. JS engine has true per-voice envelope
+    // state; this is a "snap to release-hold then fade" approximation that
+    // matches openMPT closely enough for the typical staccato-with-tail use.
+    float keyOffTime = -1.0;
     // Trigger-row effect
     if (trigNote.effect == 0xC) {{
         volume = min(trigNote.param, 64);
@@ -3221,6 +5123,19 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
                 continue;
             }}
             Note _fn = getNote(_fp, _fr, ch);
+            // XM key-off cell: instrument byte ≥ 128 (bit 7) and no period.
+            // Don't break — just record the time and keep scanning so a real
+            // following note can still terminate the trigger window.
+            bool _isKO = (_fn.instrument >= 128) && (_fn.period <= 0);
+            if (_isKO) {{
+                if (keyOffTime < 0.0) {{
+                    int _gRow = patRowOffset[_fp] + (_fr - patStartRow[_fp]);
+                    keyOffTime = rowStartTime[_gRow];
+                }}
+                _fr++;
+                if (_fr >= 64) {{ _fr=0; _fp++; }}
+                continue;
+            }}
             if (_fn.instrument>0 || _fn.period>0) break; // new note = different trigger
             if (_fn.effect==0xC)
                 volume = min(_fn.param, 64);
@@ -3243,7 +5158,11 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
         }}
         // Current row: Cxx fully, Axx for elapsed ticks (tick 0 skipped)
         Note _cr = getNote(pos.songPos, pos.row, ch);
-        if (_cr.instrument<=0 && _cr.period<=0) {{
+        bool _crIsKO = (_cr.instrument >= 128) && (_cr.period <= 0);
+        if (_crIsKO && keyOffTime < 0.0) {{
+            // Key-off on the current row — record its start time.
+            keyOffTime = rowStartTime[curGlobalRow];
+        }} else if (_cr.instrument<=0 && _cr.period<=0) {{
             if (_cr.effect==0xC)
                 volume = min(_cr.param, 64);
             else if (_cr.effect==0xA || _cr.effect==0x6) {{
@@ -3261,7 +5180,33 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
             }}
         }}
     }}
-    return s * float(volume) / 64.0;
+
+    // ── Apply XM key-off envelope release + fadeout multiplier ─────────
+    // The first ~40ms after key-off snaps from full vol down to releaseHold
+    // (matching the rapid post-sustain env drop in openMPT). Then fadeout
+    // linearly decays the multiplier toward 0 over 65536/(2*fadeout) ticks.
+    // For samples without an envelope (fadeout=0): hard cut on key-off,
+    // matching MOD/non-XM behaviour where key-off has no fade.
+    float releaseMul = 1.0;
+    if (keyOffTime > 0.0) {{
+        float relTime = currentTime - keyOffTime;
+        if (relTime > 0.0) {{
+            int _fo = sampleFadeout[trigNote.instrument - 1];
+            if (_fo <= 0) {{
+                releaseMul = 0.0;  // hard cut
+            }} else {{
+                // Stage 1: snap to releaseHold over 40ms (env release shape).
+                float drop = clamp(relTime * 25.0, 0.0, 1.0);
+                float hold = float(sampleReleaseHold[trigNote.instrument - 1]) / 64.0;
+                float envMul = mix(1.0, hold, drop);
+                // Stage 2: fadeout — volfade -= 2*fadeout per tick.
+                float ticksKO = relTime * float(pos.speed) / pos.rowTime;
+                float fadeMul = max(0.0, 1.0 - 2.0 * float(_fo) * ticksKO / 65536.0);
+                releaseMul = envMul * fadeMul;
+            }}
+        }}
+    }}
+    return s * float(volume) / 64.0 * releaseMul;
 }}
 """
     
@@ -3348,6 +5293,11 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
         _routing = 'mix-wide' if phatbass_mix_mode == 1 else 'per-sample'
         print(f"   🎚️  PhatBass routing: {_routing} (auto)")
 
+    # Common's PhatBass mix-mode #define was emitted with a deferred token
+    # because phatbass_mix_mode is computed AFTER bass detection (which
+    # happens after common_glsl was built). Substitute the real value now.
+    common_glsl = common_glsl.replace('__PHATBASS_MIX_MODE__', str(phatbass_mix_mode))
+
     # ── Only3D allpass: precompute coefficients at generation time ─────────
     # The per-sample code used to compute tan/sin/cos every audio sample
     # (~441,000× per song-second). Since freq + SR are constants, the
@@ -3377,7 +5327,7 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     _ap_p0_2, _ap_p1p2_2, _ap_delay_2 = _only3d_coeffs(_ONLY3D_FREQ2)
 
     sound_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.45 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.46 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    SOUND TAB
    Visualizer: {viz_name}
@@ -3390,8 +5340,17 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
 // Bass sample flags (true = instrument detected as bass) — for PhatBass
 const bool isBass[31] = bool[]({bass_flags_str});
 
-// PhatBass routing: 0 = per-sample (uses isBass[]), 1 = mix-wide (no detection)
+// PhatBass routing — set in Common (#ifndef guard so manual edits there win):
+//   PHATBASS_MIX_MODE 0 → per-sample (only isBass[]-tagged instruments get
+//                          the Hilbert cross-pan; cleanest, leaves leads alone)
+//   PHATBASS_MIX_MODE 1 → mix-wide (applies the cross-pan to the entire mix —
+//                          wider stereo + bass enhancement on everything,
+//                          can lightly smear mid/high transients)
+// Default is whatever --phatbass-mode the encoder ran with. Edit the line
+// in Common to override at compile time on Shadertoy without re-running.
+#ifndef PHATBASS_MIX_MODE
 #define PHATBASS_MIX_MODE {phatbass_mix_mode}
+#endif
 
 // ── FAT4X harmonic exciter helper ────────────────────────────────────────
 // cs1 polynomial waveshaper (even harmonics only) from FAT4X by Orblivius.
@@ -3429,11 +5388,28 @@ vec2 fat_cs1(vec2 x) {{
 // abs/min/max each. Catches PhatBass + FAT4X overshoot before the audio
 // context hard-clips, without compressing musical dynamics below ±0.95.
 vec2 softLimit(vec2 x) {{
-    const float T = 0.85;        // soft-knee threshold
-    const float HEAD = 1.0 - T;  // headroom above threshold (= 0.15)
+    // Fully robust soft-clipper. Always converges to ±CEIL regardless of T.
+    //   • T < CEIL → soft-knee from T to CEIL (musical, no clicks)
+    //   • T ≥ CEIL → hard ceiling at CEIL (no headroom for a knee, but no
+    //     NaN/Inf either; peaks just clamp to ±CEIL)
+    // Guarantees: output is always in [−CEIL, +CEIL]. No divide-by-zero
+    // even if T is set to 1.0 or above. Catches PhatBass / FAT4X overshoot
+    // before WebAudio hard-clips. NaN in → NaN out is impossible because
+    // every branch only does mul/div on bounded magnitudes.
+    // Soft-knee from T to CEIL. T MUST be < CEIL so the soft branch runs;
+    // otherwise we fall back to hard-clip (audible as distortion). With
+    // CEIL ≤ 1.1 the output is also a safe input for fat_cs1's polynomial,
+    // which diverges past |x| = 1.1.
+    const float T    = 0.85;    // knee start (signals below this are bit-perfect)
+    const float CEIL = 1.0;     // absolute ceiling — DAC clips above this
     vec2 ax = abs(x);
-    vec2 over = max(ax - T, vec2(0.0));
-    vec2 reduced = (HEAD * over) / (over + HEAD);
+    if (T >= CEIL) {{
+        // No soft-knee headroom available — hard-clip at CEIL.
+        return sign(x) * min(ax, vec2(CEIL));
+    }}
+    const float HEAD = CEIL - T;                      // > 0 here
+    vec2 over    = max(ax - T, vec2(0.0));
+    vec2 reduced = (HEAD * over) / (over + HEAD);     // 0 ≤ reduced < HEAD
     return sign(x) * (min(ax, vec2(T)) + reduced);
 }}
 
@@ -3445,7 +5421,10 @@ float getMixedMono(float time_offset, Position pos, float rowTime) {{
     for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
         mix += getChannelOutput(ch, time_offset, pos, rowTime);
     }}
-    const float normFactor = 2.0 / float(NUM_CHANNELS);
+    // Loud mode: 4-ch MOD keeps the original 2/N; multi-ch formats get
+    // a flat 0.45 (single voice at vol=64 reaches 45% of full scale).
+    // softLimit / FAT4X handle multi-voice peaks downstream.
+    const float normFactor = (NUM_CHANNELS <= 4) ? (2.0 / float(NUM_CHANNELS)) : 0.55;
     return mix * normFactor;
 }}
 
@@ -3572,18 +5551,31 @@ vec2 mainSound(int samp, float time) {{
         float panR = 0.25 + 0.5 * channelPan[ch];
         vec2  pan  = vec2(1.0 - panR, panR);
 
-        // AUTO-DETECT: surround on NON-bass channels (leads/pads), bass stays centered
-        Note n = getNote(pos.songPos, pos.row, ch);
-        int  inst   = n.instrument;
-        bool isBass = (inst >= 1 && inst <= 31) ? isBass[inst - 1] : false;
-
         vec2 panned = s * pan;
-        if (isBass) cent += panned;
-        else        surr += panned;
+#if USE_142_DSP
+        // Fixed surr_channels routing (v1.42 path). No per-channel getNote.
+        // surr_channels.x/.y are 1-indexed channels in the outer "surround"
+        // pair (ch0+ch3 for 4-chan); the inner pair feeds the dry centre.
+        int ch1 = (ch % 4) + 1;
+        bool isSurr = (ch1 == surr_channels.x || ch1 == surr_channels.y);
+        if (isSurr) surr += panned;
+        else        cent += panned;
+#else
+        // Per-note bass detection (v1.45 path): non-bass channels get
+        // surround widening, bass-tagged samples stay centered.
+        Note n = getNote(pos.songPos, pos.row, ch);
+        int  inst = n.instrument;
+        bool bassFlag = (inst >= 1 && inst <= 31) ? isBass[inst - 1] : false;
+        if (bassFlag) cent += panned;
+        else          surr += panned;
+#endif
     }}
 
     // OPT: const-qualified — NUM_CHANNELS is a #define.
-    const float normFactor = 2.0 / float(NUM_CHANNELS);
+    // Loud mode: 4-ch MOD keeps the original 2/N; multi-ch formats get
+    // a flat 0.45 (single voice at vol=64 reaches 45% of full scale).
+    // softLimit / FAT4X handle multi-voice peaks downstream.
+    const float normFactor = (NUM_CHANNELS <= 4) ? (2.0 / float(NUM_CHANNELS)) : 0.55;
     surr *= normFactor;
     cent *= normFactor;
     
@@ -3614,51 +5606,61 @@ vec2 mainSound(int samp, float time) {{
     const vec2 AP_DELAY      = vec2({_ap_delay_1:.7f}, {_ap_delay_2:.7f});
 
     if (enable3D) {{
+#if USE_142_DSP
+        // ── Only3D, single-tap (v1.42 path) — lower shader complexity ──
+        float tW = playbackTime - AP_DELAY.x;
+        if (tW >= 0.0) {{
+            Position posW = getPosition(tW);
+            float wL = 0.0, wR = 0.0;
+            for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
+                int ch1 = (ch % 4) + 1;
+                if (ch1 == surr_channels.x || ch1 == surr_channels.y) {{
+                    float sw   = getChannelOutput(ch, tW, posW, rowTime);
+                    float panR = 0.25 + 0.5 * channelPan[ch];
+                    wL += sw * (1.0 - panR);
+                    wR += sw * panR;
+                }}
+            }}
+            wL *= normFactor;
+            wR *= normFactor;
+            float diff = (wL - wR) * ONLY3D_DEPTH;
+            surr += vec2(diff, -diff);
+        }}
+#else
+        // ── Only3D, 2-tap parallel allpass (v1.45 path) — wider, smoother ──
+        // First-order allpass approximation in parallel for both freqs.
+        // Stateless: use delayed difference for both x[n-1] and y[n-1].
+        //   y[n] = x[n]*p0 + x[n-1]*(p1+p2)
+        // Bass channels bypass surround widening (low freqs through allpass +
+        // cross-mix shuffle thrash and saturate, audible as cracking).
         vec2 t = vec2(playbackTime) - AP_DELAY;
         if (t.x >= 0.0 && t.y >= 0.0) {{
             Position pos1 = getPosition(t.x);
             Position pos2 = getPosition(t.y);
-
-            // Current surround mix difference (for x[n])
             float diffNow = surr.x - surr.y;
-
-            // Delayed L/R sums for both allpass taps, summed in parallel.
-            // wL.x, wL.y = L-channel sum at tap1, tap2.  Same for wR.
             vec2 wL = vec2(0.0);
             vec2 wR = vec2(0.0);
             for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
-                // Bass channels bypass surround widening — putting low freqs
-                // through the allpass + cross-mix shuffle thrashes and
-                // saturates, audible as cracking on bass-heavy passages.
                 int  inst1   = getNote(pos1.songPos, pos1.row, ch).instrument;
                 bool isBass1 = (inst1 >= 1 && inst1 <= 31) ? isBass[inst1 - 1] : false;
                 if (isBass1) continue;
-
                 float panR = 0.25 + 0.5 * channelPan[ch];
                 vec2  pan  = vec2(1.0 - panR, panR);
-                vec2 s = vec2(getChannelOutput(ch, t.x, pos1, rowTime),
-                              getChannelOutput(ch, t.y, pos2, rowTime));
-                wL += s * pan.x;
-                wR += s * pan.y;
+                vec2 sxy = vec2(getChannelOutput(ch, t.x, pos1, rowTime),
+                                getChannelOutput(ch, t.y, pos2, rowTime));
+                wL += sxy * pan.x;
+                wR += sxy * pan.y;
             }}
             wL *= normFactor;
             wR *= normFactor;
-
-            vec2 diffDelayed = wL - wR;   // (.x = tap1 delayed, .y = tap2 delayed)
-
-            // First-order allpass approximation in parallel for both freqs.
-            // Stateless: use delayed difference for both x[n-1] and y[n-1].
-            //   y[n] = x[n]*p0 + x[n-1]*(p1+p2)
+            vec2 diffDelayed = wL - wR;
             vec2 ap = diffNow * AP_P0 + diffDelayed * AP_P1_PLUS_P2;
-
-            // Soft saturation: x / sqrt(1 + x²·SAT). inversesqrt() is one
-            // hardware instruction on modern GPUs (faster than 1.0/sqrt()).
+            // Soft saturation: x / sqrt(1 + x²·SAT). inversesqrt() is one HW op.
             vec2 dd = ap * inversesqrt(1.0 + ap * ap * SATURATION);
-
-            // Cross-mix shuffle: L gets +shuffle, R gets −shuffle
             float shuffle = (dd.x - dd.y) * ONLY3D_DEPTH;
             surr += vec2(shuffle, -shuffle);
         }}
+#endif
     }}
     
     // ── PhatBass — bass enhancement (cross-panned allpass) ─────────────────
@@ -3670,8 +5672,12 @@ vec2 mainSound(int samp, float time) {{
     // We pick mix-wide automatically when no bass samples were detected at
     // encode time (PHATBASS_MIX_MODE = 1).
     const float PHAT_DELAY = 0.001814;  // 80 samples @ 44100Hz
-    const float PHAT_DEPTH = 1.5;        // Cranked again — user wants OBVIOUS bass
-    if (enableFAT) {{
+    const float PHAT_DEPTH = 1.7;        // Cranked again — user wants OBVIOUS bass
+    // Chain order (user spec): cs1 → phatbass → reverb → softlim. So we
+    // COMPUTE pb here but DON'T add it to cent — instead apply it to
+    // post-fat_cs1 _out further below.
+    vec2 _phatPB = vec2(0.0);
+    if (enablePhatBass) {{
         float tP = playbackTime - PHAT_DELAY;
         // Skip PhatBass entirely when the delay tap reaches before song-start.
         // 80-sample delay tap means tP<0 for the first 80 output samples;
@@ -3700,19 +5706,23 @@ vec2 mainSound(int samp, float time) {{
         }}
 #else
         // Per-sample: only bass-detected instruments.
-        // Walk back from posP to find the most recently TRIGGERED instrument
-        // on this channel. The current row's cell is often empty (inst=0) on
-        // continuation rows — using that directly would flip bass→non-bass at
-        // every row boundary even though the channel is still sustaining the
-        // bass note. The flip created 1-sample steps that FAT amplified into
-        // audible clicks. Walking back keeps the classification stable across
-        // a sustained note.
         for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
-            int inst = 0;
+#if USE_142_DSP
+            // v1.42 path: single-row inst lookup. Cheap on the shader; bass
+            // tag may flip on continuation rows (inst=0) but the audible
+            // impact is small for most tracks and it compiles everywhere.
+            int  inst2 = getNote(posP.songPos, posP.row, ch).instrument;
+            bool bass  = (inst2 >= 1 && inst2 <= 31) ? isBass[inst2 - 1] : false;
+#else
+            // v1.45 path: walk back up to 64 rows to find the most-recently
+            // TRIGGERED instrument on this channel. Keeps the bass tag
+            // stable across sustained notes whose continuation rows have
+            // inst=0; eliminates the per-row click that FAT amplified.
+            int inst2 = 0;
             int sR = posP.row, sP = posP.songPos;
             for (int lb = 0; lb < 64; lb++) {{
                 Note n2 = getNote(sP, sR, ch);
-                if (n2.instrument > 0) {{ inst = n2.instrument; break; }}
+                if (n2.instrument > 0) {{ inst2 = n2.instrument; break; }}
                 sR--;
                 if (sR < 0) {{
                     if (sP > 0) {{
@@ -3721,7 +5731,8 @@ vec2 mainSound(int samp, float time) {{
                     }} else {{ break; }}
                 }}
             }}
-            bool bass = (inst >= 1 && inst <= 31) ? isBass[inst - 1] : false;
+            bool bass = (inst2 >= 1 && inst2 <= 31) ? isBass[inst2 - 1] : false;
+#endif
             if (bass) {{
                 float sp = getChannelOutput(ch, tP, posP, rowTime);
                 float panR = 0.25 + 0.5 * channelPan[ch];
@@ -3730,21 +5741,57 @@ vec2 mainSound(int samp, float time) {{
             }}
         }}
 #endif
-        // Mix-wide PhatBass — applied to entire mix at PHAT_DEPTH strength.
-        // Was previously attenuated 0.25× extra ("must not overwhelm") but
-        // user feedback was "I don't hear it at all" — so the cap is gone.
-        // PHAT_DEPTH itself controls overall intensity now.
+        // Save pb for post-fat_cs1 mixing (applied below, after the
+        // saturator colors the dry signal). Was: cent += pb * ...
         // OPT: combined scale folds at compile time (both consts).
-        cent += pb * (normFactor * PHAT_DEPTH);
+        _phatPB = pb * (normFactor * PHAT_DEPTH);
         }}  // end else (tP >= 0)
     }}
     
     vec2 _out = surr + cent;
 
+    // ── Velvet-noise reverb (sparse-tap convolution) ─────────────────────
+    // 6 random-sign taps spread across an ~80 ms tail with exponential
+    // amplitude decay. Polarity is flipped between L/R to widen the wet
+    // image without using any allpass tricks. Math: out += sum(±decay_i ·
+    // dry(t − tap_i)). Per output sample this costs N_TAPS getPosition +
+    // N_TAPS getChannelOutput-equivalent (via getMixedMono), which is ~half
+    // the disabled Freeverb's per-sample work and avoids the comb-filter
+    // peaks that color a comb-network's tail. Toggle in Common via
+    // enableVelvetReverb (default off — opt-in).
+    if (enableVelvetReverb) {{
+        const int   _VELV_N    = 6;
+        // Taps placed by hand to be roughly logarithmic in time, with no
+        // pair too close together (avoids audible flutter). All within
+        // the 180 s buffer so getPosition() never wraps to song-end.
+        const float _VELV_T[6] = float[6](0.011, 0.019, 0.027, 0.038, 0.052, 0.071);
+        const float _VELV_S[6] = float[6](+1.0, -1.0, +1.0, +1.0, -1.0, +1.0);
+        const float _VELV_RT60 = 0.060;   // ~60 ms decay constant
+        const float _VELV_WET  = 0.18;
+        vec2 _wet = vec2(0.0);
+        for (int _vi = 0; _vi < _VELV_N; _vi++) {{
+            float _vtt = playbackTime - _VELV_T[_vi];
+            if (_vtt < 0.0) continue;
+            Position _vp = getPosition(_vtt);
+            float _vdry = getMixedMono(_vtt, _vp, rowTime);
+            float _vamp = exp(-_VELV_T[_vi] / _VELV_RT60) * _VELV_S[_vi];
+            _wet.x += _vdry *  _vamp;
+            _wet.y -= _vdry *  _vamp;     // L/R polarity flip → stereo width
+        }}
+        _out += _wet * _VELV_WET;
+    }}
+
     // Limiter sits BEFORE FAT4X so the saturator sees already-tamed peaks
     // (PhatBass overshoot is the main culprit; FAT4X then colors the limited
-    // signal instead of pushing it further over).
+    // signal instead of pushing it further over). Velvet wet path goes
+    // through here too so any reverb peaks get caught by softLimit.
     _out = softLimit(_out);
+    // Belt-and-suspenders: explicit hard clamp to ±1.0 before fat_cs1.
+    // softLimit already asymptotes to ±1 from below, so this is a no-op
+    // for normal signals — but it guarantees the polynomial input never
+    // exceeds 1.0 even under floating-point edge cases. cs1 diverges
+    // catastrophically past |x|=1.1, so this is cheap insurance.
+    _out = clamp(_out, vec2(-1.0), vec2(1.0));
 
     // ── FAT4X harmonic exciter (stateless) ─────────────────────────────────
     // Applied BEFORE reverb (reverb currently disabled — see block below).
@@ -3753,8 +5800,43 @@ vec2 mainSound(int samp, float time) {{
     // Uses the vec2 overload of fat_cs1 so both channels go through one
     // polynomial call instead of two separate scalar invocations.
     if (enableFAT) {{
+        // FAT_AMOUNT was 1.5 but combined with the end-of-chain ×1.3 crank
+        // and the 1.1-ceiling soft-limit it produced ~6dB sustained
+        // clipping on bass-heavy 12-channel IT mixes (peak=1.0 the entire
+        // song). Dialed back to 0.5 for IT-style content; chip leads still
+        // get presence without stacking gain past the ceiling.
         const float FAT_AMOUNT = 0.5;
-        _out = _out * (0.5 + 0.5 * fat_cs1(_out) * FAT_AMOUNT);
+        _out = _out * (1.0 + 0.5 * fat_cs1(_out) * FAT_AMOUNT);
+    }}
+
+    // ── PhatBass mixed AFTER fat_cs1 ───────────────────────────────────
+    // Chain order is fat_cs1 → phatbass → (reverb) → softlim. Adding the
+    // bass-cross-pan signal here means cs1's saturation only colors the
+    // dry mix, leaving the sub-bass clean and punchy underneath.
+    _out += _phatPB;
+
+    // ── (Reverb stage placeholder — currently disabled by default) ─────
+    // The Velvet/Freeverb blocks above are between the channel mix and
+    // the safety softLimit. With the new chain order, "reverb" here would
+    // mean adding wet to _out post-fat_cs1; left as a no-op until we
+    // re-enable a stage explicitly.
+
+    // ── End-of-chain soft-limit at 1.0 (clean ceiling) ─────────────────
+    // Previously: ×1.3 crank + 1.1 ceiling → "intentional 0.1 overdrive".
+    // For 12-channel IT mixes with PhatBass + FAT4X stacked above, that
+    // crank pushed the recorded output to peak=1.0 every second of the
+    // song (sustained DAC clipping audible as harsh distortion). Dialed
+    // back to a clean unity-ceiling soft-knee — softLimit at the start
+    // of this chain already catches per-voice peaks, this is a final
+    // safety net that asymptotes cleanly to ±1.0.
+    if (NUM_CHANNELS > 4) {{
+        vec2 _ax = abs(_out);
+        float _T = 0.85;
+        float _C = 1.0;
+        float _H = _C - _T;
+        vec2 _over    = max(_ax - _T, vec2(0.0));
+        vec2 _reduced = (_H * _over) / (_over + _H);
+        _out = sign(_out) * (min(_ax, vec2(_T)) + _reduced);
     }}
 
     // ── Freeverb-inspired parallel comb reverb — DISABLED ──────────────────
@@ -3856,6 +5938,12 @@ vec2 mainSound(int samp, float time) {{
     // float _bufFade = 0.5 - 0.5 * cos(_fadeT * 3.14159265);
     // _out *= _bufFade;
 
+    // IT master volume (global_volume × mix_volume / 128²). Defined in
+    // Common — defaults to 1.0 for MOD/XM, < 1.0 for IT files that ship
+    // with a mix attenuation. Without this, IT files play 2-3× too hot
+    // and slam every downstream limiter into sustained clipping.
+    _out *= MASTER_GAIN;
+
     return _out;
 }}
 """
@@ -3866,9 +5954,17 @@ vec2 mainSound(int samp, float time) {{
     title_text  = raw_title[:20]
     title_chars = to_glsl_font_chars(title_text)
     title_len   = len(title_text)
-    # Format suffix (" (MOD)" or " (S3M)") rendered SEPARATELY in WHITE
-    # right after the title (in YELLOW). Two prints, two colors.
-    fmt_text    = " (S3M)" if getattr(mod, 'is_s3m', False) else " (MOD)"
+    # Format suffix rendered SEPARATELY in WHITE right after the title
+    # (in YELLOW). main() wraps XM/IT into a duck-typed namespace with
+    # `is_xm` / `is_it` flags; check those first, then is_s3m, else MOD.
+    if getattr(mod, 'is_xm', False):
+        fmt_text = " (XM)"
+    elif getattr(mod, 'is_it', False):
+        fmt_text = " (IT)"
+    elif getattr(mod, 'is_s3m', False):
+        fmt_text = " (S3M)"
+    else:
+        fmt_text = " (MOD)"
     fmt_chars   = to_glsl_font_chars(fmt_text)
     fmt_len     = len(fmt_text)
     bpm_val_chars = to_glsl_font_chars(str(int(mod.initial_tempo)))
@@ -3884,18 +5980,20 @@ vec2 mainSound(int samp, float time) {{
             "    vec3 col = vec3(0.0);  // --viz 0: no visualizer"
         )
     elif viz == 3:
+        # Image tab can't call getChannelOutput (it's emitted only into Sound
+        # after the Common→Sound split). Instead, read 4 distinct positions
+        # from Buffer A's row-0 mix waveform — gives 4 audio-reactive amps
+        # (not per-channel, but visually equivalent for the curtain effect).
         viz_setup_block = (
             "    vec2 _uv=(C*2.-iResolution.xy)/iResolution.y;\n"
-            "    float _scrollX=texelFetch(iChannel1,ivec2(5,2),0).r;\n"  # Read scroll offset
-            "    float _tps_v=float(BPM)*2./5., _rt_v=float(SPEED)/_tps_v;\n"
-            "    Position _pos_v=getPosition(iTime);\n"
-            "    float _va0=abs(getChannelOutput(0,iTime,_pos_v,_rt_v));\n"
-            "    float _va1=abs(getChannelOutput(1,iTime,_pos_v,_rt_v));\n"
-            "    float _va2=abs(getChannelOutput(2,iTime,_pos_v,_rt_v));\n"
-            "    float _va3=abs(getChannelOutput(3,iTime,_pos_v,_rt_v));\n"
+            "    float _scrollX=texelFetch(iChannel1,ivec2(5,2),0).r;\n"
+            "    float _va0=abs(texelFetch(iChannel1,ivec2( 64,0),0).r);\n"
+            "    float _va1=abs(texelFetch(iChannel1,ivec2(192,0),0).r);\n"
+            "    float _va2=abs(texelFetch(iChannel1,ivec2(320,0),0).r);\n"
+            "    float _va3=abs(texelFetch(iChannel1,ivec2(448,0),0).r);\n"
             "    vec3 col = _visCurtain(vec2(_uv.y, abs(_uv.x)), _va0, _va1, _va2, _va3) + _visBG(C);"
         )
-    else:  # 1, 2, 4, 5, 6, 7 all use _VizScene
+    else:  # 1, 2, 4, 5, 6, 7, 8 all use _VizScene
         viz_setup_block = (
             "    vec2 _uv=(C*2.-iResolution.xy)/iResolution.y;\n"
             "    float _scrollX=texelFetch(iChannel1,ivec2(5,2),0).r;\n"  # Read scroll offset from Buffer A
@@ -4924,7 +7022,7 @@ vec3 _VizScene(vec2 fragCoord){
 }
 """
 
-    else:  # viz == 7
+    elif viz == 7:
         # Sparkly 4D — Philip Bertani's 4D IFS volumetric raymarcher.
         # Source: https://shadertoy.com/view/MXyXzz "sparkly 4d gr" by pb.
         # Pure time-based animation; no audio dependency, so this falls
@@ -4990,9 +7088,253 @@ vec3 _VizScene(vec2 U) {
 }
 """
 
+    else:  # viz == 8
+        # Skywalker — orblivius's flying-curve terrain + synchronized star field
+        # + cloud overlay. Returns full screen-space scene; drops the original
+        # mainImage buffer-write logic (we can't persist state from Image tab,
+        # so the kval[] star list always uses the deterministic time-based
+        # fallback). Identifiers prefixed `_v8_`.
+        viz_scene_block = r"""
+// === VIZ 8: Skywalker (orblivius) ===========================================
+// Flying-curve terrain raymarched per-row, synchronized with a star field
+// (deterministic timestamp-based) and a cloud overlay sampled from iChannel2.
+// iChannel2 is RGBA Noise / nebula texture in this Image-tab setup; iChannel1
+// is Buffer A (audio + FFT). iChannel0 (alphabet) is untouched by this viz.
+// ---------------------------------------------------------------------------
+
+#define _v8_PI 3.14159265
+#define _v8_MAX_STARS 8
+#define _v8_ID 0.12321
+#define _v8_NUM_SAMPLES 3
+
+#define _v8_H(P)    fract(sin(dot(P,vec2(127.1,311.7)))*43758.545)
+#define _v8_pR(a)   mat2(cos(a),sin(a),-sin(a),cos(a))
+// Buffer A layout in this player: row 0 px 0..FFT_N-1 = raw audio samples
+// (signed, summed across NUM_CHANNELS). The original Skywalker macros
+// sampled a 2-row audio texture where y picked waveform-vs-FFT; we
+// collapse both to row 0 (the waveform) and fold the y argument into the
+// x-phase so each terrain-depth iteration still reads a different sample.
+#define _v8_FUNC(x,y)    (texelFetch(iChannel1, ivec2(int(fract((x) + (y) * 0.31) * float(FFT_N)), 0), 0).r * 0.5)
+#define _v8_CAPS2(xx,yy) (texelFetch(iChannel1, ivec2(int(fract((xx) + (yy) * 0.17) * float(FFT_N)), 0), 0).r * 0.35)
+
+#define _v8_CURVE_SPEED   0.35
+#define _v8_STAR_SPEED    0.5
+#define _v8_CAMERA_SPEED  0.3
+#define _v8_SYNC_BASE_TIME (iTime * 0.4)
+
+vec3 _v8_hsv2rgb(vec3 c) {
+    vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
+    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+float _v8_happy_star(vec2 uv, float anim) {
+    uv = abs(uv);
+    vec2 pos = min(uv.xy/uv.yx, anim);
+    float p = (2.0 - pos.x - pos.y);
+    return (2.0+p*(p*p-1.5)) / (uv.x+uv.y);
+}
+
+// _v8_iChannel0 — emulates the original Skywalker shader's iChannel0, which
+// was a Buffer A pass that pre-rendered a 6-octave fractal-noise nebula from
+// a noise source (iChannel2 in that pass). Our Image-tab iChannel0 is pinned
+// to the alphabet font, so we recreate the Buffer-A bake INLINE here as a
+// function. Anywhere the original shader read `texture(iChannel0, uv)` we
+// instead call `_v8_iChannel0(uv)` to get the same nebula sample.
+vec4 _v8_iChannel0(vec2 uv) {
+    vec4 cloud =
+        texture(iChannel2, uv * 0.25)  * 0.5      +
+        texture(iChannel2, uv * 0.5 )  * 0.25     +
+        texture(iChannel2, uv       )  * 0.125    +
+        texture(iChannel2, uv * 2.0 )  * 0.0625   +
+        texture(iChannel2, uv * 4.0 )  * 0.03125  +
+        texture(iChannel2, uv * 8.0 )  * 0.015625;
+    return pow(max(vec4(0.0), (1.0 - length(uv - 0.5) * 2.0) * cloud), vec4(4.0));
+}
+
+// Nebula background — pure 6-octave fractal-noise nebula with circular
+// vignette + gamma-4 shaping (your reference formula). No scanlines, no
+// extra dot(uv,uv) vignette — the bake already does both.
+vec3 _v8_dtcmain(vec2 fragCoord) {
+    vec2 uv = fragCoord.xy / iResolution.xy;
+    return _v8_iChannel0(uv).rgb;
+}
+
+vec4 _v8_f(vec2 uv, float t, float i) {
+    float life = fract(i / float(_v8_NUM_SAMPLES) + t * .13);
+    float fade = pow(life, 1.75) * (1.0 - pow(life, 16.0));
+    vec4 color = 8.0 * fade * vec4(fract(i*0.33), fract(0.33+i*0.33), fract(0.67+i*0.33), 1.0);
+    float s = 1.5 - 1.5 * life;
+    float r = i * 2.73 + t * 0.05 * 0.5;
+    vec2 cs = cos(r + vec2(0.0, -0.5) * 3.14);
+    mat2 m = mat2(cs.x, -cs.y, cs.y, cs.x);
+    // All 4 cloud taps sample the nebula function (same as the original
+    // shader's `texture(iChannel0, …)` reads when iChannel0 was the Buffer-A
+    // nebula bake). _v8_iChannel0 returns vec4 — take .r to match the
+    // original's single-channel read.
+    float samp1 = _v8_iChannel0((0.5 + m * uv * s)).r;
+    float samp2 = _v8_iChannel0((0.5 + m * (uv - vec2(0.0, 0.05))   * s)).r;
+    float samp3 = _v8_iChannel0((0.5 + m * (uv - vec2(0.0, 0.025))  * s)).r;
+    float samp4 = _v8_iChannel0((0.5 + m * (uv - vec2(0.0, 0.0125)) * s)).r;
+    return samp1
+         * (1.0 + (samp2 - samp1) * 8.0)
+         * (1.0 + (samp3 - samp1) * 7.0)
+         * (1.0 + (samp4 - samp1) * 6.0)
+         * color;
+}
+
+vec3 _VizScene(vec2 u) {
+    float kval[_v8_MAX_STARS];
+    vec2 uvTrue = u.xy / iResolution.xy;
+
+    float syncTime   = _v8_SYNC_BASE_TIME * _v8_CURVE_SPEED;
+    float starTime   = _v8_SYNC_BASE_TIME * _v8_STAR_SPEED;
+    float cameraTime = _v8_SYNC_BASE_TIME * _v8_CAMERA_SPEED;
+
+    vec2 curve = vec2(sin(syncTime) * 2.0 * 0.003,
+                      sin(syncTime) * 2.0 * 0.001);
+
+    vec4 o = vec4(0.0, 0.0, 0.0, 1.0);
+    vec2 fc = u; fc.y = iResolution.y - fc.y;
+    o = vec4(_v8_dtcmain(fc), 1.);
+
+    // ── Terrain (synchronized curve) ──
+    vec3 col11 = vec3(0);
+    float d21 = 0.0;
+    for (float i = 0.0; i <= 20.0; i += .5) {
+        float Y1 = _v8_CAPS2(uvTrue.x, i/50.0);
+        vec3 p = d21 * normalize(vec3(u + u, 0) - iResolution.xyx);
+        p.xy += d21 * d21 * curve;
+        if (d21 > 150.0) break;
+        p.z += starTime * 20.0 + i * 0.25;
+        p.y += 1.5 + _v8_FUNC(mod(p.x, p.y), i/20.0);
+        float rotationAngle = syncTime * 0.0001;
+        mat2 rotationMatrix = mat2(cos(rotationAngle), -sin(rotationAngle),
+                                   sin(rotationAngle),  cos(rotationAngle));
+        vec2 rotatedPos = rotationMatrix * p.xy;
+        float s = 1.0 + max(rotatedPos.x, rotatedPos.y + i/2.0)
+                - fract(p.z * 0.2 + i * 0.2) * 0.4
+                - fract(p.z * 0.2 + i * 0.2) * 0.4;
+        d21 += s;
+        vec4 tc = (1.0 + cos(p.z + 1.0 * d21 + vec4(4,2,1,0))) / s;
+        vec2 dd = vec2(1.0, 0.5 * Y1);
+        float zIntensity = 1. + sin(p.z * 0.0002);
+        col11 += 50.0 / exp(-2.0 * cos(i*.2 + sqrt(i) + vec3(0,1,3)) + 2.0)
+               / max(i * sqrt(i), 0.01) * 0.15
+               / (length(rotatedPos - clamp(dot(rotatedPos, dd) / dot(dd,dd), -3.0, 3.0) * dd) / i + i/1e9)
+               * zIntensity;
+    }
+    col11 = tanh(col11 / 300.0);
+
+    // ── Star ID generation (deterministic time-based) ──
+    float timeStamp = floor(iTime / 4.0);
+    int numActiveStars = int(1.0 + fract(sin(timeStamp * 45.123) * 43758.5453) * float(_v8_MAX_STARS));
+    for (int i = 0; i < _v8_MAX_STARS; i++) {
+        kval[i] = (i < numActiveStars)
+            ? fract(sin(timeStamp * (12.9898 + float(i+1) * 78.233)) * 43758.5453) * 50.0
+            : 0.0;
+    }
+
+    // ── Camera setup ──
+    vec2 uv = (u - 0.5 * iResolution.xy - 0.5) / iResolution.y;
+    uv *= 2.0;
+    vec3 vuv = vec3(2.0 * sin(cameraTime), 1.0, sin(cameraTime));
+    vec3 ro  = vec3(0.0, 0.0, 134.0);
+    vec3 vrp = vec3(5.0, sin(cameraTime) * 60.0, 20.0);
+    vrp.xz *= _v8_pR(cameraTime);
+    vrp.yz *= _v8_pR(cameraTime * 0.2);
+    vec3 vpn = normalize(vrp - ro);
+    vec3 uu  = normalize(cross(vuv, vpn));
+    vec3 rd  = normalize(vpn + uv.x * uu + uv.y * cross(vpn, uu));
+
+    vec3 sceneColor      = vec3(0.0, 0.0, 0.3);
+    vec3 flareCol        = vec3(0.0);
+    vec3 flareIntensity  = vec3(0.0);
+
+    for (float k = 0.0; k < 100.0; k++) {
+        float r = _v8_H(vec2(k)) * 2.0 - 1.0;
+        vec3 flarePos = vec3(
+            _v8_H(vec2(k) * r) * 20.0 - 10.0,
+            r * 10.0,
+            mod(sin(k / 100.0 * _v8_PI * 4.0) * 15.0 - starTime * 13.0 * k * 0.007, 10.0)
+        );
+        float starDistance = length(flarePos.xy);
+        flarePos.xy += starDistance * starDistance * curve;
+        flarePos = normalize(flarePos);
+        float v = abs(dot(flarePos, rd));
+        flareIntensity += pow(v, 30000.0) * 2.0;
+        flareIntensity += pow(v, 1e3) * 0.2;
+        flareIntensity *= 1.0 - flarePos.z / 2.0;
+
+        bool showStar = false;
+        float bestZ = 10.0;
+        for (int i = 0; i < _v8_MAX_STARS; i++) {
+            if (kval[i] > 0.0 && k >= kval[i] && k < kval[i] + 1.0) {
+                float starZ = mod(sin(kval[i] / 100.0 * _v8_PI * 4.0) * 15.0
+                                  - starTime * 13.0 * kval[i] * 0.007, 10.0);
+                if (starZ < bestZ) { bestZ = starZ; showStar = true; }
+            }
+        }
+        if (showStar) {
+            float starX = dot(flarePos, uu);
+            float starY = dot(flarePos, cross(vpn, uu));
+            vec2 origUV = (u - 0.5 * iResolution.xy) / iResolution.y;
+            float closeness = 1.0 - flarePos.z;
+            float starScale = 4.0 + closeness * 12.0;
+            vec2 starUV = (origUV - vec2(starX, starY) / 2.4) * starScale;
+            float starShape = _v8_happy_star(starUV, 1.0 + 0.5 * sin(iTime * 0.3));
+            vec3 starCol = starShape * _v8_hsv2rgb(vec3(mod(iTime * 0.1, 1.0), 0.8, 1.0));
+            starCol = min(0.2 * starCol, 6.0);
+            flareIntensity += starCol;
+        }
+        flareCol += flareIntensity * vec3(sin(r * 3.12 - k), r, cos(k) * 2.0) * 0.3;
+    }
+    sceneColor += abs(flareCol);
+    sceneColor = mix(sceneColor, sceneColor.rrr * 1.4, length(uv) / 2.0);
+
+    // ── Cloud overlay ──
+    vec4 sum = vec4(0.0);
+    float rotationAngle = syncTime * 0.0001;
+    mat2 rotationMatrix = mat2(cos(rotationAngle), -sin(rotationAngle),
+                               sin(rotationAngle),  cos(rotationAngle));
+    uv = rotationMatrix * uv;
+    for (int i = 0; i < _v8_NUM_SAMPLES; ++i)
+        sum += _v8_f(uv, iTime * .2, float(i));
+    vec4 cloud = sum.bgra;
+
+    // ── Swirl HSV overlay ──
+    vec2 uv5 = u / iResolution.xy;
+    uv5 -= 0.5;
+    uv5 /= vec2(iResolution.y / iResolution.x, 1.0);
+    uv5.y += 0.4;
+    uv5 = rotationMatrix * uv5;
+    float angle = atan(uv5.y, uv5.x) + starTime;
+    float radius = length(uv5);
+    float swirl = sin(radius * 10.0 - iTime * 3.0) * 0.5 + 0.5;
+    float hue = fract(angle / (2.0 * _v8_PI) + swirl);
+    float saturation = 1.0 - radius;
+    float value = swirl;
+    vec3 color3 = _v8_hsv2rgb(vec3(hue, 0.5 * saturation, value * 0.75));
+
+    // ── Final composite ──
+    // The original shader assigned `o = vec4(sceneColor + tanh(...), 1.0)`
+    // here, which silently discarded the dtcmain nebula bake.  We use the
+    // nebula as the actual background and additively layer the scene
+    // (terrain + stars + swirl) on top, with a small dose of the cloud
+    // overlay as fine atmospheric sparkle.  Cloud weight cut from 0.5 to
+    // 0.15 — at 0.5 the overlay flooded the frame in bright cyan and
+    // hid the tracker text and the per-frame vignette entirely.
+    vec3 nebulaBG = o.rgb;                                        // _v8_dtcmain output, has its own vignette + gamma
+    vec3 scene    = sceneColor + tanh(col11 + color3 * color3 * 0.35);
+    scene        *= sqrt(max(scene, vec3(0.0)));                  // matches original `o *= sqrt(o)` curve
+    o = vec4(nebulaBG + scene + cloud.rgb * 0.15, 1.0);
+    return o.rgb;
+}
+"""
+
 
     image_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.45 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.46 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    IMAGE TAB (v1_4_5) — iChannel0: alphabet texture (shadertoy.com/view/4sf3RB)
                 iChannel1: Buffer A (audio + FFT + smoothed bands)
@@ -5100,7 +7442,7 @@ makeStr(printBPMVal) {bpm_val_chars} _end
 makeStr(printSpdVal) {spd_val_chars} _end
 
 // ---- Static label strings ----
-makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _4 _5 _ _NUM _NUM _NUM _end
+makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _4 _6 _ _NUM _NUM _NUM _end
 makeStr(printCredit) _COPY _2 _0 _2 _6 _ _O _R _B _L _I _V _I _U _S _end
 makeStr(printLoad)   _L _O _A _D _I _N _G _DOT _DOT _DOT _end
 makeStr(printSpec)   _S _P _E _C _T _R _U _M _end
@@ -5790,7 +8132,7 @@ void mainImage(out vec4 O, vec2 C) {{
     # Setup: Buffer A iChannel0 = Buffer A (self-ref)
     #        Image   iChannel1 = Buffer A output
     buffer_a_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.45 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.46 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    Contact: subband@gmail.com or
             subband@protonmail.com
@@ -9330,7 +11672,7 @@ def main():
                              'lanczos3=6-tap sinc (sharpest/brightest, ~50%% more cost — '
                              'use only if you can hear the difference and have headroom). '
                              'Default: bspline (or linear if --max-compat without override).')
-    parser.add_argument('--viz', type=int, choices=[0, 1, 2, 3, 4, 5, 6, 7], default=1,
+    parser.add_argument('--viz', type=int, choices=[0, 1, 2, 3, 4, 5, 6, 7, 8], default=1,
                         help='Image-tab visualizer:\n'
                              '  0 = None             (black backdrop, fastest compile)\n'
                              '  1 = Reactive 001     (PAEz fork — SDF circles + cosmic web)  ← default\n'
@@ -9339,7 +11681,8 @@ def main():
                              '  4 = Maya             (raymarched fractal tunnel-warp)\n'
                              '  5 = Dodecahedron     (Philip Bertani — DR2 IFS fractal raymarcher)\n'
                              '  6 = Disco Combined   (smoke spotlights + lasers/clouds, time-driven)\n'
-                             '  7 = Sparkly 4D       (Philip Bertani — 4D IFS volumetric raymarcher)')
+                             '  7 = Sparkly 4D       (Philip Bertani — 4D IFS volumetric raymarcher)\n'
+                             '  8 = Skywalker        (orblivius — flying-curve terrain + sync stars)')
     parser.add_argument('--samples', action='store_true', default=False,
                         help='Extract each sample (instrument) from the module as a separate '
                              'WAV file (named like 1-samplename.wav, 2-anothername.wav). '
@@ -9408,20 +11751,27 @@ def main():
                         help="FFT size for Buffer A spectrum. Larger = more frequency "
                              "resolution but slower compile. Default: 1024 (or 128 if "
                              "--max-compat without override).")
+    parser.add_argument('--142', '--dsp142', dest='use_142_dsp', action='store_true', default=False,
+                        help='Generate Sound tab with USE_142_DSP=1 — reverts the '
+                             'expensive v1.45 DSP paths (per-note isBass routing in '
+                             'main mix, 2-tap Only3D, 64-iter PhatBass walkback) to '
+                             'their simpler v1.42 forms. Lower shader complexity, '
+                             'compiles on weaker drivers (ANGLE/Mali/older Adreno) '
+                             'that crash on the full v1.45 path. Toggleable at '
+                             "compile time inside the GLSL — flip the #define in "
+                             'Common to switch without re-running the encoder.')
     parser.add_argument('--max-compat', action='store_true', default=False,
-                        help='[NO-OP — max-compat is now the DEFAULT in v1.40+ (current: v1.45)] '
-                             'This flag previously enabled compatibility mode '
-                             'for problematic GPUs/drivers (Windows + Firefox + '
-                             'NVIDIA, etc.). The compat preset (--resampler '
-                             'lanczos3, --reverb-size small, --no-surround, '
-                             '--phatbass, --fft-n 512, FAT4X on, extra HLSL '
-                             'pragmas) is now applied by default since most '
-                             'consumer setups need it and the quality '
-                             'difference is small. To opt OUT of any compat '
-                             'setting, pass the inverse individual flag — '
-                             'e.g. --reverb-size full, --surround. The flag is '
-                             'kept for backward compatibility with old '
-                             'command lines but does nothing.')
+                        help='Maximum-compatibility build: implies --142 '
+                             '(USE_142_DSP=1 → simpler v1.42-style DSP path) '
+                             'plus the lanczos3/small-reverb/no-surround/'
+                             'fft_n=512/extra-pragmas preset that was always '
+                             'the project default. The DSP bit is what '
+                             'actually matters now — strict GLSL parsers '
+                             '(ANGLE/Mali/older Adreno) crash on the full '
+                             'v1.45 path. Use this when the user reports '
+                             '"shader fails to compile" or a black audio '
+                             'tab. Flips can be overridden by individual '
+                             'knobs (--surround, --reverb-size full, etc.).')
     args = parser.parse_args()
 
     # ── Two-pass argv-order config resolution ────────────────────────────
@@ -9454,6 +11804,11 @@ def main():
             'fat4x':                  True,       # KEEP — cheap, audibly worth it
             'fft_n':                  512,        # user wants 512 by default
             '_compat_extra_pragmas':  True,       # HLSL [unroll/loop] pragmas
+            # Flip the Sound tab to the simpler v1.42-compatible DSP path —
+            # this is what actually keeps the shader compiling on ANGLE/Mali/
+            # older Adreno. Without this, --max-compat would be a near-no-op
+            # since the other knobs are already the project defaults.
+            'use_142_dsp':            True,
         },
         # Add future aggregates here. e.g. '--quality-max': {...}
     }
@@ -9603,11 +11958,75 @@ def main():
         mod = MODFile(args.modfile)
         mod.is_s3m = False
         mod.num_channels = 4
-    elif fmt in ('XM', 'IT', 'STM', 'MTM'):
+    elif fmt == 'XM':
+        # Phase-1 XM support — parser flattens instruments to one sample
+        # each, clamps patterns to 64 rows, drops XM-only effects (G/H/K/L/
+        # P/R/T/X), and downconverts 16-bit samples to 8-bit. Engine path
+        # below is the same as for MOD.
+        xm = XMFile(args.modfile)
+        print(f"🎵 {xm.title}")
+        print(f"   Patterns: {xm.num_patterns}, Channels: {xm.num_channels}")
+        print(f"   Speed: {xm.initial_speed}, Tempo: {xm.initial_tempo}")
+        print("   ⚠️  XM support is Phase-1: envelopes/NNA/multi-sample-per-instrument")
+        print("      not yet implemented; XM-specific letter effects (G/H/K/L/P/R/T/X)")
+        print("      drop to no-ops. Most files play recognizably; high-pitched leads")
+        print("      and sub-bass may sit at the wrong octave (engine period clamp).")
+        mod = type('obj', (object,), {
+            'title':         xm.title,
+            'samples':       xm.samples,
+            'num_patterns':  xm.num_patterns,
+            'song_length':   len(xm.song_positions),
+            'song_positions': xm.song_positions,
+            'orders':        xm.song_positions,
+            'patterns':      xm.patterns,
+            'num_channels':  xm.num_channels,
+            'initial_speed': xm.initial_speed,
+            'initial_tempo': xm.initial_tempo,
+            'channel_settings': [],
+            'is_s3m':        False,
+            'is_xm':         True,
+            'is_it':         False,
+        })()
+    elif fmt == 'IT':
+        # Phase-1 IT support — parser handles uncompressed + IT-packed
+        # samples (mikIT-port decompressor), reads compressed pattern
+        # streams with the channel-mask scheme, translates IT letter
+        # effects via the inline _xm_or_it_effect_to_mod table, drops
+        # envelopes/NNA/filters.
+        it = ITFile(args.modfile)
+        print(f"🎵 {it.title}")
+        print(f"   Patterns: {it.num_patterns}, Channels: {it.num_channels}")
+        print(f"   Speed: {it.initial_speed}, Tempo: {it.initial_tempo}")
+        print("   ⚠️  IT support is Phase-1: envelopes/NNA/filters/pitch-envelope/")
+        print("      stereo samples not yet implemented; old (cmwt<0x200) instruments")
+        print("      use simplified mapping. Most files play recognizably.")
+        mod = type('obj', (object,), {
+            'title':         it.title,
+            'samples':       it.samples,
+            'num_patterns':  it.num_patterns,
+            'song_length':   len(it.song_positions),
+            'song_positions': it.song_positions,
+            'orders':        it.song_positions,
+            'patterns':      it.patterns,
+            'num_channels':  it.num_channels,
+            'initial_speed': it.initial_speed,
+            'initial_tempo': it.initial_tempo,
+            'channel_settings': it.channel_settings,
+            'is_s3m':        False,
+            'is_xm':         False,
+            'is_it':         True,
+            # IT mix/global volume — applied as a gain reduction in the
+            # audio mix so we match openMPT's level.
+            'global_volume': it.global_volume,
+            'mix_volume':    it.mix_volume,
+            # IT per-channel default pan (0..64). Used to override the
+            # MOD-style hardcoded LRRL pattern in the audio mix.
+            'channel_pan':   it.channel_pan,
+        })()
+    elif fmt in ('STM', 'MTM'):
         raise ValueError(
             f"{fmt} format is not yet implemented in this player. "
-            f"Currently supported: MOD (full), S3M (partial — effects/c2spd not remapped). "
-            f"Patches welcome."
+            f"Currently supported: MOD (full), S3M (partial), XM/IT (Phase 1)."
         )
     else:
         raise ValueError(
@@ -9722,6 +12141,17 @@ def main():
         # num_channels carry song data; the rest are already empty/disabled.
         # We don't touch those — saves work and avoids any chance of confusing
         # the encoder if it ever cares about the extra columns.
+        #
+        # CRITICAL: PRESERVE GLOBAL EFFECTS from muted channels. Effects
+        # like F (set speed/tempo), D (pattern break), B (position jump)
+        # affect playback timing and song structure — stripping them from
+        # muted channels makes --solo play at wrong tempo / skip pattern
+        # transitions. Specifically, GADGET.IT pat 7 row 0 ch1 has A.03
+        # (set speed 3) which halves row time; without it --solo plays
+        # pat 7 at 2× the duration → bass on track 1 lands at 0:08 instead
+        # of 0:04. Keep those cells' EFFECT (and effect-only cells stay
+        # intact); just zero out the audio side (sample/period/volume).
+        _global_fx = {0xF, 0xD, 0xB}   # MOD: F=tempo/speed, D=patbreak, B=jump
         muted_cells = 0
         for pat_idx, pat in enumerate(mod.patterns):
             if pat is None:
@@ -9729,12 +12159,28 @@ def main():
             for row in pat:
                 upper = min(len(row), mod.num_channels)
                 for ch in range(upper):
-                    if ch != solo_ch:
-                        # Replace in-place. Use copies of `empty` so all rows
-                        # don't alias the same dict (safer if anything later
-                        # mutates a cell).
-                        row[ch] = dict(empty)
-                        muted_cells += 1
+                    if ch == solo_ch:
+                        continue
+                    cell = row[ch]
+                    if is_s3m:
+                        # S3M command codes: 1=A(set speed), 2=B(jump),
+                        # 3=C(pattern break), 14=T(set tempo).
+                        if cell.get('command') in (1, 2, 3, 14):
+                            # keep effect — silence audio side only
+                            row[ch] = {'note': 255, 'instrument': 0,
+                                       'volume': 255,
+                                       'command': cell['command'],
+                                       'info':    cell['info']}
+                        else:
+                            row[ch] = dict(empty)
+                    else:
+                        if cell.get('effect') in _global_fx:
+                            row[ch] = {'sample': 0, 'period': 0,
+                                       'effect': cell['effect'],
+                                       'param':  cell['param']}
+                        else:
+                            row[ch] = dict(empty)
+                    muted_cells += 1
 
         print(f"🎚️  --solo {solo_ch_1based}: kept channel {solo_ch_1based}, "
               f"muted {mod.num_channels - 1} other channel(s) "
@@ -9977,7 +12423,7 @@ Just open `{base_name}_player.html` in a browser - works offline!
 - `0` = Normal (full song loop)
 - `255` = Testing (10 second loop)
 
-Generated by MOD2GLSL v1.45
+Generated by MOD2GLSL v1.46
 """)
     
     # Generate HTML player (now works for both MOD and S3M)
@@ -10325,6 +12771,98 @@ Generated by MOD2GLSL v1.45
 
                 _vqmod.MODFile = _S3MtoVQAdapter
 
+            elif getattr(mod, 'is_xm', False) or getattr(mod, 'is_it', False):
+                # ── XM / IT → VQ encoder bridge ────────────────────────────
+                # XMFile / ITFile already produce MOD-style cells (period,
+                # sample, effect, param), so the adapter is a straight
+                # passthrough — no S3M-letter→MOD-effect remap, no c2spd
+                # compensation, no S3M note-table lookup. Without this
+                # bridge the encoder tries to re-parse the .xm/.it file as
+                # raw MOD bytes, fails, and we fall through to a
+                # create_shadertoy_glsl path that doesn't emit
+                # `patTickOffset`/`patStartRow`/`surr_channels` —
+                # producing GLSL that fails to compile in Buffer A and
+                # Sound. The adapter keeps the VQ success path live.
+                _outer_mod = mod
+
+                class _XMITToVQAdapter:
+                    """Duck-typed adapter that exposes the attributes the
+                    VQ encoder reads (title, samples_info, sample_bytes,
+                    song_length, pattern_order, num_channels, num_patterns,
+                    patterns, data) — built from already-parsed XM/IT data.
+                    Cells go through the MOD 4-byte packed format so the
+                    encoder's pattern walker sees them as native MOD."""
+                    def __init__(self, _path_unused):
+                        m = _outer_mod
+                        self.title = m.title
+                        self.song_length  = len(m.song_positions)
+                        po = list(m.song_positions[:128])
+                        while len(po) < 128:
+                            po.append(0)
+                        self.pattern_order = po
+                        self.num_channels  = m.num_channels
+                        self.num_patterns  = m.num_patterns
+                        self.channel_settings = list(getattr(m, 'channel_settings', []) or [])
+                        self.magic = b'M.K.'   # placeholder; encoder uses
+                                               # num_channels above instead.
+                        # samples_info: 31 entries with the encoder-expected
+                        # field names (XMFile/ITFile use the same dict shape
+                        # as MODFile so this is mostly a passthrough).
+                        self.samples_info = []
+                        self.sample_bytes = []
+                        for i in range(31):
+                            si = m.samples[i] if (i < len(m.samples) and isinstance(m.samples[i], dict)) else None
+                            if si is not None:
+                                arr = si.get('data', None)
+                                raw = (arr.tobytes() if (arr is not None and getattr(arr, 'size', 0) > 0) else b'')
+                                self.samples_info.append(dict(
+                                    name       = si.get('name', ''),
+                                    length     = si.get('length', 0),
+                                    finetune   = si.get('finetune', 0),
+                                    volume     = si.get('volume', 0),
+                                    loop_start = si.get('repeat_point', 0),
+                                    loop_len   = si.get('repeat_length', 0),
+                                ))
+                                self.sample_bytes.append(raw)
+                            else:
+                                self.samples_info.append(dict(
+                                    name='', length=0, finetune=0, volume=0,
+                                    loop_start=0, loop_len=0))
+                                self.sample_bytes.append(b'')
+                        # Pack cells into MOD's 4-byte format. Each cell:
+                        #   b0 = (sample & 0xF0) | ((period >> 8) & 0x0F)
+                        #   b1 = period & 0xFF
+                        #   b2 = ((sample & 0x0F) << 4) | (effect & 0x0F)
+                        #   b3 = param & 0xFF
+                        # Period field is 12 bits (max 4095), sample is
+                        # 5-bit (1..31), effect is 4-bit (0..F).
+                        self.patterns = []
+                        for pat_idx in range(self.num_patterns):
+                            pat = m.patterns[pat_idx] if pat_idx < len(m.patterns) else None
+                            buf = bytearray(64 * self.num_channels * 4)
+                            if pat is not None:
+                                for row_i in range(min(64, len(pat))):
+                                    row = pat[row_i]
+                                    for ch_i in range(self.num_channels):
+                                        cell = row[ch_i] if ch_i < len(row) else None
+                                        if cell is None: continue
+                                        sample = cell.get('sample', 0)
+                                        period = max(0, min(4095, cell.get('period', 0)))
+                                        effect = cell.get('effect', 0)
+                                        param  = cell.get('param', 0)
+                                        o = (row_i * self.num_channels + ch_i) * 4
+                                        buf[o]   = (sample & 0xF0) | ((period >> 8) & 0x0F)
+                                        buf[o+1] = period & 0xFF
+                                        buf[o+2] = ((sample & 0x0F) << 4) | (effect & 0x0F)
+                                        buf[o+3] = param & 0xFF
+                            self.patterns.append(bytes(buf))
+                        # Encoder's actual_pattern_rows() reads cell bytes
+                        # from `self.data` to detect Dxx/Bxx — synthesize a
+                        # MOD-shaped blob with 1084-byte header padding.
+                        self.data = b'\x00' * 1084 + b''.join(self.patterns)
+
+                _vqmod.MODFile = _XMITToVQAdapter
+
             try:
                 _vqmod.main(args.modfile, glsl_common_file, K=256, weighted=True, downsample=args.downsample, bitrate=args.bitrate, vec_dim=args.vec_dim, resampler=args.resampler, no_rvq2=args.no_rvq2)
             finally:
@@ -10338,17 +12876,20 @@ Generated by MOD2GLSL v1.45
                 3: "Zuvuya (city/stars + audio-reactive curtain)",
                 4: "Maya (raymarched fractal tunnel-warp)",
                 5: "Dodecahedron (Philip Bertani — DR2 IFS fractal raymarcher)",
+                6: "Disco Inferno + UFOff Dancer (orblivius/finalman/Lallis — dance-floor scene with poi)",
+                7: "Sparkly 4D (Philip Bertani — 4D IFS volumetric raymarcher)",
+                8: "Skywalker (orblivius — synchronized flying-curve terrain + star field + cloud)",
             }
             _vname = _viz_names.get(args.viz, f"viz{args.viz}")
             try:
                 with open(glsl_common_file) as _cf: _ct = _cf.read()
                 # The VQ encoder's emitted Common still carries its own version
                 # (currently v1.42 inside the inner b64 blob). Rewrite any v1.4x
-                # to the current v1.45 so all four tabs stamp the same number.
+                # to the current v1.46 so all four tabs stamp the same number.
                 import re as _re_v
                 _ct = _re_v.sub(
                     r"GLSL \(The Last\) MOD Player v1\.\d+(?: \(c\) 2026 Orblivius)",
-                    "GLSL (The Last) MOD Player v1.45 (c) 2026 Orblivius", _ct, count=1)
+                    "GLSL (The Last) MOD Player v1.46 (c) 2026 Orblivius", _ct, count=1)
                 _ct = _ct.replace("   COMMON TAB\n", f"   COMMON TAB\n   Visualizer: {_vname}\n", 1)
 
                 # Inject visualizer note-synth helpers (waveType[] + _synthWave).
@@ -10381,6 +12922,29 @@ Generated by MOD2GLSL v1.45
                         # No anchor found — append at end. Image will still find
                         # the symbols since GLSL allows forward use within Common.
                         _ct = _ct + '\n' + _synth_block
+
+                # Inject USE_142_DSP toggle into the VQ-emitted Common. The
+                # Sound tab tests this with #if USE_142_DSP to switch between
+                # v1.45 fancy DSP and v1.42-compatible simpler DSP. Default
+                # tracks the --142 CLI flag.
+                if 'USE_142_DSP' not in _ct:
+                    _use142_int = 1 if getattr(args, 'use_142_dsp', False) else 0
+                    _ct = (
+                        "// DSP mode switch — 0 = v1.45 (fancy), 1 = v1.42-compatible (simpler).\n"
+                        f"#define USE_142_DSP {_use142_int}\n\n"
+                    ) + _ct
+
+                # Inject PHATBASS_MIX_MODE into the VQ-emitted Common (encoder
+                # doesn't emit it). 0 = per-sample (only isBass[] taps), 1 =
+                # mix-wide (entire mix gets Hilbert cross-pan). Default
+                # tracks --phatbass-mode resolved against bass detection.
+                if 'PHATBASS_MIX_MODE' not in _ct:
+                    _pb_mode_cli = getattr(args, 'phatbass_mode', 'sample')
+                    _pb_mix_int = 0 if _pb_mode_cli == 'sample' else (1 if _pb_mode_cli == 'mix' else 0)
+                    _ct = _ct + (
+                        "\n// PhatBass routing — 0 = per-sample, 1 = mix-wide. Flip to override.\n"
+                        f"#define PHATBASS_MIX_MODE {_pb_mix_int}\n"
+                    )
 
                 # Inject audio playback timing defines used by Sound (for
                 # playbackTime computation) and Image/BufferA (for visualizer
@@ -10431,6 +12995,31 @@ Generated by MOD2GLSL v1.45
                     f"#define SPEED             {_speed_actual}",
                     1
                 )
+
+                # ── IT master volume (#define MASTER_GAIN) ─────────────────
+                # IT files carry a global_volume + mix_volume pair (header
+                # offsets 0x30/0x31). openMPT applies their product as a
+                # master attenuation: master = global * mix / 128² so a
+                # GADGET.IT mix_vol=48 → 0.375× output. The VQ-encoded
+                # Sound has no master gain — runs everything at full scale,
+                # then stacks PhatBass + FAT4X + ×1.3 crank on top until
+                # the DAC clips on every sample. Inject MASTER_GAIN here
+                # so the mix sits where openMPT puts it. For non-IT files
+                # both fields default to 128 → MASTER_GAIN = 1.0 (no
+                # attenuation, MOD/XM behavior preserved).
+                _gv = int(getattr(mod, 'global_volume', 128))
+                _mv = int(getattr(mod, 'mix_volume', 128))
+                _master_gain = (_gv * _mv) / (128.0 * 128.0)
+                if 'MASTER_GAIN' not in _ct:
+                    # Splice right after the BPM/SPEED defines.
+                    _bpm_def = f"#define BPM               {_bpm_actual}"
+                    _ct = _ct.replace(
+                        _bpm_def,
+                        f"#define MASTER_GAIN       {_master_gain:.4f}f   "
+                        f"// IT gv={_gv} mv={_mv} → {_master_gain:.4f}\n"
+                        + _bpm_def,
+                        1)
+
                 # Override FX flags hardcoded by the VQ encoder.
                 # The encoder bakes `enableFAT = true` and `enable3D = true`
                 # into its emitted Common file regardless of CLI flags. The
@@ -10441,6 +13030,18 @@ Generated by MOD2GLSL v1.45
                 # by rewriting these constants here.
                 _no_fat = bool(getattr(args, '_compat_no_fat', False))
                 _no_surround = bool(getattr(args, '_compat_no_surround', False))
+                # Inject enablePhatBass + enableVelvetReverb right after the
+                # encoder's enableFAT line (the encoder doesn't emit them).
+                # PhatBass + FAT4X used to be gated together by enableFAT —
+                # now they're separate. Velvet reverb is opt-in (default off).
+                _phatbass_val = "false" if _no_fat else "true"
+                if 'enablePhatBass' not in _ct:
+                    _ct = _ct.replace(
+                        'const bool  enableFAT     = true;',
+                        f'const bool  enableFAT     = true;\n'
+                        f'const bool  enablePhatBass = {_phatbass_val};\n'
+                        f'const bool  enableVelvetReverb = false;', 1
+                    )
                 if _no_fat:
                     _ct = _ct.replace(
                         'const bool  enableFAT     = true;',
@@ -10451,6 +13052,117 @@ Generated by MOD2GLSL v1.45
                         'const bool  enable3D      = true;',
                         'const bool  enable3D      = false;', 1
                     )
+                # ── IT channel pan: replace VQ encoder's channelPan when IT carries pan data ──
+                # The VQ encoder uses S3M-style channel_settings (mute flags
+                # for IT) and emits all-LEFT panning for IT files. Replace
+                # the channelPan const with values derived from IT's
+                # channel_pan (range 0..64, where 0=L, 32=center, 64=R)
+                # so the GLSL stereo image matches what openMPT plays.
+                _it_pan = list(getattr(mod, 'channel_pan', []) or [])
+                if _it_pan and max(_it_pan or [0]) > 1:
+                    import re as _re
+                    _nc = int(getattr(mod, 'num_channels', len(_it_pan)))
+                    _vals = []
+                    for i in range(32):
+                        if i < min(_nc, len(_it_pan)):
+                            _v = max(0, min(64, _it_pan[i])) / 64.0
+                            _vals.append(f'{_v:.3f}')
+                        else:
+                            _vals.append('0.5')
+                    _new_pan_line = (
+                        'const float channelPan[32] = float[]('
+                        + ', '.join(_vals) + ');')
+                    _pan_pat = _re.compile(
+                        r'const\s+float\s+channelPan\s*\[\s*32\s*\]\s*=\s*'
+                        r'float\s*\[\s*\]\s*\([^)]*\)\s*;',
+                        _re.MULTILINE)
+                    _ct, _n = _pan_pat.subn(_new_pan_line, _ct, count=1)
+
+                # ── XM key-off support: inject sampleFadeout / sampleReleaseHold ──
+                # The VQ encoder's Common doesn't carry XM envelope info. Splice
+                # parallel const-int arrays right after the `samples[]` decl so
+                # the patched getChannelOutput (below) can index them. For non-XM
+                # samples both arrays are zero/64 → key-off path becomes a no-op.
+                if 'sampleFadeout[31]' not in _ct:
+                    _xm_samples = list(getattr(mod, 'samples', []))[:31]
+                    while len(_xm_samples) < 31:
+                        _xm_samples.append({})
+                    _fo_v = ', '.join(str(s.get('fadeout', 0)) for s in _xm_samples)
+                    _rh_v = ', '.join(str(int(round(s.get('release_factor', 1.0) * 64)))
+                                      for s in _xm_samples)
+                    # sampleEnvBaseGain: pre-baked average envelope gain for
+                    # samples whose envelope plays through to end without a
+                    # sustain hold (env_sus=False with env_pts). The GLSL is
+                    # stateless and can't simulate per-tick envelope advance
+                    # like the JS engine does — so we apply the time-weighted
+                    # average y as a constant gain for these voices. Without
+                    # this, GADGET.IT inst 27 "Sinewave-envelope" plays at
+                    # FULL volume in the GLSL while the JS engine modulates
+                    # it down to ~22% average. For samples with sustain
+                    # (env_sus=True) or no envelope, gain stays 64 (= 1.0,
+                    # no attenuation) and xmReleaseMul handles release tail.
+                    def _env_base_gain(s):
+                        if (s.get('env_pts') and not s.get('env_sus', False)):
+                            return int(round(s.get('release_factor', 1.0) * 64))
+                        return 64
+                    _eg_v = ', '.join(str(_env_base_gain(s)) for s in _xm_samples)
+                    # sampleC5Speed: raw c5_speed (samples/sec at C-5) for IT
+                    # samples that ship with values outside MOD's 8000-8800
+                    # finetune range — most IT drum/lead/sinewave samples.
+                    # The encoder squashes c5_speed into a 4-bit finetune
+                    # nibble, capping at 8757 Hz; without this array, IT's
+                    # inst 27 sinewave (c5=168000) plays 4 octaves too low.
+                    # 0 = use the c4speeds[finetune] fallback (MOD/XM path).
+                    _c5_v = ', '.join(str(s.get('c5_speed', 0)) for s in _xm_samples)
+                    # sampleNNA: New-Note-Action byte for each sample (0=cut,
+                    # 1=continue, 2=note-off, 3=note-fade). The GLSL needs
+                    # this to know when an old voice should fade through its
+                    # envelope release tail instead of being instantly cut
+                    # by a new trigger. inst 8 (Siner lead) has nna=2 and
+                    # an envelope ending at 0 — without ghost release the
+                    # lead notes click off instead of decaying smoothly.
+                    _nna_v = ', '.join(str(s.get('nna', 0)) for s in _xm_samples)
+                    # sampleEnvReleaseDur: length of the envelope's release
+                    # segment in TICKS (env_pts[-1].x - env_pts[sus_pt].x).
+                    # 0 means no envelope or no sustain → no ghost-release
+                    # window. Used to size the previous-note crossfade for
+                    # NNA-noteoff samples; we render the prev voice with a
+                    # linear fade across this duration in lieu of stateful
+                    # per-tick envelope simulation.
+                    def _env_rel_dur(s):
+                        if not (s.get('env_pts') and s.get('env_sus', False)):
+                            return 0
+                        sus_pt = s.get('env_sus_pt', 0)
+                        pts = s['env_pts']
+                        if sus_pt < len(pts) and len(pts) > 1:
+                            return max(0, pts[-1][0] - pts[sus_pt][0])
+                        return 0
+                    _rd_v = ', '.join(str(_env_rel_dur(s)) for s in _xm_samples)
+                    _arrays_block = (
+                        f"\n// XM key-off envelope helpers (parallel to samples[]).\n"
+                        f"const int sampleFadeout[31]     = int[]({_fo_v});\n"
+                        f"const int sampleReleaseHold[31] = int[]({_rh_v});\n"
+                        f"// Pre-baked average envelope gain for non-sustained\n"
+                        f"// envelopes (env_sus=False). Applied as a constant\n"
+                        f"// gain to approximate the JS engine's per-tick\n"
+                        f"// envelope advance in this stateless shader.\n"
+                        f"const int sampleEnvBaseGain[31] = int[]({_eg_v});\n"
+                        f"// Raw c5_speed for IT samples (overrides finetune-\n"
+                        f"// table lookup when > 0). Required for IT samples\n"
+                        f"// with c5_speed outside MOD's 8000-8800 range.\n"
+                        f"const int sampleC5Speed[31]     = int[]({_c5_v});\n"
+                        f"// IT NNA byte (0=cut 1=cont 2=off 3=fade) and\n"
+                        f"// envelope release duration in ticks. Together\n"
+                        f"// they let the previous-note crossfade widen to a\n"
+                        f"// proper ghost release for NNA=2/3 voices.\n"
+                        f"const int sampleNNA[31]         = int[]({_nna_v});\n"
+                        f"const int sampleEnvReleaseDur[31] = int[]({_rd_v});\n"
+                    )
+                    # Find end of `samples[]` array initializer and inject after.
+                    _smp_end = _ct.find(');', _ct.find('const SampleInfo samples['))
+                    if _smp_end >= 0:
+                        _eol = _ct.find('\n', _smp_end)
+                        _ct = _ct[:_eol+1] + _arrays_block + _ct[_eol+1:]
                 with open(glsl_common_file, 'w') as _cf: _cf.write(_ct)
             except Exception as _vqcommon_err:
                 print(f"   WARNING: VQ-Common post-processing failed ({_vqcommon_err})")
@@ -10470,6 +13182,7 @@ Generated by MOD2GLSL v1.45
                                      'fft_n':         getattr(args, '_compat_fft_n', 256),
                                      'extra_pragmas': getattr(args, '_compat_extra_pragmas', False),
                                      'phatbass_mode': args.phatbass_mode,
+                                     'use_142_dsp':   args.use_142_dsp,
                                  })
             glsl_common_file = _fb_glsl.replace('.glsl', '_common.glsl')
 
@@ -10489,6 +13202,7 @@ Generated by MOD2GLSL v1.45
                              'fft_n':         getattr(args, '_compat_fft_n', 256),
                              'extra_pragmas': getattr(args, '_compat_extra_pragmas', False),
                              'phatbass_mode': args.phatbass_mode,
+                             'use_142_dsp':   args.use_142_dsp,
                          })
     import os as _os2
     # create_shadertoy_glsl writes: _tmp_tabs_shadertoy_common/sound/image/bufferA.glsl
@@ -10640,8 +13354,230 @@ Generated by MOD2GLSL v1.45
                 # _gcoBody must come BEFORE getChannelOutput (which calls it).
                 if _gcobody_fn: _prelude_parts.append(_gcobody_fn + '\n')
                 if _gco_fn: _prelude_parts.append(_gco_fn + '\n')
+                # ── XM key-off release multiplier ─────────────────────────────
+                # Stateless backward-scan helper. For each sample, returns
+                # 0..1 representing the env-release × fadeout multiplier when
+                # a key-off cell (instrument byte ≥ 128, period == 0) is the
+                # most-recent event on the channel BEFORE the current trigger.
+                # Reads the parallel arrays sampleFadeout/sampleReleaseHold
+                # injected into Common above.
+                _prelude_parts.append("""\
+// XM key-off envelope-release helper — applied as a multiplier on the
+// channel output. Combines three effects:
+//   1. ENV BASE GAIN — pre-baked time-weighted average env y for samples
+//      whose envelope plays through to end without sustain (env_sus=False).
+//      The shader is stateless and can't simulate the JS engine's per-tick
+//      envelope advance, so we apply the average as a constant gain.
+//      For sustained-env or env-less samples, this is 1.0 (no effect).
+//   2. ANTI-ALIAS GAIN — when playback freq > Nyquist (chip-leads at
+//      c5=33000 playing C-7, sinewaves at c5=168000 playing low notes),
+//      lanczos-3 still aliases above-Nyquist content into the audible
+//      range. Apply linear `nyq/freq` rolloff with a 0.3 floor for
+//      single-cycle synth waveforms (c5 > 50000) — matches the JS
+//      engine's anti-alias compensation.
+//   3. RELEASE FADE — when the most recent event was a key-off (instrument
+//      byte ≥ 128, period == 0), drop ~40 ms toward releaseHold then linear
+//      fadeout decay.
+// All three are folded into a single multiplier so the per-sample mix loop
+// only pays the cost of one trigger search.
+float xmReleaseMul(int ch, Position pos, float curTime) {
+    int sR = pos.row, sP = pos.songPos;
+    int koGlobalRow = -1;
+    int trigInst = 0;
+    int trigPeriod = 0;
+    // ── IT note-cut detection ──
+    // While scanning back for the most recent trigger, also watch for any
+    // note-cut event (instrument byte bit 6 = 0x40, period=0). A cut found
+    // BEFORE the trigger when walking backward means the cut happened
+    // AFTER the trigger in song time — voice should be silenced. Without
+    // this the GLSL ignores note-cut cells entirely (e.g. GADGET.IT pat 8
+    // r10 ch0 has note-cut alongside an F-effect; my parser marks it
+    // with bit 6, the JS engine handles it, but the GLSL kept playing
+    // the bass for 14 seconds afterward).
+    bool sawCutAfterTrig = false;
+    for (int lb = 0; lb < 128; lb++) {
+        Note n = getNote(sP, sR, ch);
+        bool isKO   = (n.instrument >= 128) && (n.period <= 0);
+        bool isCut  = ((n.instrument & 0x40) != 0) && (n.instrument < 128) && (n.period <= 0);
+        bool isTrig = !isKO && !isCut && (n.period > 0);
+        if (isKO && koGlobalRow < 0) {
+            koGlobalRow = patRowOffset[sP] + (sR - patStartRow[sP]);
+        }
+        if (isCut && trigInst == 0) {
+            // Note: trigInst==0 means we haven't found a prior trigger yet,
+            // so this cut comes AFTER the most-recent trigger in song time.
+            sawCutAfterTrig = true;
+        }
+        if (isTrig) {
+            trigPeriod = n.period;
+            trigInst = (n.instrument >= 1 && n.instrument < 128 && (n.instrument & 0x40) == 0) ? n.instrument : 0;
+            if (trigInst <= 0) {
+                int sR2 = sR, sP2 = sP;
+                for (int lb2 = 1; lb2 < 128; lb2++) {
+                    sR2--;
+                    if (sR2 < 0) {
+                        if (sP2 > 0) { sP2--; sR2 = patStartRow[sP2] + (patRowOffset[sP2+1] - patRowOffset[sP2]) - 1; }
+                        else break;
+                    }
+                    Note p2 = getNote(sP2, sR2, ch);
+                    if (p2.instrument > 0 && p2.instrument < 128) { trigInst = p2.instrument; break; }
+                }
+            }
+            break;
+        }
+        sR--;
+        if (sR < 0) {
+            if (sP > 0) { sP--; sR = patStartRow[sP] + (patRowOffset[sP+1] - patRowOffset[sP]) - 1; }
+            else break;
+        }
+    }
+    // Note-cut takes priority over everything else — voice is silenced
+    // from the cut row onward, regardless of envelope/release/fadeout.
+    if (sawCutAfterTrig) return 0.0;
+    // Resolve env base gain (1.0 for samples without continuous-env; pre-
+    // baked avg for inst 27-style sinewave-envelopes). Applied to every
+    // return path so even voices without a key-off get the right average.
+    float baseGain = (trigInst > 0 && trigInst <= 31)
+        ? float(sampleEnvBaseGain[trigInst - 1]) / 64.0
+        : 1.0;
+    // Anti-alias gain compensation. lanczos-3 helps but doesn't fully
+    // suppress aliasing when stride > 1 source-sample-per-output (e.g.
+    // sinewave at c5=168000 playing period 143 → stride 11.4). Without
+    // this, IT chip leads / sinewaves come through 2-5× too loud and
+    // fizzy. Floor at 0.3 for c5 > 50000 — single-cycle synth waveforms
+    // have no real high-freq content to alias, so 95%+ rolloff buries
+    // them unnecessarily.
+    if (trigInst > 0 && trigInst <= 31 && trigPeriod > 0) {
+        int _c5 = sampleC5Speed[trigInst - 1];
+        float _c5f = (_c5 > 0) ? float(_c5) : c4speeds[samples[trigInst - 1].finetune & 0xF];
+        float _freq = _c5f * 428.0 / float(trigPeriod);
+        const float _nyq = 22050.0;
+        if (_freq > _nyq) {
+            float _aaFloor = (_c5 > 50000) ? 0.3 : 0.0;
+            baseGain *= max(_aaFloor, _nyq / _freq);
+        }
+    }
+    if (koGlobalRow < 0 || trigInst <= 0 || trigInst > 31) return baseGain;
+    int fo = sampleFadeout[trigInst - 1];
+    if (fo <= 0) return 0.0;
+    // VQ-emitted Common uses fetchTick(globalRow) → cumulative tick count;
+    // divide by TICKS_PER_SEC to get seconds. The fallback Common layout
+    // uses rowStartTime[] directly — both end up as seconds.
+    float koTime = float(fetchTick(koGlobalRow)) / TICKS_PER_SEC;
+    float relTime = curTime - koTime;
+    if (relTime <= 0.0) return baseGain;
+    float drop = clamp(relTime * 25.0, 0.0, 1.0);
+    float hold = float(sampleReleaseHold[trigInst - 1]) / 64.0;
+    float envMul = mix(1.0, hold, drop);
+    // ticks elapsed since key-off = seconds × ticks/sec.
+    float ticksKO = relTime * TICKS_PER_SEC;
+    float fadeMul = max(0.0, 1.0 - 2.0 * float(fo) * ticksKO / 65536.0);
+    return envMul * fadeMul * baseGain;
+}
+""")
                 _prelude_parts.append("// ═══ end sample decoders ═══════════════════════════════════════════════\n\n")
                 _prelude = '\n'.join(_prelude_parts)
+
+                # Multiply each getChannelOutput call by the XM key-off release
+                # mul. Pattern is `mix += getChannelOutput(ch, T, pos, rowTime)`
+                # — splice in `* xmReleaseMul(ch, pos, T)` at the same call.
+                _sound_src = _re3.sub(
+                    r'getChannelOutput\(\s*(\w+)\s*,\s*([^,]+?)\s*,\s*(\w+)\s*,\s*(\w+)\s*\)',
+                    r'(getChannelOutput(\1, \2, \3, \4) * xmReleaseMul(\1, \3, \2))',
+                    _sound_src)
+
+                # ── NNA ghost release: widen previous-note crossfade ──────
+                # The default 64-sample crossfade is just an anti-click
+                # ramp. For samples with NNA=noteoff/notefade (e.g. inst 8
+                # "Siner lead" with env_pts ending at 0), a NEW trigger
+                # should leave the OLD voice playing through its envelope
+                # release tail. Replace the fixed 64-sample window with one
+                # sized by the previous sample's release duration when its
+                # NNA calls for a fade — and use a "ghost overlay" mix (new
+                # at full + old fading linearly to 0) instead of a blend
+                # crossfade. Without this, every Siner lead note clicks
+                # off into the next instead of decaying smoothly.
+                _prelude = _re3.sub(
+                    r'if \(ageSamples < 64\.0 && ageSamples >= 0\.0\) \{',
+                    'float _xfLen = 64.0;\n'
+                    '    {\n'
+                    '        // peek prev trigger inst — quick scan for NNA window\n'
+                    '        int _pInst = 0;\n'
+                    '        for (int _lb = 0; _lb < 64; _lb++) {\n'
+                    '            int _r = trigRow - 1 - _lb;\n'
+                    '            int _p = trigPat;\n'
+                    '            if (_r < 0) { if (_p > 0) { _p--; _r = patStartRow[_p] + (patRowOffset[_p+1] - patRowOffset[_p]) - 1; } else break; }\n'
+                    '            Note _pp = getNote(_p, _r, ch);\n'
+                    '            bool _isTone = ((_pp.effect == 0x3 || _pp.effect == 0x5) && _pp.period > 0);\n'
+                    '            if (_pp.period > 0 && !_isTone) { _pInst = _pp.instrument; break; }\n'
+                    '        }\n'
+                    '        if (_pInst >= 1 && _pInst <= 31) {\n'
+                    '            int _nna = sampleNNA[_pInst - 1];\n'
+                    '            int _relTicks = sampleEnvReleaseDur[_pInst - 1];\n'
+                    '            if ((_nna == 2 || _nna == 3) && _relTicks > 0) {\n'
+                    '                _xfLen = float(_relTicks) * (44100.0 / TICKS_PER_SEC);\n'
+                    '            }\n'
+                    '        }\n'
+                    '    }\n'
+                    '    if (ageSamples < _xfLen && ageSamples >= 0.0) {',
+                    _prelude, count=1)
+                _prelude = _re3.sub(
+                    r'float t = ageSamples / 64\.0;\s*\n\s*return s_prev \* \(1\.0 - t\) \+ s_curr \* t;',
+                    '// Ghost overlay for long releases (NNA=2/3 + envelope):\n'
+                    '            // current at full + prev fading linearly to 0.\n'
+                    '            // Short crossfade (64-sample anti-click) keeps blend.\n'
+                    '            if (_xfLen > 64.5) {\n'
+                    '                float _fade = max(0.0, 1.0 - ageSamples / _xfLen);\n'
+                    '                return s_curr + s_prev * _fade;\n'
+                    '            }\n'
+                    '            float t = ageSamples / 64.0;\n'
+                    '            return s_prev * (1.0 - t) + s_curr * t;',
+                    _prelude, count=1)
+
+                # ── IT c5_speed override: replace c4speeds[finetune] lookups ──
+                # The VQ encoder emits `c4speeds[smp.finetune & 0xF] * 428.0`
+                # for the playback-rate multiplier. For IT samples whose
+                # c5_speed is outside the c4speeds table's 7895–8757 range
+                # (e.g. inst 27 sinewave at c5=168000, chiprez at c5=33448),
+                # the finetune nibble caps and the GLSL plays the sample
+                # multiple octaves too low (= the "samples sound distorted"
+                # symptom). When sampleC5Speed[i] > 0, prefer it; otherwise
+                # fall back to the finetune lookup (MOD/XM compatibility).
+                # NOTE: the c4speeds expressions live inside _gcoBody which
+                # is part of the PRELUDE string, not _sound_src yet — apply
+                # the rewrite to the prelude before it gets injected below.
+                _prelude = _re3.sub(
+                    r'c4speeds\[\s*smp\.finetune\s*&\s*0xF\s*\]\s*\*\s*428\.0',
+                    r'((sampleC5Speed[trigNote.instrument - 1] > 0 ? '
+                    r'float(sampleC5Speed[trigNote.instrument - 1]) : '
+                    r'c4speeds[smp.finetune & 0xF]) * 428.0)',
+                    _prelude)
+                # And the periodToFreqFt() call site uses the same lookup
+                # internally — replace the call with a direct computation
+                # that honors sampleC5Speed.
+                _prelude = _re3.sub(
+                    r'periodToFreqFt\(\s*max\(\s*1\s*,\s*int\(basePeriod\)\s*\)\s*,\s*smp\.finetune\s*\)',
+                    r'((sampleC5Speed[trigNote.instrument - 1] > 0 ? '
+                    r'float(sampleC5Speed[trigNote.instrument - 1]) : '
+                    r'c4speeds[smp.finetune & 0xF]) * 428.0 / max(1.0, basePeriod))',
+                    _prelude)
+
+                # ── Loud-mode normFactor + post-softLimit makeup gain ──────────
+                # The VQ encoder bakes `normFactor = 2.0 / float(NUM_CHANNELS)`
+                # into the Sound mix, which drops to 0.167 for 12-channel XM —
+                # most of the audible loudness disappears. Replace with the
+                # 4-ch=2/N / >4-ch=0.65 split, matching the JS engine. Then
+                # splice a hard-clip makeup gain right after the softLimit
+                # call (or any reasonable late stage) for >4-channel formats.
+                _nc_actual = mod.num_channels if hasattr(mod, 'num_channels') else 4
+                if _nc_actual > 4:
+                    _sound_src = _sound_src.replace(
+                        'const float normFactor = 2.0 / float(NUM_CHANNELS);',
+                        f'const float normFactor = 0.55;   // loud mode (>4 channels)')
+                    # NOTE: the chain restructure (fat_cs1 → phatbass → softlim)
+                    # is now baked into mod_player.py's mainSound emission, so
+                    # the VQ-emitted Sound already has the correct order plus
+                    # final softLimit. No post-VQ tail-limit splice needed.
 
                 # Replace any "are in Common" comment with "are above"
                 _sound_src = _sound_src.replace(
