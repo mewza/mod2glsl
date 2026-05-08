@@ -60,6 +60,7 @@ $\color{limegreen}\textsf{+}$ &nbsp; **Fixed most of the pattern playback bugs i
 </p>
 <p align="center">
 <samp>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>BEYOND.MOD</b> • <a href="https://www.shadertoy.com/view/s3l3R8">shadertoy.com/view/s3l3R8</a></samp><br>
+<samp>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>GUITAROUS.MOD</b> • <a href="https://www.shadertoy.com/view/N3s3WN">shadertoy.com/view/N3s3WN</a></samp><br>
 <samp>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>SPCDEBRIS.MOD</b> • <a href="https://www.shadertoy.com/view/fXf3D4">shadertoy.com/view/fXf3D4</a></samp><br>
 <samp>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>GADGET.IT</b> • <a href="https://www.shadertoy.com/view/s3sGWM">shadertoy.com/view/s3sGWM</a></samp><br>
 <samp>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>MV-FLUTES.XM</b> • <a href="https://www.shadertoy.com/view/7Xs3WM">shadertoy.com/view/7Xs3WM</a></samp><br>
