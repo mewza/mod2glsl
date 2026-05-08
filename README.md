@@ -1,8 +1,8 @@
 <div align="center">
 
-# 🎵 MOD2GLSL v1.45
+# 🎵 MOD2GLSL v1.50
 
-$${\Large\color{orange}\textsf{GLSL MOD Player v1.45 for ShaderToy}}$$
+$${\Large\color{orange}\textsf{GLSL MOD Player v1.50 for ShaderToy}}$$
 $${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
 
 ![Version](https://img.shields.io/badge/version-1.37-orange?style=flat-square)
@@ -18,7 +18,7 @@ $${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
 
 https://github.com/user-attachments/assets/4c7fe125-086c-410b-bcba-808fc7648984
 
-*BEYOND_MUSIC.MOD rendered through GLSL MOD Player v1.45*
+*BEYOND_MUSIC.MOD rendered through GLSL MOD Player v1.50*
 
 </div>
 
@@ -27,14 +27,16 @@ Example: % python mod_player.py beyond.mod --max-compat --viz 6   --resampler la
 
 ---
 
-## $${\color{limegreen}\textsf{✨ What's new in v1.45}}$$
+## $${\color{limegreen}\textsf{✨ What's new in v1.50}}$$
 
+$\color{limegreen}\textsf{+}$ &nbsp; **Impulse Tracker (IT) w/ NNA support**  <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Fast Tracker II (XM) support**  <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **ScreamTracker 3.xx (S3M) support**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **TRU 3D Surround** (new improved AllPass 3D Surround technique)<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Phat Bass — Hilbert applied to bass tracks or a mix**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Velvet Reverb** <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **FAT 4X** (Fat curve compressor)<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **W1 (Low latency) Limiter** <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **Full ScreamTracker 3.xx (S3M) support and playback**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **RVQ sample compression** — 27.7 dB<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Mouse control to horizontal scroll between tracks**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Downsampling integrated with RVQ (--downsample 1, 2 or 4)**<br>
