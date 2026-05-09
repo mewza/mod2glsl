@@ -23,8 +23,9 @@ https://github.com/user-attachments/assets/4c7fe125-086c-410b-bcba-808fc7648984
 </div>
 
 Convert Amiga ProTracker mod files (MOD, S3M, XM, and IT) into a ShaderToy shader, complete with visualization and a note/effect overlay.
-Example: % python mod_player.py beyond.mod --max-compat --viz 6   --resampler lanczos3<br>
-
+Examples: <br>
+    % python mod_player.py beyond.mod --max-compat --viz 6   --resampler lanczos3<br>
+    % python3 mod_player.py Firestorm.it --max-compat --viz 3 --no-rvq2  --bitrate ultra<br>
 ---
 
 ## $${\color{limegreen}\textsf{✨ What's new in v1.51}}$$
