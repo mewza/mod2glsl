@@ -1707,6 +1707,7 @@ class ITFile:
             else:
                 mask = last_mask[ch]
             note = inst = vol = eff = par = 0
+            inst_explicit = False     # True only if mask bit 0x02 set
             if mask & 0x01:
                 if cur >= n: break
                 note = data[cur]; cur += 1
@@ -1715,10 +1716,15 @@ class ITFile:
                 if cur >= n: break
                 inst = data[cur]; cur += 1
                 last_inst[ch] = inst
+                inst_explicit = True
+            vol_col_present = False
             if mask & 0x04:
                 if cur >= n: break
                 vol = data[cur]; cur += 1
                 last_vol[ch] = vol
+                vol_col_present = True
+            if mask & 0x40:
+                vol_col_present = True
             if mask & 0x08:
                 if cur+1 >= n: break
                 eff = data[cur]; par = data[cur+1]; cur += 2
@@ -1727,6 +1733,10 @@ class ITFile:
                 note = last_note[ch]
             if mask & 0x20:
                 inst = last_inst[ch]
+                # NOT setting inst_explicit — cell only inherits, doesn't
+                # introduce a "new instrument" event. mikIT semantic: a
+                # note without explicit inst is a pitch change, no
+                # envelope/channel-volume reset.
             if mask & 0x40:
                 vol = last_vol[ch]
             if mask & 0x80:
@@ -1792,12 +1802,58 @@ class ITFile:
             if eff != 0 and m_eff == 0 and m_par == 0:
                 self._unsupported_effects += 1
 
-            # Volume column: 0..64 = set volume (most common). IT vol-col
-            # supports many sub-commands but we only translate plain set-vol
-            # in Phase 1.
+            # Volume column: 0..64 = set volume.
+            # If the cell ALSO has an effect column (e.g. Sxx note delay),
+            # we cannot encode both via MOD's single effect+param slot. So
+            # we synthesize Cxx from vol-col only when the effect column
+            # is empty. For cells with BOTH vol-col and effect, we capture
+            # vol-col into a SEPARATE field (`vol_col`) so the engine can
+            # apply it on top of the effect.
+            # CRITICAL bug fix: previously vol-col on cells with non-empty
+            # effect was silently dropped — channels with vol-col=2 + Sxx
+            # delay triggered at the sample's default volume (e.g. 36)
+            # instead of the intended 2/64 = -25 dB. On jeff pat 0 row 0,
+            # ch1/ch3/ch5/ch6/ch8 had this combo → 4 channels at full vol
+            # vs OpenMPT's correct quiet level → 3× loudness mismatch.
+            # IT Mxx (Set Channel Volume): eff=13 (= cmd 12 = letter M).
+            # MOD has no equivalent, so the translator at line 880 returns
+            # (0, 0) and the effect was silently dropped. This is wrong —
+            # jeff has 39 Mxx events and without them channel volumes
+            # never compensate when vol-col=1 cells set the note volume
+            # very low (pat 1 row 0). Capture Mxx into a separate cell
+            # field so the engine can apply it as a per-channel multiplier
+            # alongside the existing note-volume / Cxx path.
+            # Encoding: 0 = no Mxx on this cell, 1..65 = set channel
+            # volume to (chn_vol - 1) ∈ [0, 64].
+            cell_chn_vol = 0
+            if eff == 13 and par <= 0x40:
+                cell_chn_vol = par + 1   # offset by 1 so 0 = "absent"
+                # Drop the MOD-effect translation since we handled it.
+                m_eff = 0
+                m_par = 0
+
+            cell_vol_col = 0
             if 0 < vol <= 64 and m_eff == 0 and m_par == 0:
+                # Vol-col on its own (no effect col): fold into Cxx.
+                # Applies on BOTH trigger rows (period > 0) and continuation
+                # rows (period == 0) — continuation Cxx events drive the
+                # vol crescendos in jeff (rows 1-31 ramp ch0 vol 2→64).
+                # The earlier `period > 0` restriction was wrong: it
+                # silently dropped every continuation Cxx, leaving channels
+                # stuck at their initial trigger volume for entire patterns.
                 m_eff = 0xC
                 m_par = vol
+            elif 0 < vol <= 64 and (m_eff != 0 or m_par != 0):
+                # Vol-col coexists with another effect. Capture separately
+                # so the engine applies it on top.
+                cell_vol_col = vol
+            # vol-col=0 with retrigger: tried treating as a "preserve
+            # current channel volume" sentinel (cell_vol_col=65) — fixes
+            # the +17 dB jump at jeff t=3.27s but locks subsequent
+            # vol-col=1 cells (pat 1 row 0) at very low channel volume
+            # for the rest of playback because the song relies on Mxx
+            # events later to bring volumes back up. Trade-off chosen:
+            # accept the small jump, keep overall loudness right.
 
             # Resolve sample number AND transposed note. In IT instrument-mode
             # (cmwt >= 0x200), each cell's "instrument" byte is an instrument
@@ -1837,11 +1893,31 @@ class ITFile:
             elif note == 254:
                 samp_byte |= 0x40
                 period = 0
+            # NOTE: tried zeroing samp_byte for cells with inherited
+            # instrument (mask 0x20, no 0x02) to take the JS engine's
+            # period-only retrigger path. Eliminated the +17 dB jump
+            # at jeff t=3.27s but produced a 25 dB overall loudness
+            # drop because jeff's patterns are 128 rows (Cxx crescendos
+            # in rows 32-127) but our engine truncates to 64 rows.
+            # Until variable-row patterns are supported, can't fix
+            # both at once. Reverted; accepting the small jump.
             rows[row][ch] = {
                 'sample': samp_byte,
                 'period': period,
                 'effect': m_eff,
                 'param':  m_par,
+                # vol_col != 0 means the cell carries a vol-col=N value the
+                # engine should apply on TRIGGER (sets state.currentVolume
+                # to N) in addition to whatever the effect column does.
+                # Only emitted for IT cells where vol-col coexists with a
+                # non-empty effect column; otherwise vol-col is folded into
+                # the effect slot as Cxx and this stays 0.
+                'vol_col': cell_vol_col,
+                # chn_vol carries IT Mxx (Set Channel Volume), encoded as
+                # 0 = no Mxx, 1..65 = set channel vol to (chn_vol - 1).
+                # Multiplied in at the channel mix stage on top of the
+                # note volume (mixVol).
+                'chn_vol': cell_chn_vol,
             }
         return rows
 
@@ -2075,18 +2151,32 @@ def create_fixed_player_html(mod, output_file, downsample=1, compress=False, vec
                     period = ch.get('period', 0)
                     effect = ch.get('effect', 0)
                     param = ch.get('param', 0)
-                
-                pattern_data.append({
+
+                cell = {
                     'sample': sample,
                     'period': period,
                     'effect': effect,
                     'param': param
-                })
+                }
+                vc = ch.get('vol_col', 0)
+                if vc:
+                    cell['vol_col'] = vc
+                cv = ch.get('chn_vol', 0)
+                if cv:
+                    cell['chn_vol'] = cv
+                pattern_data.append(cell)
     
     # Optional compression
     if compress:
         print("   Compressing patterns...")
-        # Flatten to bytes for RLE
+        # Flatten to bytes for RLE. Cell layout (7 bytes):
+        #   0: sample
+        #   1: period >> 8
+        #   2: period & 0xFF
+        #   3: (effect << 4) | (param >> 4)
+        #   4: param & 0x0F
+        #   5: vol_col (0..64 set, 65 preserve sentinel; 0 = absent)
+        #   6: chn_vol (0 = no Mxx, 1..65 = set channel vol to chn_vol-1)
         pattern_bytes = []
         for note in pattern_data:
             pattern_bytes.extend([
@@ -2094,7 +2184,9 @@ def create_fixed_player_html(mod, output_file, downsample=1, compress=False, vec
                 note['period'] >> 8,
                 note['period'] & 0xFF,
                 (note['effect'] << 4) | (note['param'] >> 4),
-                note['param'] & 0x0F
+                note['param'] & 0x0F,
+                note.get('vol_col', 0) & 0x7F,
+                note.get('chn_vol', 0) & 0x7F
             ])
         
         compressed_patterns = compress_patterns_rle(pattern_bytes)
@@ -2128,19 +2220,30 @@ function decompressPatterns(compressed) {
     }
     
     const _nc = modData.numChannels || 4;
-    console.log('Decompressed bytes:', decompressed.length, 'expected:', modData.numPatterns * 64 * _nc * 5);
+    console.log('Decompressed bytes:', decompressed.length, 'expected:', modData.numPatterns * 64 * _nc * 7);
 
-    // Reconstruct pattern objects
+    // Reconstruct pattern objects (7-byte cells:
+    //   sample / period_hi / period_lo / eff_par_hi / par_lo /
+    //   vol_col / chn_vol).
     const patterns = [];
     let offset = 0;
     const totalNotes = modData.numPatterns * 64 * _nc;
-    
-    for (let n = 0; n < totalNotes && offset + 4 < decompressed.length; n++) {
+
+    for (let n = 0; n < totalNotes && offset + 6 < decompressed.length; n++) {
+        const s     = decompressed[offset++] || 0;
+        const ph    = decompressed[offset++] || 0;
+        const pl    = decompressed[offset++] || 0;
+        const epHi  = decompressed[offset++] || 0;
+        const pLo   = decompressed[offset++] || 0;
+        const vcol  = decompressed[offset++] || 0;
+        const cvol  = decompressed[offset++] || 0;
         patterns.push({
-            sample: decompressed[offset++] || 0,
-            period: ((decompressed[offset++] || 0) << 8) | (decompressed[offset++] || 0),
-            effect: (decompressed[offset] || 0) >> 4,
-            param: (((decompressed[offset++] || 0) & 0x0F) << 4) | (decompressed[offset++] || 0)
+            sample: s,
+            period: (ph << 8) | pl,
+            effect: epHi >> 4,
+            param: ((epHi & 0x0F) << 4) | pLo,
+            vol_col: vcol,
+            chn_vol: cvol
         });
     }
     
@@ -2603,6 +2706,19 @@ class MODPlayer {{
                 volumeFade: 1.0, volumeFadeInc: 0, targetVolume: 1.0,
                 currentVolume: 64, targetVolume2: 64, volumeRampInc: 0, volumeRamping: false,
                 mixVol: 0, volInc: 0,
+                // IT Mxx (Set Channel Volume): 0..64, default 64 (= no scaling).
+                // Updated by cells carrying chn_vol. Multiplied with mixVol in
+                // the per-sample mix for proper IT note×channel volume math.
+                channelVolume: 64,
+                // mikMod-style click ramp: vlast = last output sample
+                // value (pre-pan). On trigger, clickRemaining is set to
+                // the window length (clickWindow); per-sample ramp is
+                // (clickWindow - clickRemaining) / clickWindow.
+                // For NNA=0/1 (percussive): 64-sample anti-click.
+                // For NNA=2/3 (sustained pad displaced): 4410 samples
+                // (~100 ms equal-power crossfade) so the OLD voice
+                // fades smoothly instead of cutting abruptly.
+                vlast: 0.0, clickRemaining: 0, clickWindow: 64,
                 loopbackPoint: 0, loopCount: 0, _delayedNote: null,
                 // XM volume envelope state. envX is the current envelope-x
                 // position in player ticks. keyOn=true while sustaining,
@@ -2762,23 +2878,62 @@ class MODPlayer {{
         if (!oldInfo) return;
         const nna = oldInfo.nna || 0;
         if (nna === 0) return;     // cut — fall through to retrigger as before
-        // Build a frozen snapshot ghost.
+        // All non-cut NNAs dispatch a ghost so the OLD voice plays through
+        // its envelope release (NNA=2 linear release, NNA=3 fadeout, NNA=1
+        // continue). The ghost+active overlap creates a slight amplitude
+        // bump during the chord-change window but the envelope-shaped
+        // release sound is clearly preferred over a clean cut.
+        // Master gain reduced (line 1991, vol=0.5) and MAKEUP reduced
+        // (line 4047) to keep the overlap below the limiter ceiling.
+        // Snapshot full envelope state so the ghost continues advancing
+        // through release/fadeout exactly like a live voice.
+        // NNA=1 (continue): keyOn stays true, env keeps sustaining.
+        // NNA=2 (off):      keyOn=false → env releases past sus point.
+        // NNA=3 (fade):     keyOn=false + force fadeout even with no env.
         const ghost = {{
             sample:     state.sample,
             period:     state.period,
             basePeriod: state.basePeriod,
             samplePos:  state.samplePos,
             volume:     state.volume,
+            // mikIT NNA mechanism (mmod_it0.cpp:1032): OLD voice stays in
+            // place with keyon=0, no copy. Its envelope advances past
+            // sustain via the existing per-tick advance, naturally
+            // releasing over the envelope's release segment. No forced
+            // down-ramp on ghost mixVol — the envelope multiplier alone
+            // shapes the fade. NEW voice trigger ramps mixVol 0 → target
+            // (kick semantic) which is the mikIT "fadecount" click ramp.
+            // Overall amplitude is bounded by the lowered master volume
+            // (mikIT uses pow(channels,0.52)/channels per-voice gain ≈
+            // 0.137 for the 64-voice pool, giving headroom for overlap).
+            // Ghost preserves the OLD voice's mixVol (no forced ramp-down).
+            // The fade-out is shaped by the inherited envelope release
+            // (envX continues advancing past sustain) and NFC fadeout — so
+            // long-tail strings actually ring through. The NEW voice's
+            // 30 ms mixVol ramp-up alone provides the crossfade against
+            // this naturally-decaying ghost.
             mixVol:     state.mixVol,
-            // Per-tick volume decrement when non-zero (notefade/noteoff).
-            // fadeout=64 ⇒ 1 unit/tick → ~1s to silence at typical speed.
-            fadeAmt:    (nna === 1) ? 0 : ((oldInfo.fadeout || 64) / 512.0 * 64.0),
+            volInc:     0,
+            envX:       state.envX,
+            keyOn:      (nna === 1),
+            volFade:    state.volFade,
+            envFin:     state.envFin,
+            // NNA=3 forces fadeout even when there's no envelope. NNA=2
+            // relies on the envelope's release tail; only fades via
+            // volFade if the envelope itself runs out.
+            forceFadeout: (nna === 3),
             active:     true,
         }};
         if (state.ghostVoices.length >= this._maxGhosts) {{
             state.ghostVoices.shift();   // FIFO eviction of the oldest
         }}
         state.ghostVoices.push(ghost);
+        // The ghost now carries the OLD voice's output continuity. Reset
+        // the active state's vlast to 0 so the click ramp on the NEW voice
+        // doesn't ALSO blend from the OLD signal — that would double-count
+        // (ghost + active vlast both contributing OLD), producing the +6dB
+        // swell every retrigger.
+        state.vlast = 0;
     }}
 
     // ── DCT (Duplicate Check Type) on incoming note ───────────────────────
@@ -2806,7 +2961,11 @@ class MODPlayer {{
                 if (dca === 0) {{
                     st.ghostVoices.splice(i, 1);                          // cut
                 }} else {{
-                    g.fadeAmt = ((newInfo.fadeout || 64) / 512.0) * 64.0; // notefade/noteoff fallback
+                    // DCA=1 (noteoff) / 2 (notefade): trigger key-off so
+                    // the envelope-release / fadeout machinery in
+                    // _decayGhosts takes over.
+                    g.keyOn = false;
+                    if (dca === 2) g.forceFadeout = true;
                 }}
             }}
         }}
@@ -2906,21 +3065,64 @@ class MODPlayer {{
         }}
     }}
 
-    // ── Per-tick ghost decay ──────────────────────────────────────────────
-    // Decrement notefade-marked ghost volumes once per tick. Cleanup
-    // exhausted ghosts (volume → 0). Called at the end of processTick.
+    // ── Per-tick ghost envelope advance + decay ──────────────────────────
+    // Advances each ghost's envX (honouring sustain only when keyOn=true,
+    // i.e. NNA=1 continue) and decrements volFade past key-off — same
+    // formula as _advanceEnvelopes for active voices, so a ghost dies
+    // exactly when an equivalent active voice would. Called once per tick.
     _decayGhosts() {{
         for (let ch = 0; ch < this.numChannels; ch++) {{
             const st = this.channels[ch];
             for (let i = st.ghostVoices.length - 1; i >= 0; i--) {{
                 const g = st.ghostVoices[i];
-                if (g.fadeAmt > 0) {{
-                    g.volume -= g.fadeAmt;
-                    if (g.volume <= 0) {{
-                        st.ghostVoices.splice(i, 1);
+                if (!g.active) {{ st.ghostVoices.splice(i, 1); continue; }}
+                const info = modData.sampleMap[g.sample];
+                if (!info) {{ st.ghostVoices.splice(i, 1); continue; }}
+
+                // Envelope advance — same shape as _advanceEnvelopes.
+                const pts = info.env_pts;
+                if (pts && pts.length >= 2 && !g.envFin) {{
+                    const susPt  = info.env_sus_pt | 0;
+                    const susEn  = info.env_sus_en | 0;
+                    const lpStPt = info.env_loop_st | 0;
+                    const lpEnPt = info.env_loop_en | 0;
+                    const susStX = pts[Math.min(susPt,  pts.length - 1)][0];
+                    const susEnX = pts[Math.min(susEn,  pts.length - 1)][0];
+                    const lpStX  = pts[Math.min(lpStPt, pts.length - 1)][0];
+                    const lpEnX  = pts[Math.min(lpEnPt, pts.length - 1)][0];
+                    let nextX = g.envX + 1;
+                    if (info.env_sus && g.keyOn && nextX > susEnX) {{
+                        nextX = susStX;
+                    }} else if (info.env_loop && nextX > lpEnX && lpEnX > lpStX) {{
+                        nextX = lpStX;
+                    }} else if (nextX > pts[pts.length - 1][0]) {{
+                        nextX = pts[pts.length - 1][0];
+                        g.envFin = true;
                     }}
-                }} else if (!g.active) {{
-                    st.ghostVoices.splice(i, 1);
+                    g.envX = nextX;
+                    // Envelope ended at zero → kill ghost.
+                    if (g.envFin && pts[pts.length - 1][1] === 0) {{
+                        st.ghostVoices.splice(i, 1);
+                        continue;
+                    }}
+                }}
+
+                // Fadeout: applies after key-off (NNA=2/3). NNA=3 forces
+                // fadeout even without an envelope; NNA=2 relies on the
+                // envelope above and only fades if envFin landed >0.
+                if (!g.keyOn) {{
+                    const fo = info.fadeout | 0;
+                    if (fo > 0 && (g.forceFadeout || g.envFin || !pts || pts.length < 2)) {{
+                        g.volFade -= 2 * fo;
+                        if (g.volFade <= 0) {{
+                            st.ghostVoices.splice(i, 1);
+                            continue;
+                        }}
+                    }} else if ((!pts || pts.length < 2) && fo === 0) {{
+                        // No env, no fadeout: NNA=2/3 cuts cleanly.
+                        st.ghostVoices.splice(i, 1);
+                        continue;
+                    }}
                 }}
             }}
         }}
@@ -2944,6 +3146,13 @@ class MODPlayer {{
         if (this.currentTick === 0) {{
             for (let ch = 0; ch < this.numChannels; ch++) {{
                 const note = this.getNote(patternIdx, this.currentRow, ch);
+
+                // IT Mxx (Set Channel Volume) fires on tick 0 of any row,
+                // independent of trigger. chn_vol = 1..65 means set channel
+                // volume to (chn_vol - 1) ∈ [0, 64]; 0 means absent.
+                if (note.chn_vol && note.chn_vol >= 1 && note.chn_vol <= 65) {{
+                    this.channels[ch].channelVolume = note.chn_vol - 1;
+                }}
 
                 // ── IT note-cut: bit 6 of the sample byte signals
                 // "instant silence" (vs note-off bit 7 which only releases
@@ -2991,6 +3200,17 @@ class MODPlayer {{
                 // Handle new sample trigger
                 if (noteSample > 0) {{
                     const state = this.channels[ch];
+                    // Capture pre-trigger envelope state for potential inheritance.
+                    // When the channel was sustaining an envelope-equipped voice
+                    // and we're cut-retriggering (NNA_GHOST_MODE=false), inherit
+                    // envX so chord changes on samples with attack envelopes
+                    // (Phase Strings env_pts=[[0,0],[8,64]…]) don't dip to silent
+                    // for the first ~20 ms while envX rebuilds from 0.
+                    const _wasActive = state.active;
+                    const _oldInfo = modData.sampleMap[state.sample];
+                    const _oldHadEnv = !!(_oldInfo && _oldInfo.env_pts && _oldInfo.env_pts.length >= 2);
+                    const _oldEnvX = state.envX;
+                    const _oldEnvFin = state.envFin;
                     this.dyingChannels[ch].active = false;
                     // XM cuts any lingering key-off-fade voice on retrigger.
                     // (IT key-off handling goes through the NNA path which
@@ -3019,9 +3239,26 @@ class MODPlayer {{
                             this._applyDCT(noteSample - 1, note.period);
                         }}
 
+                        // IT volume-on-retrigger semantics:
+                        //   - vol_col = 1..64: set vol to that value
+                        //   - vol_col = 65 (sentinel): cell had vol-col=0,
+                        //     i.e. "preserve current channel volume" — used
+                        //     by IT files to retrigger without disturbing
+                        //     the existing Cxx-set channel volume
+                        //   - Cxx (folded vol-col, no other fx): set vol
+                        //     to param
+                        //   - None of the above: reset to sample.dv
                         state.sample = noteSample - 1;
-                        state.volume = sampleInfo.volume;
-                        state.currentVolume = sampleInfo.volume;
+                        let _trigVol = sampleInfo.volume;
+                        if (note.vol_col === 65) {{
+                            _trigVol = state.currentVolume;     // preserve
+                        }} else if (note.vol_col && note.vol_col > 0 && note.vol_col <= 64) {{
+                            _trigVol = note.vol_col;
+                        }} else if (note.effect === 0xC) {{
+                            _trigVol = Math.min(64, note.param);
+                        }}
+                        state.volume = _trigVol;
+                        state.currentVolume = _trigVol;
                         state.active = true;
                         state.volumeRamping = false;
 
@@ -3029,16 +3266,56 @@ class MODPlayer {{
                             // Tone portamento: keep current position, don't retrigger
                         }} else {{
                             state.samplePos = 0.0;
-                            state.mixVol = 0;
+                            // mikMod-style click ramp: keep mixVol at target so
+                            // output isn't quenched, but mark a window for
+                            // vlast-based blending in the per-sample mix.
+                            // For sustained-pad samples (NNA=2 note-off, NNA=3
+                            // fade), use a LONG ~100 ms ramp so the OLD voice
+                            // fades smoothly into the NEW one — matches the
+                            // envelope-release feel without producing the +6dB
+                            // overlap swell that ghost mode creates.
+                            // For percussive (NNA=0/1) keep tight 64-sample
+                            // anti-click.
+                            // OpenMPT NNA mechanism: NEW voice's mix volume
+                            // STARTS at 0 and ramps UP to currentVolume.
+                            // Ghost (dispatched above in _dispatchNNA)
+                            // inherited the OLD voice's prior mixVol and
+                            // ramps DOWN to its envelope-release target.
+                            // Sum of the two ramps ≈ constant during the
+                            // overlap window — no +6 dB swell at trigger.
+                            // Reference: OpenMPT Snd_fx.cpp CheckNNA:
+                            //   srcChn.rightVol = srcChn.leftVol = 0;
+                            //   chn = srcChn;  // ghost keeps prior amp
+                            // Then ProcessRamping ramps each per voice.
+                            // Anti-click ramp only: 64-sample fade from
+                            // vlast → target. The crossfade itself comes
+                            // from the envelope: NEW voice's envelope
+                            // attack rises 0→peak over the row, while the
+                            // ghost rides natural envelope release. mikIT
+                            // does the same — new voice flvolmul=0 the
+                            // entire chord row, ghost decays via NFC.
+                            state.mixVol = state.currentVolume;
+                            state.volInc = 0;
+                            state.clickWindow = 64;
+                            state.clickRemaining = 64;
                             state.volumeFade = 1.0;
                             state.volumeFadeInc = 0;
                             state.targetVolume = 1.0;
                             if (note.effect === 0x9) state.samplePos = note.param * 256;
-                            // XM envelope reset on retrigger.
+                            // Envelope reset on retrigger (mikIT semantics):
+                            // NEW voice envX=0, plays through the envelope's
+                            // attack ramp (0→peak over env-defined ticks).
+                            // For Phase Strings (env (0,0)→(8,64)→(48,0)) the
+                            // new voice is essentially silent for the first
+                            // ~130 ms then rises to peak — by then samplePos
+                            // has moved past the DC-offset attack region of
+                            // the sample data so no click. The ghost rides
+                            // its envelope release in parallel and the two
+                            // form a natural envelope-shaped crossfade.
                             state.envX = 0;
+                            state.envFin = false;
                             state.keyOn = true;
                             state.volFade = 65536;
-                            state.envFin = false;
                         }}
                     }}
                 }}
@@ -3060,7 +3337,8 @@ class MODPlayer {{
                         if (noteSample === 0 && this.channels[ch].active) {{
                             const state = this.channels[ch];
                             state.samplePos = 0.0;
-                            state.mixVol = 0;
+                            state.mixVol = state.currentVolume;
+                            state.clickWindow = 64; state.clickRemaining = 64;
                         }}
                     }}
                 }}
@@ -3354,7 +3632,8 @@ class MODPlayer {{
                         case 0x9: // E9x — Retrigger note every x ticks
                             if (!tick0 && val > 0 && (this.currentTick % val) === 0) {{
                                 state.samplePos = 0.0;
-                                state.mixVol = 0;
+                                state.mixVol = state.currentVolume;
+                                state.clickWindow = 64; state.clickRemaining = 64;
                             }}
                             break;
                         case 0xC: // ECx — Note cut after x ticks
@@ -3370,11 +3649,21 @@ class MODPlayer {{
                                 const dnSample = dn.sample & 0x1F;
                                 const info = modData.sampleMap[dnSample - 1];
                                 state.sample = dnSample - 1;
-                                state.volume = info.volume;
-                                state.currentVolume = info.volume;
+                                // Same vol-col handling as immediate trigger.
+                                let _dnTrigVol = info.volume;
+                                if (dn.vol_col === 65) {{
+                                    _dnTrigVol = state.currentVolume;   // preserve
+                                }} else if (dn.vol_col && dn.vol_col > 0 && dn.vol_col <= 64) {{
+                                    _dnTrigVol = dn.vol_col;
+                                }} else if (dn.effect === 0xC) {{
+                                    _dnTrigVol = Math.min(64, dn.param);
+                                }}
+                                state.volume = _dnTrigVol;
+                                state.currentVolume = _dnTrigVol;
                                 state.active = true;
                                 state.samplePos = 0.0;
-                                state.mixVol = 0;
+                                state.mixVol = state.currentVolume;
+                                state.clickWindow = 64; state.clickRemaining = 64;
                                 state.envX = 0;
                                 state.keyOn = true;
                                 state.volFade = 65536;
@@ -3548,7 +3837,7 @@ class MODPlayer {{
             // [1,4] = outer LEFT pair (ch0,ch3); [2,3] = inner RIGHT pair (ch1,ch2)
             const surroundPair = [1, 4];
             const isSurrCh = (!_useITPan) && (surroundPair.includes((ch % 4) + 1));
-                
+
                 if (state.active && state.period > 0) {{
                     const sample = this.getSampleData(state.sample, state.samplePos);
                     state.mixVol += state.volInc;
@@ -3600,8 +3889,22 @@ class MODPlayer {{
                             envMul *= Math.max(_aaFloor, _nyq / _freq);
                         }}
                     }}
-                    const cv = (state.mixVol / 64.0) * envMul;
-                    const s  = sample * cv;
+                    const cv = (state.mixVol / 64.0) * (state.channelVolume / 64.0) * envMul;
+                    const target = sample * cv;
+                    // mikMod-style click ramp: blend output from vlast (last
+                    // sample's actual output) toward target over 64 samples
+                    // post-trigger. Eliminates the dip-to-silence that
+                    // happened when state.mixVol was reset to 0.
+                    let s;
+                    if (state.clickRemaining > 0) {{
+                        const _w = state.clickWindow || 64;
+                        const _ct = (_w - state.clickRemaining) / _w;
+                        s = state.vlast * (1.0 - _ct) + target * _ct;
+                        state.clickRemaining--;
+                    }} else {{
+                        s = target;
+                    }}
+                    state.vlast = s;
                     
                     // Per-channel pan: prefer panOverride from MOD 8xx /
                     // IT X effect when set, else fall back to header-default
@@ -3659,7 +3962,42 @@ class MODPlayer {{
                     const g = state.ghostVoices[gi];
                     if (!g.active || g.period <= 0 || g.volume <= 0) continue;
                     const gs = this.getSampleData(g.sample, g.samplePos);
-                    const gcv = g.volume / 64.0;
+                    const _ginfo = modData.sampleMap[g.sample];
+                    let _gEnvMul = 1.0;
+                    if (_ginfo && _ginfo.env_pts && _ginfo.env_pts.length >= 2) {{
+                        _gEnvMul = (this._xmEnvLookup(_ginfo, g.envX) / 64.0)
+                                 * (g.volFade / 65536.0);
+                    }} else if (!g.keyOn) {{
+                        _gEnvMul = g.volFade / 65536.0;
+                    }}
+                    // Anti-alias gain compensation (mirrors active-voice path,
+                    // line ~3858). Ghosts must rolloff above-Nyquist content
+                    // the same way active voices do — otherwise a ghost from
+                    // a high-c5_speed sample plays at full amplitude while its
+                    // sibling active voice is attenuated to ~0.4×, and the
+                    // ghost dominates the chord-change overlap by ~3 dB,
+                    // producing the audible jump-at-trigger that doesn't
+                    // exist in mikIT/OpenMPT renders.
+                    if (_ginfo && _ginfo.c5_speed && _ginfo.c5_speed > 0) {{
+                        const _gfreq = (_ginfo.c5_speed * 428) / g.period;
+                        const _gnyq  = this.sampleRate * 0.5;
+                        if (_gfreq > _gnyq) {{
+                            const _gaaFloor = (_ginfo.c5_speed > 50000) ? 0.3 : 0.0;
+                            _gEnvMul *= Math.max(_gaaFloor, _gnyq / _gfreq);
+                        }}
+                    }}
+                    // Use frozen mixVol (where the active voice's ramp was at
+                    // dispatch time), not the channel target volume — otherwise
+                    // a mid-ramp dispatch causes the ghost to jump to full
+                    // target instantly = audible click. Anti-ramp toward target
+                    // continues per-sample for smooth completion of the ramp
+                    // that was in progress.
+                    g.mixVol += g.volInc;
+                    if (g.volInc > 0 && g.mixVol > g.volume) {{ g.mixVol = g.volume; g.volInc = 0; }}
+                    else if (g.volInc < 0 && g.mixVol < g.volume) {{ g.mixVol = g.volume; g.volInc = 0; }}
+                    // Ghost output uses ramping mixVol (now ramping DOWN to
+                    // 0 over click window per OpenMPT NNA dispatch).
+                    const gcv = (g.mixVol / 64.0) * (state.channelVolume / 64.0) * _gEnvMul;
                     const gOut = gs * gcv;
                     if (isSurrCh) {{
                         surrL += gOut * chPanLeft[ch % chPanLeft.length];
@@ -3683,7 +4021,7 @@ class MODPlayer {{
                     }}
                 }}
             }}
-            
+
             // Mix normalization. For 4-channel MOD: 0.5 (keeps total ≤ 2.0
             // when 4 voices play at full vol — original tuning). For
             // multi-channel XM/IT/S3M formats: 1/N is too aggressive
@@ -3703,12 +4041,21 @@ class MODPlayer {{
             const normFactor = (this.numChannels <= 4)
                 ? 2.0 / this.numChannels
                 : 0.85;
-            const vol = this._volume !== undefined ? this._volume : 0.8;
-            // IT mix/global volume — 128 = unity. For non-IT formats both
-            // default to 128 → multiplier=1. For IT, GADGET-style files
-            // ship with mix_vol=48 which openMPT applies as a master cut.
-            // Use ?? for "default if missing"; `|` is bitwise OR (= bug).
-            const _gMix = ((modData.globalVol ?? 128) * (modData.mixVol ?? 128)) / (128.0 * 128.0);
+            // Master volume reduced to match mikIT-style headroom for NNA
+            // ghost overlap. mikIT divides per-voice gain by total channels
+            // (~64), giving low absolute output but room for many concurrent
+            // voices. We use a lower master vol to give the same headroom.
+            const vol = this._volume !== undefined ? this._volume : 0.45;
+            // IT mix/global volume.
+            // OpenMPT applies MixVol as a SCALAR with unity at MV=48 (the
+            // IT default) — not at MV=128. So MV=40 → 40/48 = 0.833 (very
+            // mild reduction), not 40/128 = 0.3125 (-10 dB cut).
+            // The /128 normalization made our mix ~3-4× too quiet vs
+            // OpenMPT on jeff (mv=40) and similar IT files. Reference:
+            // OpenMPT MPTM_DefaultMixVol = 48.
+            const _gv  = (modData.globalVol ?? 128) / 128.0;   // 0..1, default=1
+            const _mv  = (modData.mixVol    ?? 48 ) / 48.0;    // 0..2.67, default=1
+            const _gMix = _gv * _mv;
 
             // Apply Only3D to surround bus (ch0 + ch3 = outer LEFT pair = "Surround L/R")
             let sL = surrL * normFactor * vol * _gMix;
@@ -3745,7 +4092,9 @@ class MODPlayer {{
             // against the ±1 boundary for maximum perceived loudness.
             // The limiter has already softly tamed catastrophic peaks; this
             // gain stage hard-clips whatever's left to fill the rail.
-            const _MAKEUP = 1.7;
+            // Reduced from 1.7 → 1.0 to match mikIT's clean-output chain
+            // (no post-limiter makeup; output sits below the rail).
+            const _MAKEUP = 1.0;
             leftChannel[offset + i]  = Math.max(-1, Math.min(1, _lim[0] * _MAKEUP));
             rightChannel[offset + i] = Math.max(-1, Math.min(1, _lim[1] * _MAKEUP));
             
@@ -4531,7 +4880,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
     # USE_142_DSP toggle — emit as 0/1 for the GLSL #define
     use_142_dsp_int = 1 if compat.get('use_142_dsp', False) else 0
     common_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.46 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.5 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    COMMON TAB
    Visualizer: {viz_name}
@@ -4543,6 +4892,9 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
 // {data_source_comment}
 
 #define USE_EMBEDDED_DATA {1 if use_embedded else 0}
+// 3-tap FIR low-pass on RVQ-decoded samples (1=ON, 0=OFF). Suppresses
+// HF quantization noise from --no-rvq2 / --bitrate lo at 3× decode cost.
+#define RVQ_LPF 1
 #define TEX_WIDTH 1024
 #define TEX_HEIGHT 1024
 #define PATTERN_DATA_SIZE {pattern_size}
@@ -5327,7 +5679,7 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     _ap_p0_2, _ap_p1p2_2, _ap_delay_2 = _only3d_coeffs(_ONLY3D_FREQ2)
 
     sound_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.46 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.5 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    SOUND TAB
    Visualizer: {viz_name}
@@ -5424,7 +5776,7 @@ float getMixedMono(float time_offset, Position pos, float rowTime) {{
     // Loud mode: 4-ch MOD keeps the original 2/N; multi-ch formats get
     // a flat 0.45 (single voice at vol=64 reaches 45% of full scale).
     // softLimit / FAT4X handle multi-voice peaks downstream.
-    const float normFactor = (NUM_CHANNELS <= 4) ? (2.0 / float(NUM_CHANNELS)) : 0.55;
+    const float normFactor = (NUM_CHANNELS <= 4) ? (2.0 / float(NUM_CHANNELS)) : 0.85;
     return mix * normFactor;
 }}
 
@@ -5575,7 +5927,7 @@ vec2 mainSound(int samp, float time) {{
     // Loud mode: 4-ch MOD keeps the original 2/N; multi-ch formats get
     // a flat 0.45 (single voice at vol=64 reaches 45% of full scale).
     // softLimit / FAT4X handle multi-voice peaks downstream.
-    const float normFactor = (NUM_CHANNELS <= 4) ? (2.0 / float(NUM_CHANNELS)) : 0.55;
+    const float normFactor = (NUM_CHANNELS <= 4) ? (2.0 / float(NUM_CHANNELS)) : 0.85;
     surr *= normFactor;
     cent *= normFactor;
     
@@ -7334,9 +7686,9 @@ vec3 _VizScene(vec2 u) {
 
 
     image_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.46 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.5 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
-   IMAGE TAB (v1_4_5) — iChannel0: alphabet texture (shadertoy.com/view/4sf3RB)
+   IMAGE TAB (_v_1_DOT_5) — iChannel0: alphabet texture (shadertoy.com/view/4sf3RB)
                 iChannel1: Buffer A (audio + FFT + smoothed bands)
                 iChannel2: RGBA Noise Small  ← required for viz 6 smoke turbulence
    Visualizer: {viz_name}
@@ -7442,7 +7794,7 @@ makeStr(printBPMVal) {bpm_val_chars} _end
 makeStr(printSpdVal) {spd_val_chars} _end
 
 // ---- Static label strings ----
-makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _4 _6 _ _NUM _NUM _NUM _end
+makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _5 _0 _ _NUM _NUM _NUM _end
 makeStr(printCredit) _COPY _2 _0 _2 _6 _ _O _R _B _L _I _V _I _U _S _end
 makeStr(printLoad)   _L _O _A _D _I _N _G _DOT _DOT _DOT _end
 makeStr(printSpec)   _S _P _E _C _T _R _U _M _end
@@ -8132,7 +8484,7 @@ void mainImage(out vec4 O, vec2 C) {{
     # Setup: Buffer A iChannel0 = Buffer A (self-ref)
     #        Image   iChannel1 = Buffer A output
     buffer_a_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.46 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.5 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    Contact: subband@gmail.com or
             subband@protonmail.com
@@ -8210,7 +8562,7 @@ void mainImage(out vec4 O, vec2 C) {{
             int trigSgr = patTickOffset[tpat] + (trow - patStartRow[tpat]);
             float trigT = float(fetchTick(trigSgr)) / TICKS_PER_SEC;
             float age   = max(0.0, t - trigT);
-            float env   = exp(-age * 3.5);
+            float att = clamp(age / 0.300, 0.0, 1.0); float env = att * att * (3.0 - 2.0 * att);
             int wt = waveType[tn.instrument - 1];
             s += amp * env * _synthWave(wt, f, t);
         }}
@@ -8440,7 +8792,7 @@ void mainImage(out vec4 O, vec2 C) {{
                 int trigSgr = patTickOffset[tpat] + (trow - patStartRow[tpat]);
                 float trigT = float(fetchTick(trigSgr)) / TICKS_PER_SEC;
                 float age   = max(0.0, iTime - trigT);
-                float env   = exp(-age * 3.5);
+                float att = clamp(age / 0.300, 0.0, 1.0); float env = att * att * (3.0 - 2.0 * att);
                 int wt = waveType[tn.instrument - 1];
                 s = amp * env * _synthWave(wt, f, iTime);
             }}
@@ -8490,7 +8842,7 @@ void mainImage(out vec4 O, vec2 C) {{
             int trigSgr = patTickOffset[tpat] + (trow - patStartRow[tpat]);
             float trigT = float(fetchTick(trigSgr)) / TICKS_PER_SEC;
             float age   = max(0.0, t - trigT);
-            float env   = exp(-age * 3.5);
+            float att = clamp(age / 0.300, 0.0, 1.0); float env = att * att * (3.0 - 2.0 * att);
             int wt = waveType[tn.instrument - 1];
             s += amp * env * _synthWave(wt, f, t);
         }}
@@ -12423,7 +12775,7 @@ Just open `{base_name}_player.html` in a browser - works offline!
 - `0` = Normal (full song loop)
 - `255` = Testing (10 second loop)
 
-Generated by MOD2GLSL v1.46
+Generated by MOD2GLSL v1.5
 """)
     
     # Generate HTML player (now works for both MOD and S3M)
@@ -12885,11 +13237,11 @@ Generated by MOD2GLSL v1.46
                 with open(glsl_common_file) as _cf: _ct = _cf.read()
                 # The VQ encoder's emitted Common still carries its own version
                 # (currently v1.42 inside the inner b64 blob). Rewrite any v1.4x
-                # to the current v1.46 so all four tabs stamp the same number.
+                # / v1.5 stamp so all four tabs land on the current version.
                 import re as _re_v
                 _ct = _re_v.sub(
                     r"GLSL \(The Last\) MOD Player v1\.\d+(?: \(c\) 2026 Orblivius)",
-                    "GLSL (The Last) MOD Player v1.46 (c) 2026 Orblivius", _ct, count=1)
+                    "GLSL (The Last) MOD Player v1.5 (c) 2026 Orblivius", _ct, count=1)
                 _ct = _ct.replace("   COMMON TAB\n", f"   COMMON TAB\n   Visualizer: {_vname}\n", 1)
 
                 # Inject visualizer note-synth helpers (waveType[] + _synthWave).
@@ -13138,6 +13490,56 @@ Generated by MOD2GLSL v1.46
                             return max(0, pts[-1][0] - pts[sus_pt][0])
                         return 0
                     _rd_v = ', '.join(str(_env_rel_dur(s)) for s in _xm_samples)
+                    # sampleEnvAttackDur: tick count from env_pts[0] to the
+                    # sustain point. Non-zero ONLY for samples whose envelope
+                    # starts at silence (env_pts[0].y == 0) — for these the
+                    # JS engine plays the new voice silently during the
+                    # attack ramp (envX advances 0→sus over this many ticks).
+                    # The GLSL is stateless so it ramps s_curr's amplitude
+                    # from 0 to 1 over this window in the trigger overlay,
+                    # eliminating the "burst" of full-amplitude new voice
+                    # before the envelope catches up.
+                    def _env_attack_dur(s):
+                        pts = s.get('env_pts')
+                        if not pts or len(pts) < 2:
+                            return 0
+                        if pts[0][1] != 0:
+                            return 0  # env starts at peak — no attack ramp
+                        sus_pt = s.get('env_sus_pt', 0)
+                        if sus_pt >= len(pts):
+                            return 0
+                        return max(0, pts[sus_pt][0] - pts[0][0])
+                    _ad_v = ', '.join(str(_env_attack_dur(s)) for s in _xm_samples)
+                    # Pack env_pts (x,y pairs) into flat arrays with per-
+                    # sample offset/count for the GLSL synthesis-time
+                    # envelope lookup. Each point is two ints (tick, value);
+                    # values are 0..64. envOffset[i]/envCount[i] index into
+                    # envPointsX/Y for sample i. Samples without an envelope
+                    # get count=0 → engine treats envValue as 1.0.
+                    _env_x_flat = []
+                    _env_y_flat = []
+                    _env_off_v = []
+                    _env_cnt_v = []
+                    _env_sus_pt_v = []
+                    for s in _xm_samples:
+                        pts = s.get('env_pts') or []
+                        sus_pt = s.get('env_sus_pt', 0) if s.get('env_sus', False) else -1
+                        _env_off_v.append(len(_env_x_flat))
+                        _env_cnt_v.append(len(pts))
+                        _env_sus_pt_v.append(sus_pt)
+                        for p in pts:
+                            _env_x_flat.append(int(p[0]))
+                            _env_y_flat.append(int(p[1]))
+                    # Pad to non-empty for GLSL int[](…) syntax.
+                    if not _env_x_flat:
+                        _env_x_flat = [0]
+                        _env_y_flat = [64]
+                    _ex_v = ', '.join(str(v) for v in _env_x_flat)
+                    _ey_v = ', '.join(str(v) for v in _env_y_flat)
+                    _eo_v = ', '.join(str(v) for v in _env_off_v)
+                    _ec_v = ', '.join(str(v) for v in _env_cnt_v)
+                    _esp_v = ', '.join(str(v) for v in _env_sus_pt_v)
+                    _env_total = len(_env_x_flat)
                     _arrays_block = (
                         f"\n// XM key-off envelope helpers (parallel to samples[]).\n"
                         f"const int sampleFadeout[31]     = int[]({_fo_v});\n"
@@ -13157,6 +13559,60 @@ Generated by MOD2GLSL v1.46
                         f"// proper ghost release for NNA=2/3 voices.\n"
                         f"const int sampleNNA[31]         = int[]({_nna_v});\n"
                         f"const int sampleEnvReleaseDur[31] = int[]({_rd_v});\n"
+                        f"// ── Per-sample volume envelopes (env_pts) ──\n"
+                        f"// Flat (x,y) pairs indexed by sample via offset/count.\n"
+                        f"// sampleEnvSusPt[i] is the sustain point INDEX into the\n"
+                        f"// sample's envelope (or -1 = no sustain). envValueAt()\n"
+                        f"// linearly interpolates between adjacent points; while\n"
+                        f"// keyOn it clamps envX at the sustain point's tick.\n"
+                        f"const int envPointsX[{_env_total}]  = int[]({_ex_v});\n"
+                        f"const int envPointsY[{_env_total}]  = int[]({_ey_v});\n"
+                        f"const int sampleEnvOff[31]    = int[]({_eo_v});\n"
+                        f"const int sampleEnvCnt[31]    = int[]({_ec_v});\n"
+                        f"const int sampleEnvSusPt[31]  = int[]({_esp_v});\n"
+                        f"\n"
+                        f"// envValueAt — sample-defined envelope at envTime (seconds).\n"
+                        f"// envTime: total seconds since trigger.\n"
+                        f"// keyOffAge: seconds since key-off; <= 0 means keyOn=true\n"
+                        f"//   (sustain at sus point). > 0 means voice has been released\n"
+                        f"//   for that long — envX advances past sus by that much\n"
+                        f"//   regardless of envTime.\n"
+                        f"// Returns y/64.0 in [0,1]. instIdx is 0-based sample index.\n"
+                        f"float envValueAt(int instIdx, float envTime, float keyOffAge) {{\n"
+                        f"    if (instIdx < 0 || instIdx >= 31) return 1.0;\n"
+                        f"    int cnt = sampleEnvCnt[instIdx];\n"
+                        f"    if (cnt < 2) return 1.0;\n"
+                        f"    int off = sampleEnvOff[instIdx];\n"
+                        f"    int susPt = sampleEnvSusPt[instIdx];\n"
+                        f"    float envX;\n"
+                        f"    if (keyOffAge <= 0.0) {{\n"
+                        f"        envX = envTime * TICKS_PER_SEC;\n"
+                        f"        if (susPt >= 0 && susPt < cnt) {{\n"
+                        f"            float susX = float(envPointsX[off + susPt]);\n"
+                        f"            if (envX > susX) envX = susX;\n"
+                        f"        }}\n"
+                        f"    }} else {{\n"
+                        f"        if (susPt >= 0 && susPt < cnt) {{\n"
+                        f"            envX = float(envPointsX[off + susPt]) + keyOffAge * TICKS_PER_SEC;\n"
+                        f"        }} else {{\n"
+                        f"            envX = envTime * TICKS_PER_SEC;\n"
+                        f"        }}\n"
+                        f"    }}\n"
+                        f"    float lastX = float(envPointsX[off + cnt - 1]);\n"
+                        f"    if (envX >= lastX) return float(envPointsY[off + cnt - 1]) / 64.0;\n"
+                        f"    if (envX <= float(envPointsX[off])) return float(envPointsY[off]) / 64.0;\n"
+                        f"    for (int i = 0; i < 24; i++) {{\n"
+                        f"        if (i + 1 >= cnt) break;\n"
+                        f"        float x0 = float(envPointsX[off + i]);\n"
+                        f"        float x1 = float(envPointsX[off + i + 1]);\n"
+                        f"        if (envX >= x0 && envX <= x1) {{\n"
+                        f"            float t = (x1 > x0) ? (envX - x0) / (x1 - x0) : 0.0;\n"
+                        f"            return mix(float(envPointsY[off + i]),\n"
+                        f"                       float(envPointsY[off + i + 1]), t) / 64.0;\n"
+                        f"        }}\n"
+                        f"    }}\n"
+                        f"    return 1.0;\n"
+                        f"}}\n"
                     )
                     # Find end of `samples[]` array initializer and inject after.
                     _smp_end = _ct.find(');', _ct.find('const SampleInfo samples['))
@@ -13277,6 +13733,25 @@ Generated by MOD2GLSL v1.46
                     _re3.MULTILINE | _re3.DOTALL)
                 _gs_fns = _gs_pat.findall(_common_src)
                 _common_src = _gs_pat.sub('', _common_src)
+                # Rename captured getSample → _decodeSample, append RVQ_LPF wrapper
+                # so HF quantization noise can be filtered without regenerating.
+                _wrapped = []
+                for _f in _gs_fns:
+                    _wrapped.append(_f.replace('float getSample(', 'float _decodeSample(', 1))
+                    _wrapped.append(
+                        'float getSample(int sampleIdx) {\n'
+                        '    if (sampleIdx < 0 || sampleIdx >= TOTAL_SAMPLES) return 0.0;\n'
+                        '#if RVQ_LPF\n'
+                        '    int _a = max(0, sampleIdx - 1);\n'
+                        '    int _c = min(TOTAL_SAMPLES - 1, sampleIdx + 1);\n'
+                        '    return 0.25 * _decodeSample(_a)\n'
+                        '         + 0.5  * _decodeSample(sampleIdx)\n'
+                        '         + 0.25 * _decodeSample(_c);\n'
+                        '#else\n'
+                        '    return _decodeSample(sampleIdx);\n'
+                        '#endif\n'
+                        '}')
+                _gs_fns = _wrapped
     
                 _gsf_pat = _re3.compile(
                     r'(?://[^\n]*\n)*float\s+getSampleF\s*\([^)]*\)\s*\{(?:[^{}]|\{[^}]*\})*\}',
@@ -13324,7 +13799,7 @@ Generated by MOD2GLSL v1.46
                         _i += 1
                     _gcobody_fn = _common_src[_start:_i]
                     _common_src = _common_src[:_start] + _common_src[_i:]
-    
+
                 # Also capture _lanczos3 helper if present
                 _lz_pat = _re3.compile(
                     r'(?://[^\n]*\n)*float\s+_lanczos3\s*\([^)]*\)\s*\{[^}]*\}',
@@ -13383,6 +13858,7 @@ Generated by MOD2GLSL v1.46
 float xmReleaseMul(int ch, Position pos, float curTime) {
     int sR = pos.row, sP = pos.songPos;
     int koGlobalRow = -1;
+    int trigGlobalRow = -1;
     int trigInst = 0;
     int trigPeriod = 0;
     // ── IT note-cut detection ──
@@ -13410,6 +13886,7 @@ float xmReleaseMul(int ch, Position pos, float curTime) {
         }
         if (isTrig) {
             trigPeriod = n.period;
+            trigGlobalRow = patRowOffset[sP] + (sR - patStartRow[sP]);
             trigInst = (n.instrument >= 1 && n.instrument < 128 && (n.instrument & 0x40) == 0) ? n.instrument : 0;
             if (trigInst <= 0) {
                 int sR2 = sR, sP2 = sP;
@@ -13514,23 +13991,84 @@ float xmReleaseMul(int ch, Position pos, float curTime) {
                     '        if (_pInst >= 1 && _pInst <= 31) {\n'
                     '            int _nna = sampleNNA[_pInst - 1];\n'
                     '            int _relTicks = sampleEnvReleaseDur[_pInst - 1];\n'
-                    '            if ((_nna == 2 || _nna == 3) && _relTicks > 0) {\n'
-                    '                _xfLen = float(_relTicks) * (44100.0 / TICKS_PER_SEC);\n'
+                    '            int _foAmt    = sampleFadeout[_pInst - 1];\n'
+                    '            float _foSamp = (_foAmt > 0)\n'
+                    '                ? (32768.0 / float(_foAmt)) * (44100.0 / TICKS_PER_SEC)\n'
+                    '                : 220500.0;\n'
+                    '            float _envSamp = (_relTicks > 0)\n'
+                    '                ? float(_relTicks) * (44100.0 / TICKS_PER_SEC)\n'
+                    '                : 220500.0;\n'
+                    '            // NNA=1 (continue) ALWAYS uses long ghost — drum stacking\n'
+                    '            // depends on it regardless of NNA_GHOST_MODE.\n'
+                    '            // NNA=2/3 only use long ghost when NNA_GHOST_MODE=1; otherwise\n'
+                    '            // _xfLen stays at the 64-sample anti-click default.\n'
+                    '            if (_nna == 1) {\n'
+                    '                _xfLen = (_relTicks > 0) ? _envSamp : 220500.0;\n'
                     '            }\n'
+                    '#if NNA_GHOST_MODE\n'
+                    '            else if (_nna == 2) {\n'
+                    '                _xfLen = (_relTicks > 0) ? _envSamp : _foSamp;\n'
+                    '            } else if (_nna == 3) {\n'
+                    '                _xfLen = min(_envSamp, _foSamp);\n'
+                    '            }\n'
+                    '#endif\n'
                     '        }\n'
                     '    }\n'
                     '    if (ageSamples < _xfLen && ageSamples >= 0.0) {',
                     _prelude, count=1)
+                # Attack ramp on s_curr — multiplies the NEW voice by 0→1 over
+                # 130 ms when its sample has a sustained envelope starting at
+                # silence (sampleEnvReleaseDur > 0). Done at the s_curr
+                # definition site so EVERY return path (overlay branches,
+                # bare `return s_curr;`) inherits the attenuation. The ghost
+                # `s_prev` is computed separately later and unaffected.
+                _prelude = _re3.sub(
+                    r'(float s_curr = _gcoBody\([^;]+\);\s*\n)',
+                    r'\1'
+                    r'    // Apply the sample-defined envelope to s_curr. NO extra\n'
+                    r'    // smoothstep — stacking ramps causes a mid-transition\n'
+                    r'    // amplitude DIP (new voice rises slower than ghost decays\n'
+                    r'    // → both partial in the middle = swoosh). Just envelope.\n'
+                    r'    {\n'
+                    r'        int _curIns_ = trigNote.instrument;\n'
+                    r'        if (_curIns_ >= 1 && _curIns_ <= 31) {\n'
+                    r'            float _trigTimeF_ = float(fetchTick(patTickOffset[trigPat]+(trigRow-patStartRow[trigPat]))) / TICKS_PER_SEC;\n'
+                    r'            s_curr *= envValueAt(_curIns_ - 1, time - _trigTimeF_, 0.0);\n'
+                    r'        }\n'
+                    r'    }\n',
+                    _prelude, count=1)
+
                 _prelude = _re3.sub(
                     r'float t = ageSamples / 64\.0;\s*\n\s*return s_prev \* \(1\.0 - t\) \+ s_curr \* t;',
-                    '// Ghost overlay for long releases (NNA=2/3 + envelope):\n'
-                    '            // current at full + prev fading linearly to 0.\n'
-                    '            // Short crossfade (64-sample anti-click) keeps blend.\n'
+                    '            // Ghost overlay engages when _xfLen > 64.5. _xfLen was\n'
+                    '            // set long for NNA=1 ALWAYS (drum stacking — additive\n'
+                    '            // is correct here) and for NNA=2/3 only when\n'
+                    '            // NNA_GHOST_MODE=1. NNA=2/3 use a CROSSFADE rather\n'
+                    '            // than additive overlay so chord-change retriggers\n'
+                    '            // stay near the pre-trigger amplitude instead of\n'
+                    '            // swelling +6 dB during the ghost-release window\n'
+                    '            // (matches the JS engine where the new voice is\n'
+                    '            // silent during env-attack while the ghost rides\n'
+                    '            // its envelope release).\n'
                     '            if (_xfLen > 64.5) {\n'
-                    '                float _fade = max(0.0, 1.0 - ageSamples / _xfLen);\n'
-                    '                return s_curr + s_prev * _fade;\n'
+                    '                // Ghost (s_prev) gets envelope release: it was\n'
+                    '                // key-offed at the NEW trigger time, so its envX\n'
+                    '                // progresses past the sustain point from then on.\n'
+                    '                // envValueAt with keyOn=false advances envX into\n'
+                    '                // the release segment — the natural envelope decay.\n'
+                    '                int _pIns2 = pTrigNote.instrument;\n'
+                    '                if (_pIns2 >= 1 && _pIns2 <= 31) {\n'
+                    '                    float _pTrigTime = float(fetchTick(patTickOffset[pTrigPat]+(pTrigRow-patStartRow[pTrigPat]))) / TICKS_PER_SEC;\n'
+                    '                    float _curTrigTime = float(fetchTick(patTickOffset[trigPat]+(trigRow-patStartRow[trigPat]))) / TICKS_PER_SEC;\n'
+                    '                    float _koAge = max(0.0, time - _curTrigTime);\n'
+                    '                    s_prev *= envValueAt(_pIns2 - 1, time - _pTrigTime, _koAge);\n'
+                    '                }\n'
+                    '                return s_curr + s_prev;\n'
                     '            }\n'
-                    '            float t = ageSamples / 64.0;\n'
+                    '            // Equal-power crossfade over 64 samples for the anti-click\n'
+                    '            // window. clamp(t) prevents t>1 from producing negative\n'
+                    '            // s_prev + over-amped s_curr.\n'
+                    '            float t = clamp(ageSamples / 64.0, 0.0, 1.0);\n'
                     '            return s_prev * (1.0 - t) + s_curr * t;',
                     _prelude, count=1)
 
@@ -13573,7 +14111,7 @@ float xmReleaseMul(int ch, Position pos, float curTime) {
                 if _nc_actual > 4:
                     _sound_src = _sound_src.replace(
                         'const float normFactor = 2.0 / float(NUM_CHANNELS);',
-                        f'const float normFactor = 0.55;   // loud mode (>4 channels)')
+                        f'const float normFactor = 0.85;   // loud mode (>4 channels)')
                     # NOTE: the chain restructure (fat_cs1 → phatbass → softlim)
                     # is now baked into mod_player.py's mainSound emission, so
                     # the VQ-emitted Sound already has the correct order plus
@@ -13594,6 +14132,21 @@ float xmReleaseMul(int ch, Position pos, float curTime) {
 
                 # Collapse runs of blank lines in common
                 _common_src = _re3.sub(r'\n{3,}', '\n\n', _common_src)
+
+                # Inject runtime-toggleable knobs after USE_EMBEDDED_DATA
+                # if not already present (idempotent).
+                if 'RVQ_LPF' not in _common_src:
+                    _common_src = _re3.sub(
+                        r'(#define\s+USE_EMBEDDED_DATA\s+[01]\s*\n)',
+                        r'\1// 3-tap FIR low-pass on RVQ-decoded samples (1=ON, 0=OFF). Suppresses\n'
+                        r'// HF quantization noise from --no-rvq2 / --bitrate lo at 3× decode cost.\n'
+                        r'#define RVQ_LPF 1\n'
+                        r'// NNA mode: 0=clean equal-power crossfade over 64 samples for ALL NNAs\n'
+                        r'// (no +6dB swell at trigger, no long ghost overlay — VLC-style).\n'
+                        r'// 1=ghost overlay per NNA byte (IT semantics; envelope release tail\n'
+                        r'// for NNA=2/3, drum stacking for NNA=1) — matches the JS engine.\n'
+                        r'#define NNA_GHOST_MODE 1\n',
+                        _common_src, count=1)
 
                 with open(glsl_common_file, 'w') as _f: _f.write(_common_src)
                 with open(_glsl_sound,       'w') as _f: _f.write(_sound_src)
