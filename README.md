@@ -31,8 +31,8 @@ Example: % python mod_player.py beyond.mod --max-compat --viz 6   --resampler la
 
 $\color{limegreen}\textsf{+}$ &nbsp; **Impulse Tracker (IT) w/ NNA support**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Fast Tracker II (XM) support**  <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **ScreamTracker 3.xx (S3M) support**  <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **Fixed some bugs in IT playback*  <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **ScreamTracker 3.xx (S3M) support**<br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Fixed some bugs in IT playback**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **TRU 3D Surround** (new improved AllPass 3D Surround technique)<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Phat Bass — Hilbert applied to bass tracks or a mix**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Velvet Reverb** <br>
