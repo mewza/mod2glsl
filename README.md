@@ -1,8 +1,8 @@
 <div align="center">
 
-# 🎵 MOD2GLSL v1.51
+# 🎵 MOD2GLSL v1.54
 
-$${\Large\color{orange}\textsf{GLSL MOD Player v1.51 for ShaderToy}}$$
+$${\Large\color{orange}\textsf{GLSL MOD Player v1.54 for ShaderToy}}$$
 $${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
 
 ![Version](https://img.shields.io/badge/version-1.37-orange?style=flat-square)
@@ -18,24 +18,25 @@ $${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
 
 https://github.com/user-attachments/assets/4c7fe125-086c-410b-bcba-808fc7648984
 
-*BEYOND_MUSIC.MOD rendered through GLSL MOD Player v1.51*
+*BEYOND_MUSIC.MOD rendered through GLSL MOD Player v1.54*
 
 </div>
 
 Convert Amiga ProTracker mod files (MOD, S3M, XM, and IT) into a ShaderToy shader, complete with visualization and a note/effect overlay.
 
 Examples: <br>
-&nbsp; % python3 mod_player.py beyond.mod --max-compat --viz 6   --resampler lanczos3<br>
-&nbsp; % python3 mod_player.py Firestorm.it --max-compat --viz 3 --no-rvq2  --bitrate ultra<br>
+&nbsp; % python3 mod_player.py beyond.mod --viz 6   --resampler lanczos3<br>
+&nbsp; % python3 mod_player.py Firestorm.it --viz 3 --no-rvq2  --bitrate ultra<br>
     
 ---
 
-## $${\color{limegreen}\textsf{✨ What's new in v1.51}}$$
+## $${\color{limegreen}\textsf{✨ What's new in v1.54}}$$
 
 $\color{limegreen}\textsf{+}$ &nbsp; **Impulse Tracker (IT) w/ NNA support**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Fast Tracker II (XM) support**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **ScreamTracker 3.xx (S3M) support**<br>
-$\color{limegreen}\textsf{+}$ &nbsp; **Fixed some bugs in IT playback**  <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Fixed some more bugs in IT playback**  <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Avanced micro-click removal**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **TRU 3D Surround** (new improved AllPass 3D Surround technique)<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Phat Bass — Hilbert applied to bass tracks or a mix**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Velvet Reverb** <br>
