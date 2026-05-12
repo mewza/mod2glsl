@@ -213,50 +213,67 @@ def create_sample_pngs(samples, mod_name, output_dir):
 def bw_compress_sample(data, sr=44100):
     """
     Bandwidth-adaptive sample compression.
-    Analyzes frequency content via FFT, finds highest significant frequency,
-    then decimates by the best power-of-2 factor via raw stride (no LPF).
+    Analyzes frequency content via FFT, finds best power-of-2 downsample factor,
+    applies a windowed-sinc anti-alias LPF, then decimates.
     Returns (bw_factor, compressed_int8_array).
     """
     d = data.astype(np.float32)
     n = len(d)
     if n < 32:
         return 1, d.astype(np.int8)
-    
+
     # FFT with Hann window to find highest significant frequency
     fft_mag = np.abs(np.fft.rfft(d * np.hanning(n)))
     freqs   = np.fft.rfftfreq(n, 1.0/sr)
     peak    = np.max(fft_mag)
     if peak == 0:
         return 1, d.astype(np.int8)
-    
+
     # Find highest bin with > 0.5% of peak energy
     sig_bins = np.where(fft_mag > peak * 0.005)[0]
     max_freq = freqs[sig_bins[-1]] if len(sig_bins) else 22050.0
-    
+
     # Choose best power-of-2 downsample factor (Nyquist + 20% headroom)
     best_factor = 1
     for f in [2, 4, 8, 16]:
         if sr / f >= max_freq * 2.4:
             best_factor = f
-    
+
     if best_factor == 1:
         return 1, d.astype(np.int8)
-    
-    # Pre-emphasis: y[n] = x[n] - alpha*x[n-1]  (first-order high-shelf boost)
-    # Compensates the anti-alias LPF roll-off baked in by resample_poly.
-    # No de-emphasis on playback → brighter, more present sound.
-    # alpha=0.85 ≈ +6 dB shelf above ~3 kHz; raise to 0.93 for more air.
-    _alpha = 0.85
-    d_pre = np.empty_like(d)
-    d_pre[0] = d[0]
-    for i in range(1, len(d)):
-        d_pre[i] = d[i] - _alpha * d[i-1]
-    d = d_pre
 
-    # Raw decimation — no LPF, full HF content preserved
-    compressed = d[::best_factor]
+    # Anti-alias LPF: 128-tap windowed-sinc at 0.9× the new Nyquist.
+    # Blackman window gives >70 dB stopband — eliminates aliasing foldback
+    # that the old raw-stride code left in (audible as clicks/crackling).
+    M   = 64                      # half-length; total taps = 2M+1 = 129
+    fc  = 0.9 / best_factor       # normalised cutoff (1.0 = original Nyquist)
+    idx = np.arange(-M, M + 1, dtype=np.float32)
+    h   = np.sinc(2.0 * fc * idx).astype(np.float32)
+    h  *= np.blackman(2 * M + 1).astype(np.float32)
+    h  /= h.sum()                 # unity DC gain
+
+    d_filt    = np.convolve(d, h, mode='same')
+    compressed = d_filt[::best_factor]
     compressed = np.clip(np.round(compressed).astype(np.int32), -128, 127).astype(np.int8)
     return best_factor, compressed
+
+
+def _compress_loop_offsets(repeat_point, repeat_length, bw_factor):
+    """
+    Convert original loop start/length to compressed-domain coordinates.
+    Rounds both endpoints to the nearest decimated-grid position so the
+    seam maps to the closest actual stored sample, minimising discontinuity.
+    Returns (loop_start_c, loop_len_c) in compressed units.
+    If the compressed loop would be < 3 samples (GLSL won't loop), returns (0, 0).
+    """
+    if repeat_length <= 2 or bw_factor <= 1:
+        return repeat_point // max(1, bw_factor), repeat_length
+    lp = int(round(repeat_point / bw_factor))
+    le = int(round((repeat_point + repeat_length) / bw_factor))
+    ll = max(0, le - lp)
+    if ll < 3:          # too short — GLSL loopLen > 2 guard would skip it
+        return 0, 0
+    return lp, ll
 
 
 class MODFile:
@@ -2053,8 +2070,8 @@ def create_fixed_player_html(mod, output_file, downsample=1, compress=False, vec
                 'index':       i,
                 'start':       current_pos,
                 'length':      len(compressed),  # compressed length (not including padding)
-                'loop_start':  sample['repeat_point'] // bf,
-                'loop_length': sample['repeat_length'] // bf if sample['repeat_length'] > 2 else sample['repeat_length'],
+                'loop_start':  _compress_loop_offsets(sample['repeat_point'], sample['repeat_length'], bf)[0],
+                'loop_length': _compress_loop_offsets(sample['repeat_point'], sample['repeat_length'], bf)[1],
                 'bw_factor':   bf,
                 'volume':      sample['volume'],
                 'finetune':    sample['finetune'],
@@ -2714,11 +2731,13 @@ class MODPlayer {{
                 // value (pre-pan). On trigger, clickRemaining is set to
                 // the window length (clickWindow); per-sample ramp is
                 // (clickWindow - clickRemaining) / clickWindow.
-                // For NNA=0/1 (percussive): 64-sample anti-click.
+                // For NNA=0/1 (percussive): 256-sample anti-click (~5.8ms
+                // @44.1kHz) — matches mikMod default, kills bass/drum
+                // retrigger clicks without softening transient attack.
                 // For NNA=2/3 (sustained pad displaced): 4410 samples
                 // (~100 ms equal-power crossfade) so the OLD voice
                 // fades smoothly instead of cutting abruptly.
-                vlast: 0.0, clickRemaining: 0, clickWindow: 64,
+                vlast: 0.0, clickRemaining: 0, clickWindow: 256,
                 loopbackPoint: 0, loopCount: 0, _delayedNote: null,
                 // XM volume envelope state. envX is the current envelope-x
                 // position in player ticks. keyOn=true while sustaining,
@@ -3296,8 +3315,8 @@ class MODPlayer {{
                             // entire chord row, ghost decays via NFC.
                             state.mixVol = state.currentVolume;
                             state.volInc = 0;
-                            state.clickWindow = 64;
-                            state.clickRemaining = 64;
+                            state.clickWindow = 256;
+                            state.clickRemaining = 256;
                             state.volumeFade = 1.0;
                             state.volumeFadeInc = 0;
                             state.targetVolume = 1.0;
@@ -3338,7 +3357,7 @@ class MODPlayer {{
                             const state = this.channels[ch];
                             state.samplePos = 0.0;
                             state.mixVol = state.currentVolume;
-                            state.clickWindow = 64; state.clickRemaining = 64;
+                            state.clickWindow = 256; state.clickRemaining = 256;
                         }}
                     }}
                 }}
@@ -3633,13 +3652,22 @@ class MODPlayer {{
                             if (!tick0 && val > 0 && (this.currentTick % val) === 0) {{
                                 state.samplePos = 0.0;
                                 state.mixVol = state.currentVolume;
-                                state.clickWindow = 64; state.clickRemaining = 64;
+                                state.clickWindow = 256; state.clickRemaining = 256;
                             }}
                             break;
                         case 0xC: // ECx — Note cut after x ticks
                             if (!tick0 && this.currentTick === val) {{
                                 state.currentVolume = 0;
                                 state.volume = 0;
+                                // Anti-click: ramp mixVol DOWN to 0 over 256
+                                // output samples instead of setting it to 0
+                                // immediately (which would click). The
+                                // existing per-sample slew at the top of the
+                                // mix loop will carry mixVol → currentVolume
+                                // (=0) at this rate, then clamp.
+                                if (state.mixVol > 0) {{
+                                    state.volInc = -state.mixVol / 256.0;
+                                }}
                             }}
                             break;
                         case 0xD: // EDx — Note delay: trigger note x ticks late
@@ -3663,7 +3691,7 @@ class MODPlayer {{
                                 state.active = true;
                                 state.samplePos = 0.0;
                                 state.mixVol = state.currentVolume;
-                                state.clickWindow = 64; state.clickRemaining = 64;
+                                state.clickWindow = 256; state.clickRemaining = 256;
                                 state.envX = 0;
                                 state.keyOn = true;
                                 state.volFade = 65536;
@@ -3840,6 +3868,34 @@ class MODPlayer {{
 
                 if (state.active && state.period > 0) {{
                     const sample = this.getSampleData(state.sample, state.samplePos);
+                    // Loop-wrap click suppression for bass / sustained loops.
+                    // When a sample loops and its boundary samples don't match
+                    // amplitudes, each wrap produces a click. At a 100 Hz bass
+                    // note that's ~100 clicks/sec = audible buzz. Detect the
+                    // wrap moment (current position in loop < previous position
+                    // in loop, modulo loop length) and arm a 16-sample ramp.
+                    // Skip very tight loops (< 64 samples = single-cycle synth
+                    // waveforms) where 16-sample smoothing would dull the
+                    // tone significantly.
+                    {{
+                        const _smiL = modData.sampleMap[state.sample];
+                        if (_smiL && (_smiL.loop_length || 0) >= 64) {{
+                            const _bfL = _smiL.bw_factor || 1;
+                            const _inLoop = ((state.samplePos / _bfL) - _smiL.loop_start);
+                            const _curMod = ((_inLoop % _smiL.loop_length) + _smiL.loop_length) % _smiL.loop_length;
+                            if (state._prevLoopPos !== undefined
+                                && _curMod + 1.0 < state._prevLoopPos
+                                && state.clickRemaining === 0) {{
+                                // Wrap detected — short ramp smooths the
+                                // amplitude discontinuity at the loop boundary.
+                                state.clickWindow = 16;
+                                state.clickRemaining = 16;
+                            }}
+                            state._prevLoopPos = _curMod;
+                        }} else {{
+                            state._prevLoopPos = undefined;
+                        }}
+                    }}
                     state.mixVol += state.volInc;
                     if (state.volInc > 0 && state.mixVol > state.currentVolume) {{
                         state.mixVol = state.currentVolume; state.volInc = 0;
@@ -3891,10 +3947,28 @@ class MODPlayer {{
                     }}
                     const cv = (state.mixVol / 64.0) * (state.channelVolume / 64.0) * envMul;
                     const target = sample * cv;
+                    // Post-end anti-click: when samplePos has crossed the
+                    // non-looping sample's end (getSampleData now returns 0)
+                    // and we still have a non-zero vlast, arm the existing
+                    // click ramp. The ramp formula `vlast*(1-ct) + target*ct`
+                    // with target=0 naturally decays vlast → 0 over 256
+                    // samples. The sample plays through its full natural
+                    // length first — this only kicks in *after* the data
+                    // ends, so no track-path is cut short.
+                    if (_info && (_info.loop_length || 0) <= 2 && _info.length > 0
+                        && state.clickRemaining === 0
+                        && Math.abs(state.vlast) > 1e-6) {{
+                        const _bf = _info.bw_factor || 1;
+                        if (state.samplePos / _bf >= _info.length) {{
+                            state.clickWindow = 256;
+                            state.clickRemaining = 256;
+                        }}
+                    }}
                     // mikMod-style click ramp: blend output from vlast (last
-                    // sample's actual output) toward target over 64 samples
-                    // post-trigger. Eliminates the dip-to-silence that
-                    // happened when state.mixVol was reset to 0.
+                    // sample's actual output) toward target over 256 samples
+                    // post-trigger (~5.8 ms @44.1kHz). Eliminates the
+                    // dip-to-silence that happened when state.mixVol was reset
+                    // to 0 and the percussive click on bass/drum retriggers.
                     let s;
                     if (state.clickRemaining > 0) {{
                         const _w = state.clickWindow || 64;
@@ -4674,8 +4748,8 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
         sample_map.append({
             'start':          start_idx,
             'length':         raw_len,
-            'repeat_point':   smp['repeat_point'] // bw_factor,
-            'repeat_length':  smp['repeat_length'] // bw_factor if smp['repeat_length'] > 2 else smp['repeat_length'],
+            'repeat_point':   _compress_loop_offsets(smp['repeat_point'], smp['repeat_length'], bw_factor)[0],
+            'repeat_length':  _compress_loop_offsets(smp['repeat_point'], smp['repeat_length'], bw_factor)[1],
             'bw_factor':      bw_factor,
         })
     
@@ -4880,13 +4954,16 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
     # USE_142_DSP toggle — emit as 0/1 for the GLSL #define
     use_142_dsp_int = 1 if compat.get('use_142_dsp', False) else 0
     common_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.5 (c) 2026 Orblivius
-   4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
-   COMMON TAB
+   GLSL (The Last) MOD Player v1.54 (c) 2026 Orblivius
+   
+   32 Tracks support, IT/XM/S3M/MOD loader, 3D Surround, PHAT Bass, Velvet Reverb, 
+   Comb Reverb, FAT, W1 Limiter, RVQ sample compression, configurable downsample
+   
    Visualizer: {viz_name}
-   Contact: subband@gmail.com or
-            subband@protonmail.com
-   GIT:     https://github.com/mewza/mod2glsl
+ 
+   Git Home: https://github.com/mewza/mod2glsl
+   Contact:  subband@gmail.com or
+             subband@protonmail.com
   ============================================================================ */
 // Generated from: {mod.title}
 // {data_source_comment}
@@ -5417,15 +5494,50 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     float freq       = periodToFreq(max(1, int(effectivePeriod)));
     float fSamplePos = elapsed * freq / float(smp.bwFactor);  // map to compressed sample space
 
+    float s;
     if (smp.loopLen > 2) {{
         if (fSamplePos >= float(smp.loopStart + smp.loopLen))
             fSamplePos = float(smp.loopStart) + mod(fSamplePos - float(smp.loopStart), float(smp.loopLen));
-    }} else if (fSamplePos >= float(smp.length)) {{
-        return 0.0;
-    }}
-    if (fSamplePos < 0.0) return 0.0;
+        if (fSamplePos < 0.0) return 0.0;
+        s = getSampleF(smp.start, fSamplePos, smp.length, smp.loopStart, smp.loopLen);
 
-    float s = getSampleF(smp.start, fSamplePos, smp.length, smp.loopStart, smp.loopLen);
+        // Loop-wrap anti-click: blend with the wave's "other side" near each
+        // boundary. Bass samples often have mismatched loop_end and loop_start
+        // amplitudes — without this, every loop wrap clicks. 8-sample window
+        // each side (in compressed sample-domain — the discontinuity lives
+        // there). Skip very short loops (<32 samples) where this would dull
+        // single-cycle synth tones.
+        if (smp.loopLen >= 32) {{
+            const float _LF = 8.0;
+            float _posInLoop = fSamplePos - float(smp.loopStart);
+            float _distFromStart = _posInLoop;
+            float _distFromEnd   = float(smp.loopLen) - _posInLoop;
+            if (_distFromStart < _LF) {{
+                float _partnerPos = float(smp.loopStart + smp.loopLen) - (_LF - _distFromStart);
+                float _partner = getSampleF(smp.start, _partnerPos, smp.length, smp.loopStart, smp.loopLen);
+                float _fade = 0.5 * (1.0 - _distFromStart / _LF);
+                s = mix(s, _partner, _fade);
+            }} else if (_distFromEnd < _LF) {{
+                float _partnerPos = float(smp.loopStart) + (_LF - _distFromEnd);
+                float _partner = getSampleF(smp.start, _partnerPos, smp.length, smp.loopStart, smp.loopLen);
+                float _fade = 0.5 * (1.0 - _distFromEnd / _LF);
+                s = mix(s, _partner, _fade);
+            }}
+        }}
+    }} else if (fSamplePos >= float(smp.length)) {{
+        // Anti-click post-end tail: hold the sample's last value and fade
+        // it linearly over 64 OUTPUT samples (~1.45 ms @ 44.1k) — NOT 64
+        // compressed-sample-domain units, which would be wildly wrong for
+        // samples with bw_factor>1 played at non-c5 pitches. Convert via
+        // freq and bw_factor: time-past-end = (fSamplePos - length) * bwFactor / freq
+        // (in seconds), then × 44100 for output samples.
+        float _postEndOut = (fSamplePos - float(smp.length)) * float(smp.bwFactor) * 44100.0 / freq;
+        if (_postEndOut >= 64.0) return 0.0;
+        s = getSample(smp.start + smp.length - 1) * (1.0 - _postEndOut / 64.0);
+    }} else {{
+        if (fSamplePos < 0.0) return 0.0;
+        s = getSampleF(smp.start, fSamplePos, smp.length, smp.loopStart, smp.loopLen);
+    }}
 
     // ── Volume: forward scan trigger→current to honour Cxx cuts & Axx slides ─
     // ProTracker volume slide (Effect A/6) SKIPS tick 0 → applies (SPEED-1) ticks per row.
@@ -5545,7 +5657,10 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
         if (relTime > 0.0) {{
             int _fo = sampleFadeout[trigNote.instrument - 1];
             if (_fo <= 0) {{
-                releaseMul = 0.0;  // hard cut
+                // Anti-click: ramp releaseMul 1→0 over 64 output samples
+                // (~1.45 ms @ 44.1k). Used to be 256 — too long.
+                float _kSamp = relTime * 44100.0;
+                releaseMul = max(0.0, 1.0 - _kSamp / 64.0);
             }} else {{
                 // Stage 1: snap to releaseHold over 40ms (env release shape).
                 float drop = clamp(relTime * 25.0, 0.0, 1.0);
@@ -5558,7 +5673,169 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
             }}
         }}
     }}
-    return s * float(volume) / 64.0 * releaseMul;
+    // ── mikIT-style 64-sample crossfade with previous trigger ─────────────
+    //
+    // mdrv_mix.cpp `dying[]` mechanism: when a new note kicks on channel t,
+    // mikIT copies the OLD channel state to dying[t], sets dying[t].volume=0
+    // and ramps it down over 64 samples while the new note ramps up from 0.
+    // True parallel crossfade — output is continuous across the trigger.
+    //
+    // Stateless port: scan back to find the trigger BEFORE current, replay
+    // its FULL effect chain (volume slides, Cxx, EAx/EBx, key-off envelope)
+    // to compute the prev note's frozen volume at the moment of the new
+    // trigger, look up its sample value at currentTime, and blend:
+    //
+    //   weight = clamp(elapsed * 44100 / 64, 0, 1)
+    //   at trigger T (elapsed=0):    weight=0 → 100% prev (continuous w/ T-1)
+    //   at T+64:                     weight=1 → 100% new
+    //
+    // Earlier mikIT attempt failed because prev used `_pSmp.volume` (static
+    // default vol), not the actual playing volume. If old note was at vol 32
+    // and prev-output was computed at vol 64, the boundary jumped 2x = click.
+    // This version fixes that by running the full vol/release chain for prev.
+    float _newOutput = s * float(volume) / 64.0 * releaseMul;
+    float _xfWeight  = clamp(elapsed * 44100.0 / 64.0, 0.0, 1.0);
+    float _prevOutput = 0.0;
+
+    if (_xfWeight < 1.0) {{
+        // ── Step 1: backward scan from trigRow-1 to find prev trigger ──
+        int _pScanRow = trigRow - 1;
+        int _pScanPat = trigPat;
+        Note _pNote;
+        bool _pFound = false;
+        for (int _plb = 0; _plb < 64; _plb++) {{
+            if (_pScanRow < 0) {{
+                if (_pScanPat > 0) {{
+                    _pScanPat--;
+                    int _prCount = patRowOffset[_pScanPat+1] - patRowOffset[_pScanPat];
+                    _pScanRow = patStartRow[_pScanPat] + _prCount - 1;
+                }} else {{ break; }}
+            }}
+            _pNote = getNote(_pScanPat, _pScanRow, ch);
+            bool _pIsKO = (_pNote.instrument >= 128) && (_pNote.period <= 0);
+            if (!_pIsKO && (_pNote.instrument > 0 || _pNote.period > 0)) {{
+                _pFound = true;
+                break;
+            }}
+            _pScanRow--;
+        }}
+        if (_pFound && _pNote.instrument > 0 && _pNote.instrument <= 31 && _pNote.period > 0) {{
+            SampleInfo _pSmp = samples[_pNote.instrument - 1];
+            if (_pSmp.length > 0) {{
+                int   _pTrigGlobalRow = patRowOffset[_pScanPat] + (_pScanRow - patStartRow[_pScanPat]);
+                int   _pTrigSpeed     = rowSpeed[_pTrigGlobalRow];
+                float _pTrigTime      = rowStartTime[_pTrigGlobalRow];
+                float _pElapsed       = currentTime - _pTrigTime;
+                if (_pElapsed > 0.0) {{
+                    // ── Step 2: prev note's full volume effect chain ───
+                    // Identical structure to the current note's chain but
+                    // scoped to (_pScanPat,_pScanRow) → (trigPat,trigRow-1).
+                    int _pVolume = _pSmp.volume;
+                    float _pKeyOffTime = -1.0;
+                    // Prev trigger row effects
+                    if (_pNote.effect == 0xC) {{
+                        _pVolume = min(_pNote.param, 64);
+                    }} else if (_pNote.effect == 0xA || _pNote.effect == 0x6) {{
+                        int _psu=(_pNote.param>>4)&0xF, _psd=_pNote.param&0xF;
+                        _pVolume = clamp(_pVolume + (_psu>0?_psu:-_psd)*(_pTrigSpeed-1), 0, 64);
+                    }} else if (_pNote.effect == 0xE) {{
+                        int _pesub = (_pNote.param >> 4) & 0xF;
+                        int _peval =  _pNote.param        & 0xF;
+                        if      (_pesub == 0xA) _pVolume = min(64, _pVolume + _peval);
+                        else if (_pesub == 0xB) _pVolume = max(0,  _pVolume - _peval);
+                    }}
+                    // Forward scan from _pScanRow+1 to (trigPat,trigRow-1)
+                    {{
+                        int _pfp = _pScanPat, _pfr = _pScanRow + 1;
+                        int _pPosRows = (_pfp < SONG_LENGTH) ? patRowOffset[_pfp+1] - patRowOffset[_pfp] : 0;
+                        if (_pfr >= patStartRow[_pfp] + _pPosRows) {{
+                            _pfp++;
+                            if (_pfp < SONG_LENGTH) {{
+                                _pfr = patStartRow[_pfp];
+                                _pPosRows = patRowOffset[_pfp+1] - patRowOffset[_pfp];
+                            }}
+                        }}
+                        for (int _pfi = 0; _pfi < 64; _pfi++) {{
+                            // Stop when we reach trigRow on trigPat (exclusive — new note replaces old at start of trigRow)
+                            if (_pfp > trigPat || (_pfp == trigPat && _pfr >= trigRow)) break;
+                            if (_pfp >= SONG_LENGTH) break;
+                            if (_pfr >= patStartRow[_pfp] + _pPosRows) {{
+                                _pfp++;
+                                _pfr = (_pfp < SONG_LENGTH) ? patStartRow[_pfp] : 0;
+                                if (_pfp < SONG_LENGTH) _pPosRows = patRowOffset[_pfp+1] - patRowOffset[_pfp];
+                                continue;
+                            }}
+                            Note _pfn = getNote(_pfp, _pfr, ch);
+                            bool _pfIsKO = (_pfn.instrument >= 128) && (_pfn.period <= 0);
+                            if (_pfIsKO) {{
+                                if (_pKeyOffTime < 0.0) {{
+                                    int _pgRow = patRowOffset[_pfp] + (_pfr - patStartRow[_pfp]);
+                                    _pKeyOffTime = rowStartTime[_pgRow];
+                                }}
+                                _pfr++;
+                                continue;
+                            }}
+                            if (_pfn.instrument > 0 || _pfn.period > 0) break;  // shouldn't happen (we stopped at trigRow), but safety
+                            if (_pfn.effect == 0xC) {{
+                                _pVolume = min(_pfn.param, 64);
+                            }} else if (_pfn.effect == 0xA || _pfn.effect == 0x6) {{
+                                int _psu=(_pfn.param>>4)&0xF, _psd=_pfn.param&0xF;
+                                int _pfGRow = patRowOffset[_pfp] + (_pfr - patStartRow[_pfp]);
+                                int _pfSpd = rowSpeed[_pfGRow];
+                                _pVolume = clamp(_pVolume + (_psu>0?_psu:-_psd)*(_pfSpd-1), 0, 64);
+                            }} else if (_pfn.effect == 0xE) {{
+                                int _pesub = (_pfn.param >> 4) & 0xF;
+                                int _peval =  _pfn.param        & 0xF;
+                                if      (_pesub == 0xA) _pVolume = min(64, _pVolume + _peval);
+                                else if (_pesub == 0xB) _pVolume = max(0,  _pVolume - _peval);
+                            }}
+                            _pfr++;
+                        }}
+                    }}
+                    // ── Step 3: prev note's release / fadeout multiplier ──
+                    float _pReleaseMul = 1.0;
+                    if (_pKeyOffTime > 0.0) {{
+                        float _pRelTime = currentTime - _pKeyOffTime;
+                        if (_pRelTime > 0.0) {{
+                            int _pFo = sampleFadeout[_pNote.instrument - 1];
+                            if (_pFo <= 0) {{
+                                float _pKSamp = _pRelTime * 44100.0;
+                                _pReleaseMul = max(0.0, 1.0 - _pKSamp / 64.0);
+                            }} else {{
+                                float _pDrop  = clamp(_pRelTime * 25.0, 0.0, 1.0);
+                                float _pHold  = float(sampleReleaseHold[_pNote.instrument - 1]) / 64.0;
+                                float _pEnvM  = mix(1.0, _pHold, _pDrop);
+                                float _pTksKO = _pRelTime * float(pos.speed) / pos.rowTime;
+                                float _pFadeM = max(0.0, 1.0 - 2.0 * float(_pFo) * _pTksKO / 65536.0);
+                                _pReleaseMul = _pEnvM * _pFadeM;
+                            }}
+                        }}
+                    }}
+                    // ── Step 4: prev note's sample value at currentTime ──
+                    // (vibrato ignored — modulation over 1.45ms is sub-cent)
+                    float _pFreq       = periodToFreq(max(1, _pNote.period));
+                    float _pFSamplePos = _pElapsed * _pFreq / float(_pSmp.bwFactor);
+                    float _pS = 0.0;
+                    if (_pSmp.loopLen > 2) {{
+                        if (_pFSamplePos >= float(_pSmp.loopStart + _pSmp.loopLen))
+                            _pFSamplePos = float(_pSmp.loopStart) + mod(_pFSamplePos - float(_pSmp.loopStart), float(_pSmp.loopLen));
+                        if (_pFSamplePos >= 0.0)
+                            _pS = getSampleF(_pSmp.start, _pFSamplePos, _pSmp.length, _pSmp.loopStart, _pSmp.loopLen);
+                    }} else if (_pFSamplePos < float(_pSmp.length) && _pFSamplePos >= 0.0) {{
+                        _pS = getSampleF(_pSmp.start, _pFSamplePos, _pSmp.length, _pSmp.loopStart, _pSmp.loopLen);
+                    }} else if (_pFSamplePos >= float(_pSmp.length)) {{
+                        // Post-end tail (64 output samples)
+                        float _pPostOut = (_pFSamplePos - float(_pSmp.length)) * float(_pSmp.bwFactor) * 44100.0 / _pFreq;
+                        if (_pPostOut < 64.0)
+                            _pS = getSample(_pSmp.start + _pSmp.length - 1) * (1.0 - _pPostOut / 64.0);
+                    }}
+                    _prevOutput = _pS * float(_pVolume) / 64.0 * _pReleaseMul;
+                }}
+            }}
+        }}
+    }}
+
+    return mix(_prevOutput, _newOutput, _xfWeight);
 }}
 """
     
@@ -5679,13 +5956,16 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     _ap_p0_2, _ap_p1p2_2, _ap_delay_2 = _only3d_coeffs(_ONLY3D_FREQ2)
 
     sound_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.5 (c) 2026 Orblivius
-   4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
-   SOUND TAB
+   GLSL (The Last) MOD Player v1.54 (c) 2026 Orblivius
+   
+   32 Tracks support, IT/XM/S3M/MOD loader, 3D Surround, PHAT Bass, Velvet Reverb, 
+   Comb Reverb, FAT, W1 Limiter, RVQ sample compression, configurable downsample
+   
    Visualizer: {viz_name}
-   Contact: subband@gmail.com or
-            subband@protonmail.com
-   GIT:     https://github.com/mewza/mod2glsl
+ 
+   Git Home: https://github.com/mewza/mod2glsl
+   Contact:  subband@gmail.com or
+             subband@protonmail.com
   ============================================================================ */
 // getByte / getPatternByte / getSample / getNote / getChannelOutput are in Common.
 
@@ -5960,6 +6240,9 @@ vec2 mainSound(int samp, float time) {{
     if (enable3D) {{
 #if USE_142_DSP
         // ── Only3D, single-tap (v1.42 path) — lower shader complexity ──
+        // Bass channels bypass widening — feeding bass through allpass +
+        // cross-mix produces audible cracking on transients (same reason
+        // v1.45 has the `if (isBass1) continue;` guard below).
         float tW = playbackTime - AP_DELAY.x;
         if (tW >= 0.0) {{
             Position posW = getPosition(tW);
@@ -5967,6 +6250,9 @@ vec2 mainSound(int samp, float time) {{
             for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
                 int ch1 = (ch % 4) + 1;
                 if (ch1 == surr_channels.x || ch1 == surr_channels.y) {{
+                    int  _inst142   = getNote(posW.songPos, posW.row, ch).instrument;
+                    bool _isBass142 = (_inst142 >= 1 && _inst142 <= 31) ? isBass[_inst142 - 1] : false;
+                    if (_isBass142) continue;
                     float sw   = getChannelOutput(ch, tW, posW, rowTime);
                     float panR = 0.25 + 0.5 * channelPan[ch];
                     wL += sw * (1.0 - panR);
@@ -6023,53 +6309,67 @@ vec2 mainSound(int samp, float time) {{
     //     song without bass detection, but slightly colors mid-bass content.
     // We pick mix-wide automatically when no bass samples were detected at
     // encode time (PHATBASS_MIX_MODE = 1).
-    const float PHAT_DELAY = 0.001814;  // 80 samples @ 44100Hz
-    const float PHAT_DEPTH = 1.7;        // Cranked again — user wants OBVIOUS bass
+    const float PHAT_T     = 0.001814;  // T = 80/44100 s
+    const float PHAT_H1   = 0.6366;    // 2/π — 1-tap FIR Hilbert coefficient
+    const float PHAT_DEPTH = 1.7;      // Cranked again — user wants OBVIOUS bass
     // Chain order (user spec): cs1 → phatbass → reverb → softlim. So we
     // COMPUTE pb here but DON'T add it to cent — instead apply it to
     // post-fat_cs1 _out further below.
     vec2 _phatPB = vec2(0.0);
     if (enablePhatBass) {{
-        float tP = playbackTime - PHAT_DELAY;
-        // Skip PhatBass entirely when the delay tap reaches before song-start.
-        // 80-sample delay tap means tP<0 for the first 80 output samples;
-        // without this guard, getPosition() wraps to song-end and PhatBass
-        // (which has cross-pan + 1.5× depth) ends up injecting song-tail
+        float tP  = playbackTime - PHAT_T;
+        float t3T = playbackTime - 3.0 * PHAT_T;
+        // Guard: skip until t3T >= 0 so both Hilbert taps are within rendered audio.
+        // Without this, getPosition() wraps to song-end and injects song-tail
         // audio into voice-attack regions, audible as a click on the lead.
-        if (tP < 0.0) {{
-            // Skip PhatBass for these initial samples; cent remains unchanged.
+        if (t3T < 0.0) {{
+            // Skip PhatBass; far tap not yet available.
         }} else {{
-        Position posP = getPosition(tP);
-        // pb.x = pbL accumulator, pb.y = pbR accumulator
+        Position posP  = getPosition(tP);
+        Position pos3T = getPosition(t3T);
+        // pb accumulates the Hilbert quadrature component of each channel.
         vec2 pb = vec2(0.0);
 #if PHATBASS_MIX_MODE
-        // Mix-wide: take the same per-channel sum but with NO bass filter,
-        // then let the listener treat the allpass as a global bass shaper.
-        // The allpass only meaningfully shifts <100 Hz, so mids pass through
-        // largely unaffected — net effect is sub-bass widening.
+        // Mix-wide: Q(t-2T) ≈ (2/π)·(x(t-T) − x(t-3T)) — true 90° phase shift.
         for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
-            float sp = getChannelOutput(ch, tP, posP, rowTime);
-            // Cross-pan: pan.yx swaps L and R — that's the intentional
-            // Hilbert-allpass widening. Same swizzle replaces the old
-            // pbL+=sp*panR / pbR+=sp*panL pair.
+            float spN = getChannelOutput(ch, tP,  posP,  rowTime);  // x(t-T)
+            float spF = getChannelOutput(ch, t3T, pos3T, rowTime);  // x(t-3T)
+            float q   = PHAT_H1 * (spN - spF);                      // H{{x}}(t-2T)
             float panR = 0.25 + 0.5 * channelPan[ch];
             vec2  pan  = vec2(1.0 - panR, panR);
-            pb += sp * pan.yx;
+            pb += q * pan.yx;
         }}
 #else
         // Per-sample: only bass-detected instruments.
         for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
 #if USE_142_DSP
-            // v1.42 path: single-row inst lookup. Cheap on the shader; bass
-            // tag may flip on continuation rows (inst=0) but the audible
-            // impact is small for most tracks and it compiles everywhere.
-            int  inst2 = getNote(posP.songPos, posP.row, ch).instrument;
+            // v1.42 path: 8-row backward scan to find most-recent instrument
+            // trigger on this channel. Single-row lookup (the original v1.42
+            // behaviour) was a click source — bass tag flickered ON at trigger
+            // rows and OFF at continuation rows, abruptly toggling PhatBass's
+            // ~3 dB low-end contribution on every row boundary. 8 rows is
+            // enough to span any sustaining bass note at typical BPM, and is
+            // 8× cheaper than the v1.45 path's 64-row scan, preserving the
+            // "compiles on weak drivers" goal of USE_142_DSP=1.
+            int inst2 = 0;
+            {{
+                int _sR = posP.row, _sP = posP.songPos;
+                for (int _lb = 0; _lb < 8; _lb++) {{
+                    Note _n2 = getNote(_sP, _sR, ch);
+                    if (_n2.instrument > 0 && _n2.instrument <= 31) {{ inst2 = _n2.instrument; break; }}
+                    _sR--;
+                    if (_sR < 0) {{
+                        if (_sP > 0) {{
+                            _sP--;
+                            _sR = patStartRow[_sP] + (patRowOffset[_sP+1] - patRowOffset[_sP]) - 1;
+                        }} else {{ break; }}
+                    }}
+                }}
+            }}
             bool bass  = (inst2 >= 1 && inst2 <= 31) ? isBass[inst2 - 1] : false;
 #else
             // v1.45 path: walk back up to 64 rows to find the most-recently
-            // TRIGGERED instrument on this channel. Keeps the bass tag
-            // stable across sustained notes whose continuation rows have
-            // inst=0; eliminates the per-row click that FAT amplified.
+            // triggered instrument — keeps bass tag stable on continuation rows.
             int inst2 = 0;
             int sR = posP.row, sP = posP.songPos;
             for (int lb = 0; lb < 64; lb++) {{
@@ -6086,18 +6386,17 @@ vec2 mainSound(int samp, float time) {{
             bool bass = (inst2 >= 1 && inst2 <= 31) ? isBass[inst2 - 1] : false;
 #endif
             if (bass) {{
-                float sp = getChannelOutput(ch, tP, posP, rowTime);
+                float spN = getChannelOutput(ch, tP,  posP,  rowTime);  // x(t-T)
+                float spF = getChannelOutput(ch, t3T, pos3T, rowTime);  // x(t-3T)
+                float q   = PHAT_H1 * (spN - spF);                      // H{{x}}(t-2T)
                 float panR = 0.25 + 0.5 * channelPan[ch];
                 vec2  pan  = vec2(1.0 - panR, panR);
-                pb += sp * pan.yx;   // cross-panned (Hilbert widening)
+                pb += q * pan.yx;
             }}
         }}
 #endif
-        // Save pb for post-fat_cs1 mixing (applied below, after the
-        // saturator colors the dry signal). Was: cent += pb * ...
-        // OPT: combined scale folds at compile time (both consts).
         _phatPB = pb * (normFactor * PHAT_DEPTH);
-        }}  // end else (tP >= 0)
+        }}  // end else (t3T >= 0)
     }}
     
     vec2 _out = surr + cent;
@@ -7504,12 +7803,158 @@ vec4 _v8_iChannel0(vec2 uv) {
     return pow(max(vec4(0.0), (1.0 - length(uv - 0.5) * 2.0) * cloud), vec4(4.0));
 }
 
-// Nebula background — pure 6-octave fractal-noise nebula with circular
-// vignette + gamma-4 shaping (your reference formula). No scanlines, no
-// extra dot(uv,uv) vignette — the bake already does both.
+// ─── Voyage-style volumetric nebula ─────────────────────────────────────────
+// Replaces the previous 6-octave fractal-noise bake background with a proper
+// raymarched cosmic gas adapted from sebastien durand's "Voyage to the Stars"
+// (CC BY-NC-SA 3.0): https://www.shadertoy.com/view/4dlGW2 — specifically the
+// renderIntergalacticClouds path (mapIntergalacticCloud + SpiralNoiseC +
+// HSV-cell point lights). The original used iChannel1 as a 256x256 noise
+// texture for value noise; we route to iChannel2 (mod_player's noise slot).
+// Step budget cut 100 -> 36 for in-viz framerate; outer loop preserves the
+// original td/sum.a early-out behavior.
+//
+// NOTE: _v8_iChannel0 + _v8_f (cloud sparkle overlay) below are UNTOUCHED —
+// they're a separate moving-foreground layer that depends on cheap close-UV
+// texture samples for its motion-blur trick. Only the *background* nebula
+// has been swapped.
+// ----------------------------------------------------------------------------
+
+float _v8_neb_hash11(float p) {
+    vec3 p3 = fract(vec3(p) * .1031);
+    p3 += dot(p3, p3.yzx + 19.19);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+float _v8_neb_pn(vec3 x) {
+    vec3 p = floor(x), f = fract(x);
+    f *= f*(3.-f-f);
+    vec2 uv = (p.xy + vec2(37., 17.)*p.z) + f.xy;
+    vec2 rg = textureLod(iChannel2, (uv+.5)/256., -100.).yx;
+    return 2.4*mix(rg.x, rg.y, f.z) - 1.;
+}
+
+// otaviogood's spiral noise — successively adds/rotates sin waves with
+// increasing frequency. Cheap, aperiodic, no hash table.
+const float _v8_neb_nudge      = 20.0;
+const float _v8_neb_normalizer = 1.0 / 20.024984394500787; // = 1/sqrt(1+20^2)
+
+float _v8_neb_spiralNoise(vec3 p, vec4 id) {
+    float iter = 2., n = 2. - id.x;
+    for (int i = 0; i < 6; i++) {
+        n += -abs(sin(p.y*iter) + cos(p.x*iter)) / iter;
+        p.xy += vec2(p.y, -p.x) * _v8_neb_nudge;
+        p.xy *= _v8_neb_normalizer;
+        p.xz += vec2(p.z, -p.x) * _v8_neb_nudge;
+        p.xz *= _v8_neb_normalizer;
+        iter *= id.y + .733733;
+    }
+    return n;
+}
+
+float _v8_neb_map(vec3 p, vec4 id) {
+    float k = 2.*id.w + .1;
+    return k*(.5 + _v8_neb_spiralNoise(p.zxy*.4132 + 333., id)*3.
+                 + _v8_neb_pn(p*8.5)*.12);
+}
+
+vec3 _v8_neb_hsv(float x, float y, float z) {
+    return z + z*y*(clamp(abs(mod(x*6. + vec3(0,4,2), 6.) - 3.) - 1., 0., 1.) - 1.);
+}
+
+// Volumetric march. id = (lightRadiusRef, spiralFreqStep, densityBias, densityGain)
+vec4 _v8_neb_render(vec3 ro, vec3 rd, float tmax, vec4 id) {
+    float max_dist = min(tmax, 22.0);
+    float td = 0., d, t, noi, lDist, a;
+    const float sp = 9.;          // periodic light-cell spacing
+    float rRef = 2.*id.x;
+    float h    = .05 + .25*id.z;  // density edge threshold
+    vec3  pos, lightColor;
+    vec4  sum = vec4(0);
+
+    // Small per-pixel start jitter — breaks step banding without showing as
+    // visible static. Was .1 which produced speckle behind the tracker UI;
+    // .02 is enough to dither the step boundary without per-pixel noise.
+    t = .02 * _v8_neb_hash11(rd.x + rd.y*17.0 + rd.z*113.0);
+
+    // Iteration count: 40 -> 24. Each step does a 6-iter spiral noise plus
+    // a texture sample plus an HSV mix, so per-step cost is high. Stacked on
+    // top of viz 8's existing 100-flare loop and 40-step terrain raymarch,
+    // 40 nebula steps was tipping the GPU into frame-deadline misses, which
+    // glitched the audio in Shadertoy. 24 steps + early-out keeps the look
+    // while reclaiming ~40% of the nebula's cost.
+    for (int i = 0; i < 24; i++) {
+        if (td > .9 || sum.a > .99 || t > max_dist) break;
+        a   = smoothstep(max_dist, 0., t);
+        pos = ro + t*rd;
+        d   = abs(_v8_neb_map(pos, id)) + .07;
+
+        // Periodic point-light grid colors the gas pockets. Saturation .7 /
+        // value .85 — saturated enough to read as nebula color, but not so
+        // neon that it looks like a fluid sim.
+        lDist = max(length(mod(pos + sp*.5, sp) - sp*.5), .001);
+        noi   = _v8_neb_pn(.05*pos);
+        lightColor = mix(_v8_neb_hsv(noi,     .7, .85),
+                         _v8_neb_hsv(noi+.3,  .7, .85),
+                         smoothstep(rRef*.5, rRef*2., lDist));
+        // Light divisor /18 — midway between Voyage's /30 (too dim) and
+        // /12 (blew out into solid white blobs).
+        sum.rgb += a * lightColor / exp(lDist*lDist*lDist*.08) / 18.;
+
+        if (d < h) {
+            td += (1.-td)*(h-d) + .005;
+            sum.rgb += sum.a * sum.rgb * .30 / lDist;   // emission
+            sum    += (1. - sum.a) * .03 * td * a;       // density alpha
+        }
+        td += .015;
+        t  += max(d * .08 * max(min(lDist, d), 2.), .01);
+    }
+
+    // NOTE: Voyage's `sum.xyz *= sum.xyz*(3.-sum.xyz-sum.xyz)` curve was
+    // dropped. That formula peaks at x=0.75 with value 1.125, so it pushes
+    // anything above ~0.2 alpha toward full white — fine when the nebula is
+    // a thin atmosphere over a star field, but as a *background* it produced
+    // glossy fluid-blob artifacts. Plain clamp gives proper gas falloff.
+    return clamp(sum, 0., 1.);
+}
+
+// Nebula background — independent forward drift through the noise field so
+// the gas evolves even when viz 8's main scene camera is spinning elsewhere.
+// The "starts small, grows as approached" effect comes naturally from the
+// fast forward camera motion: distant formations appear small, then enlarge
+// on screen as the camera flies toward them. No cycle pulsing — earlier
+// attempt with a fade-in/fade-out cycle made the nebula invisible 25% of
+// the time and reset visible extent back to small, breaking continuity.
 vec3 _v8_dtcmain(vec2 fragCoord) {
-    vec2 uv = fragCoord.xy / iResolution.xy;
-    return _v8_iChannel0(uv).rgb;
+    vec2 uv = (fragCoord.xy - 0.5*iResolution.xy) / iResolution.y;
+
+    // Fast forward drift — gives the "flying toward the nebula" punch.
+    // Speed 0.15 means the camera covers ~1 nebula-feature unit every ~7
+    // seconds, so formations visibly approach and pass.
+    float ct = iTime * 0.15;
+    vec3  ro = vec3(0.0, 0.0, ct);
+
+    // Camera ray + very slow pan (no continuous yaw). Focal 1.9 (was 1.4)
+    // pulls the gas back so formations read as smaller, more distant clouds.
+    vec3  rd = normalize(vec3(uv, 1.9));
+    rd.xz *= _v8_pR(0.18 * sin(ct*0.3));   // gentle horizontal pan
+    rd.yz *= _v8_pR(0.10 * sin(ct*0.2));   // gentler vertical drift
+
+    // (lightRef, freqStep, densityBias, densityGain). id.z slightly above
+    // Voyage's .16 to thicken the gas a touch; id.w stays at default.
+    vec4 id  = vec4(0.50, 0.40, 0.22, 0.75);
+    vec4 neb = _v8_neb_render(ro, rd, 22.0, id);
+
+    // Static center-weighted mask — matches the original _v8_iChannel0 bake
+    // which used (1 - length(uv-0.5)*2)^4. Concentrates the gas as a defined
+    // central formation; the forward drift naturally enlarges it as we
+    // approach, no time-based cycle needed.
+    float r   = length(uv);
+    float vig = max(1.0 - r, 0.0);
+    vig       = pow(vig, 3.0);
+
+    // Linear base + squared highlight punch — squaring brightens bright cells
+    // more than midtones, so the HSV pockets pop without flooding the gas.
+    return (neb.rgb * 1.8 + neb.rgb * neb.rgb * 1.5) * vig;
 }
 
 vec4 _v8_f(vec2 uv, float t, float i) {
@@ -7672,29 +8117,39 @@ vec3 _VizScene(vec2 u) {
     // The original shader assigned `o = vec4(sceneColor + tanh(...), 1.0)`
     // here, which silently discarded the dtcmain nebula bake.  We use the
     // nebula as the actual background and additively layer the scene
-    // (terrain + stars + swirl) on top, with a small dose of the cloud
-    // overlay as fine atmospheric sparkle.  Cloud weight cut from 0.5 to
-    // 0.15 — at 0.5 the overlay flooded the frame in bright cyan and
-    // hid the tracker text and the per-frame vignette entirely.
+    // (terrain + stars + swirl) on top, with a tiny dose of the cloud
+    // overlay as fine atmospheric texture.  Cloud weight history:
+    //   0.50 — original; flooded frame with bright cyan
+    //   0.15 — earlier reduction; still produced particle spray over UI
+    //   0.04 — current; cloud reads as faint texture, tracker stays clean
     vec3 nebulaBG = o.rgb;                                        // _v8_dtcmain output, has its own vignette + gamma
-    vec3 scene    = sceneColor + tanh(col11 + color3 * color3 * 0.35);
+    // Terrain (col11) math is left at viz 8's original tuning — it's an
+    // inherently sparkly inverse-distance accumulation across 40 rays.
+    // Scaling it to 0.4 in the composite dims those sparkles so they stop
+    // competing with the tracker UI, without changing what the terrain is
+    // actually drawing.
+    vec3 scene    = sceneColor + tanh(col11 * 0.4 + color3 * color3 * 0.35);
     scene        *= sqrt(max(scene, vec3(0.0)));                  // matches original `o *= sqrt(o)` curve
-    o = vec4(nebulaBG + scene + cloud.rgb * 0.15, 1.0);
+    o = vec4(nebulaBG + scene + cloud.rgb * 0.04, 1.0);
     return o.rgb;
 }
 """
 
 
     image_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.5 (c) 2026 Orblivius
-   4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
-   IMAGE TAB (_v_1_DOT_5) — iChannel0: alphabet texture (shadertoy.com/view/4sf3RB)
-                iChannel1: Buffer A (audio + FFT + smoothed bands)
-                iChannel2: RGBA Noise Small  ← required for viz 6 smoke turbulence
+   GLSL (The Last) MOD Player v1.54 (c) 2026 Orblivius
+   
+   32 Tracks support, IT/XM/S3M/MOD loader, 3D Surround, PHAT Bass, Velvet Reverb, 
+   Comb Reverb, FAT, W1 Limiter, RVQ sample compression, configurable downsample
+   
    Visualizer: {viz_name}
-   Contact: subband@gmail.com or
-            subband@protonmail.com
-   GIT:     https://github.com/mewza/mod2glsl
+   iChannel0: alphabet texture (shadertoy.com/view/4sf3RB)
+   iChannel1: Buffer A (audio + FFT + smoothed bands)
+   iChannel2: RGBA Noise Small  ← required for viz 6 smoke turbulence
+ 
+   Git Home: https://github.com/mewza/mod2glsl
+   Contact:  subband@gmail.com or
+             subband@protonmail.com
   ============================================================================ */
 
 // FFT_N and FFT_SR must match Buffer A — used by spectrum view to index
@@ -7794,7 +8249,7 @@ makeStr(printBPMVal) {bpm_val_chars} _end
 makeStr(printSpdVal) {spd_val_chars} _end
 
 // ---- Static label strings ----
-makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _5 _0 _ _NUM _NUM _NUM _end
+makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _5 _4 _ _NUM _NUM _NUM _end
 makeStr(printCredit) _COPY _2 _0 _2 _6 _ _O _R _B _L _I _V _I _U _S _end
 makeStr(printLoad)   _L _O _A _D _I _N _G _DOT _DOT _DOT _end
 makeStr(printSpec)   _S _P _E _C _T _R _U _M _end
@@ -8484,12 +8939,11 @@ void mainImage(out vec4 O, vec2 C) {{
     # Setup: Buffer A iChannel0 = Buffer A (self-ref)
     #        Image   iChannel1 = Buffer A output
     buffer_a_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.5 (c) 2026 Orblivius
-   4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
-   Contact: subband@gmail.com or
-            subband@protonmail.com
-   GIT:     https://github.com/mewza/mod2glsl
-   BUFFER A TAB
+   GLSL (The Last) MOD Player v1.54 (c) 2026 Orblivius
+   
+   32 Tracks support, IT/XM/S3M/MOD loader, 3D Surround, PHAT Bass, Velvet Reverb, 
+   Comb Reverb, FAT, W1 Limiter, RVQ sample compression, configurable downsample
+   
    Visualizer: {viz_name}
    Row 0      : FFT_N mixed audio samples      (getChannelOutput sum, per px)
    Row 1      : FFT_N/2 DFT magnitudes         (phasor-rotation DFT)
@@ -8501,6 +8955,10 @@ void mainImage(out vec4 O, vec2 C) {{
      Buffer A -> iChannel0 = Buffer A  (self-reference)
      Buffer A -> iChannel1 = Sound tab output  (audio waveform for Zuvuya)
      Image    -> iChannel1 = Buffer A
+ 
+   Git Home: https://github.com/mewza/mod2glsl
+   Contact:  subband@gmail.com or
+             subband@protonmail.com
    ============================================================================ */
 
 #define FFT_N     {_compat["fft_n"]}
@@ -12008,7 +12466,7 @@ def main():
     parser.add_argument('--downsample', type=int, default=1,
                         help='Sample decimation factor: 1=full-rate, 2=22kHz, 4=11kHz. '
                              'HF percussion (cymbals/rides) gets max(1,DS//2) to keep shimmer.')
-    parser.add_argument('--bitrate', choices=['lo','med','hi','ultra'], default='med',
+    parser.add_argument('--bitrate', choices=['lo','med','hi','ultra'], default='hi',
                         help='RVQ codebook size (mp3-style quality knob). '
                              'lo=K(128,64) 13b/pair smallest+grainy, med=K(256,128) 15b/pair balanced, '
                              'hi=K(512,256) 17b/pair sharper, ultra=K(1024,512) 19b/pair near-transparent.')
@@ -12775,7 +13233,7 @@ Just open `{base_name}_player.html` in a browser - works offline!
 - `0` = Normal (full song loop)
 - `255` = Testing (10 second loop)
 
-Generated by MOD2GLSL v1.5
+Generated by MOD2GLSL v1.54
 """)
     
     # Generate HTML player (now works for both MOD and S3M)
@@ -12808,8 +13266,8 @@ Generated by MOD2GLSL v1.5
             # so the GLSL formula `time = rowStartTick / 50.0` stays valid
             # under variable BPM.
             def _bpm_aware_compute_row_speed_table(_mod):
-                speed = 6
-                bpm   = 125
+                speed = getattr(_mod, 'initial_speed', 6)
+                bpm   = getattr(_mod, 'initial_tempo', 125)
                 rowSpeed = []
                 cumF = 0.0
                 rowStartTickF = [0.0]
@@ -13166,10 +13624,42 @@ Generated by MOD2GLSL v1.5
                             si = m.samples[i] if (i < len(m.samples) and isinstance(m.samples[i], dict)) else None
                             if si is not None:
                                 arr = si.get('data', None)
+                                raw_length = si.get('length', 0)
+                                # Block-align onset: if the first non-zero sample
+                                # in the first VQ block is at position p > 0, prepend
+                                # (vec_dim - p) zeros so the transient starts on a
+                                # fresh block boundary — eliminates the mixed
+                                # silence+transient block that causes clicking.
+                                if (arr is not None and getattr(arr, 'size', 0) > 0
+                                        and raw_length > 0 and args.vec_dim > 1):
+                                    _vd = args.vec_dim
+                                    _scan = arr[:min(_vd, len(arr))]
+                                    _nz = (_scan != 0).nonzero()[0]
+                                    if len(_nz) > 0 and int(_nz[0]) > 0:
+                                        _pad = _vd - int(_nz[0])
+                                        arr = np.concatenate([np.zeros(_pad, dtype=arr.dtype), arr])
+                                        raw_length += _pad
+                                # Pre-VQ LPF: if lag-1 autocorr is strongly
+                                # negative (near-Nyquist oscillation), apply a
+                                # 4th-order Butterworth LPF at 60% Nyquist before
+                                # encoding so VQ gets a smoother signal → smaller
+                                # block-boundary reconstruction errors → less clicking.
+                                if arr is not None and getattr(arr, 'size', 0) > 64:
+                                    _af = arr.astype(np.float32)
+                                    # Trigger: std of first-differences > 25 means
+                                    # adjacent samples swing wildly (percussive
+                                    # transient or near-Nyquist oscillation), which
+                                    # VQ encodes poorly.  LPF at 0.60 Nyquist before
+                                    # encoding; smooth melodic samples are unaffected.
+                                    if float(np.std(np.diff(_af))) > 25:
+                                        from scipy.signal import butter, sosfilt
+                                        _sos = butter(4, 0.60, btype='low', output='sos')
+                                        _af2 = sosfilt(_sos, _af)
+                                        arr = np.clip(_af2, -128, 127).astype(np.int8)
                                 raw = (arr.tobytes() if (arr is not None and getattr(arr, 'size', 0) > 0) else b'')
                                 self.samples_info.append(dict(
                                     name       = si.get('name', ''),
-                                    length     = si.get('length', 0),
+                                    length     = raw_length,
                                     finetune   = si.get('finetune', 0),
                                     volume     = si.get('volume', 0),
                                     loop_start = si.get('repeat_point', 0),
@@ -13235,14 +13725,30 @@ Generated by MOD2GLSL v1.5
             _vname = _viz_names.get(args.viz, f"viz{args.viz}")
             try:
                 with open(glsl_common_file) as _cf: _ct = _cf.read()
-                # The VQ encoder's emitted Common still carries its own version
-                # (currently v1.42 inside the inner b64 blob). Rewrite any v1.4x
-                # / v1.5 stamp so all four tabs land on the current version.
+                # The VQ encoder's emitted Common carries its own (older)
+                # banner. Replace the whole banner block with our current
+                # one — version, feature list, visualizer line, Git Home,
+                # Contact — so the regenerated file matches the source
+                # templates exactly.
                 import re as _re_v
+                _new_banner = (
+                    "/* ============================================================================\n"
+                    "   GLSL (The Last) MOD Player v1.54 (c) 2026 Orblivius\n"
+                    "   \n"
+                    "   32 Tracks support, IT/XM/S3M/MOD loader, 3D Surround, PHAT Bass, Velvet Reverb, \n"
+                    "   Comb Reverb, FAT, W1 Limiter, RVQ sample compression, configurable downsample\n"
+                    "   \n"
+                    f"   Visualizer: {_vname}\n"
+                    " \n"
+                    "   Git Home: https://github.com/mewza/mod2glsl\n"
+                    "   Contact:  subband@gmail.com or\n"
+                    "             subband@protonmail.com\n"
+                    "  ============================================================================ */"
+                )
                 _ct = _re_v.sub(
-                    r"GLSL \(The Last\) MOD Player v1\.\d+(?: \(c\) 2026 Orblivius)",
-                    "GLSL (The Last) MOD Player v1.5 (c) 2026 Orblivius", _ct, count=1)
-                _ct = _ct.replace("   COMMON TAB\n", f"   COMMON TAB\n   Visualizer: {_vname}\n", 1)
+                    r"/\* =+\n   GLSL \(The Last\) MOD Player.*?=+ \*/",
+                    lambda _m: _new_banner,
+                    _ct, count=1, flags=_re_v.DOTALL)
 
                 # Inject visualizer note-synth helpers (waveType[] + _synthWave).
                 # The VQ encoder doesn't know about Image/Buffer A's synth path,
@@ -13619,6 +14125,60 @@ Generated by MOD2GLSL v1.5
                     if _smp_end >= 0:
                         _eol = _ct.find('\n', _smp_end)
                         _ct = _ct[:_eol+1] + _arrays_block + _ct[_eol+1:]
+                # ── BPM-normalised rowStartTick0 replacement ──────────────────────
+                # The VQ encoder emits rowStartTick0 from raw speed ticks at the
+                # default BPM=125/speed=6, ignoring the song's actual header values.
+                # IT/XM/S3M files with non-default header BPM/speed (e.g. elk_hitch:
+                # speed=3, BPM=120) end up with 6-tick-per-row tables making the
+                # song play ~2× too slow. Post-process: recompute from outer `mod`.
+                _tspd = int(getattr(mod, 'initial_speed', 6))
+                _tbpm = int(getattr(mod, 'initial_tempo', 125))
+                if (_tspd != 6 or _tbpm != 125) and 'rowStartTick0' in _ct:
+                    import re as _re_tk
+                    _spd2, _bpm2 = _tspd, _tbpm
+                    _cumF3 = 0.0
+                    _tv3 = [0]
+                    for _si3 in range(len(mod.song_positions)):
+                        _pi3 = mod.song_positions[_si3]
+                        _pat3 = mod.patterns[_pi3]
+                        for _ri3 in range(len(_pat3)):
+                            _row3 = _pat3[_ri3]
+                            for _ch3 in range(mod.num_channels):
+                                _n3 = _row3[_ch3] if _ch3 < len(_row3) else {}
+                                _e3 = _n3.get('effect', 0)
+                                _p3 = _n3.get('param', 0)
+                                if _e3 == 0xF and _p3 > 0:
+                                    if _p3 < 0x20: _spd2 = _p3
+                                    else:          _bpm2 = _p3
+                            _cumF3 += _spd2 * 125.0 / max(_bpm2, 1)
+                            _tv3.append(int(round(_cumF3)))
+                    _tot3 = _tv3[-1]
+                    _b3 = []
+                    for _t3 in _tv3:
+                        _b3 += [_t3 & 0xFF, (_t3 >> 8) & 0xFF]
+                    while len(_b3) % 16:
+                        _b3.append(0)
+                    _ic3 = len(_b3) // 16
+                    _iv3 = []
+                    for _i3 in range(_ic3):
+                        _o3 = _i3 * 16
+                        _ints3 = []
+                        for _j3 in range(4):
+                            _bs3 = _b3[_o3 + _j3*4 : _o3 + _j3*4 + 4]
+                            _v3 = (_bs3[0]<<24)|(_bs3[1]<<16)|(_bs3[2]<<8)|_bs3[3]
+                            if _v3 >= 0x80000000: _v3 -= 0x100000000
+                            _ints3.append(_v3)
+                        _iv3.append(f'ivec4({_ints3[0]},{_ints3[1]},{_ints3[2]},{_ints3[3]})')
+                    _new_ta = ', '.join(_iv3)
+                    _ct = _re_tk.sub(
+                        r'const ivec4 rowStartTick0\[\d+\] = ivec4\[\]\([^;]+\);',
+                        f'const ivec4 rowStartTick0[{_ic3}] = ivec4[]({_new_ta});',
+                        _ct)
+                    _ct = _re_tk.sub(
+                        r'#define TOTAL_TICKS\s+\d+',
+                        f'#define TOTAL_TICKS       {_tot3}',
+                        _ct)
+                    print(f"   🔧 rowStartTick0 patched: {_tspd} ticks/row @ BPM={_tbpm} → TOTAL_TICKS={_tot3}")
                 with open(glsl_common_file, 'w') as _cf: _cf.write(_ct)
             except Exception as _vqcommon_err:
                 print(f"   WARNING: VQ-Common post-processing failed ({_vqcommon_err})")
@@ -13742,11 +14302,17 @@ Generated by MOD2GLSL v1.5
                         'float getSample(int sampleIdx) {\n'
                         '    if (sampleIdx < 0 || sampleIdx >= TOTAL_SAMPLES) return 0.0;\n'
                         '#if RVQ_LPF\n'
-                        '    int _a = max(0, sampleIdx - 1);\n'
-                        '    int _c = min(TOTAL_SAMPLES - 1, sampleIdx + 1);\n'
-                        '    return 0.25 * _decodeSample(_a)\n'
-                        '         + 0.5  * _decodeSample(sampleIdx)\n'
-                        '         + 0.25 * _decodeSample(_c);\n'
+                        '    // 5-tap triangular FIR: reduces RVQ block-boundary jumps by ~80%\n'
+                        '    // vs raw decode, at the cost of 2 extra _decodeSample calls.\n'
+                        '    int _a2 = max(0, sampleIdx - 2);\n'
+                        '    int _a1 = max(0, sampleIdx - 1);\n'
+                        '    int _c1 = min(TOTAL_SAMPLES - 1, sampleIdx + 1);\n'
+                        '    int _c2 = min(TOTAL_SAMPLES - 1, sampleIdx + 2);\n'
+                        '    return 0.0625 * _decodeSample(_a2)\n'
+                        '         + 0.25   * _decodeSample(_a1)\n'
+                        '         + 0.375  * _decodeSample(sampleIdx)\n'
+                        '         + 0.25   * _decodeSample(_c1)\n'
+                        '         + 0.0625 * _decodeSample(_c2);\n'
                         '#else\n'
                         '    return _decodeSample(sampleIdx);\n'
                         '#endif\n'
