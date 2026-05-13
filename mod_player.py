@@ -74,6 +74,8 @@ import os
 import json
 import argparse
 import math
+from dataclasses import dataclass, field
+from typing import Optional, List
 
 # Adaptive sample compression (BW analysis + anti-alias decimation)
 try:
@@ -81,6 +83,2603 @@ try:
     _HAS_SCIPY = True
 except ImportError:
     _HAS_SCIPY = False
+
+# ============================================================================
+# MikIT tick engine (inlined from mikit_engine.py)
+# ============================================================================
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MikIT lookup tables  (from mmod_it1.cpp — verbatim)
+# ──────────────────────────────────────────────────────────────────────────────
+
+PITCH_TABLE = [
+    2048,   2170,   2299,   2435,   2580,   2734,
+    2896,   3069,   3251,   3444,   3649,   3866,
+    4096,   4340,   4598,   4871,   5161,   5468,
+    5793,   6137,   6502,   6889,   7298,   7732,
+    8192,   8679,   9195,   9742,  10321,  10935,
+    11585,  12274,  13004,  13777,  14596,  15464,
+    16384,  17358,  18390,  19484,  20643,  21870,
+    23170,  24548,  26008,  27554,  29193,  30929,
+    32768,  34716,  36781,  38968,  41285,  43740,
+    46341,  49097,  52016,  55109,  58386,  61858,
+    65536,  69433,  73562,  77936,  82570,  87480,
+    92682,  98193, 104032, 110218, 116772, 123715,
+   131072, 138866, 147123, 155872, 165140, 174960,
+   185364, 196386, 208064, 220436, 233544, 247431,
+   262144, 277732, 294247, 311744, 330281, 349920,
+   370728, 392772, 416128, 440872, 467088, 494862,
+   524288, 555464, 588493, 623487, 660561, 699841,
+   741455, 785544, 832255, 881744, 934175, 989724,
+  1048576,1110928,1176987,1246974,1321123,1399681,
+  1482910,1571089,1664511,1763488,1868350,1979448,
+]
+
+FINE_SLIDE_UP = [
+    65536, 65595, 65654, 65714, 65773, 65832, 65892, 65951,
+    66011, 66071, 66130, 66190, 66250, 66309, 66369, 66429,
+]
+
+FINE_SLIDE_DN = [
+    65535, 65477, 65418, 65359, 65300, 65241, 65182, 65359,
+    65065, 65006, 64947, 64888, 64830, 64772, 64713, 64645,
+]
+
+LINEAR_SLIDE_UP = [
+    65536,  65773,  66011,  66250,  66489,  66730,  66971,  67213,
+    67456,  67700,  67945,  68191,  68438,  68685,  68933,  69183,
+    69433,  69684,  69936,  70189,  70443,  70693,  70953,  71210,
+    71468,  71726,  71985,  72246,  72507,  72769,  73032,  73297,
+    73562,  73828,  74095,  73563,  74632,  74902,  75172,  75444,
+    75717,  75991,  76266,  76542,  76819,  77096,  77375,  77655,
+    77936,  78218,  78501,  78785,  79069,  79355,  79642,  79930,
+    80220,  80510,  80801,  81093,  81386,  81681,  81976,  82273,
+    82570,  82869,  83169,  83469,  83771,  84074,  84378,  84683,
+    84990,  85297,  85606,  85915,  86226,  86538,  86851,  87165,
+    87480,  87796,  88114,  88433,  88752,  89073,  89396,  89719,
+    90043,  90369,  90696,  91024,  91353,  91684,  92015,  92348,
+    92682,  93017,  93354,  93691,  94030,  94370,  94711,  95054,
+    95398,  95743,  96089,  96436,  96784,  97135,  97487,  97839,
+    98193,  98548,  98905,  99262,  99621,  99982, 100343, 100706,
+   101070, 101436, 101803, 102171, 102540, 102911, 103283, 103657,
+   104032, 104408, 104786, 105165, 105545, 105927, 106310, 106694,
+   107080, 107468, 107856, 108246, 108638, 109031, 109425, 109821,
+   110218, 110617, 111017, 111418, 111821, 112226, 112631, 113039,
+   113453, 113858, 114270, 114683, 115098, 115514, 115932, 116351,
+   116772, 117194, 117618, 118043, 118470, 118899, 119329, 119760,
+   120194, 120628, 121065, 121502, 121942, 122383, 122825, 123270,
+   123715, 124163, 124612, 125063, 125515, 125969, 126425, 126882,
+   127341, 127801, 128263, 128727, 129193, 129660, 130129, 130600,
+   131072, 131546, 132022, 132499, 132978, 133459, 133942, 134427,
+   134913, 135399, 135890, 136382, 136875, 137370, 137867, 138366,
+   138866, 139368, 139872, 140378, 140886, 141395, 141907, 142420,
+   142935, 143452, 143971, 144491, 145014, 145539, 146065, 146593,
+   147123, 147655, 148189, 148725, 149263, 149803, 150345, 150889,
+   151434, 151982, 152532, 153083, 153637, 154193, 154750, 155310,
+   155872, 156435, 157001, 156569, 158139, 158711, 159285, 159861,
+   160439, 161019, 161602, 162186, 162773, 163361, 163952, 164545,
+   165140,
+]
+
+LINEAR_SLIDE_DN = [
+    65535, 65300, 65065, 64830, 64596, 64364, 64132, 63901,
+    63670, 63441, 63212, 62984, 62757, 62531, 62306, 62081,
+    61858, 61635, 61413, 61191, 60971, 60751, 60532, 60314,
+    60097, 59880, 59664, 59449, 59235, 59022, 58809, 58597,
+    58386, 58176, 57966, 57757, 57549, 57341, 57135, 56929,
+    56724, 56519, 56316, 56113, 55911, 55709, 55508, 55308,
+    55109, 54910, 54713, 54515, 54319, 54123, 53928, 53734,
+    53540, 53347, 53155, 52963, 52773, 52582, 52393, 52204,
+    52016, 51829, 51642, 51456, 51270, 51085, 50901, 50718,
+    50535, 50353, 50172, 49991, 49811, 49631, 49452, 49274,
+    49097, 48920, 48743, 48568, 48393, 48128, 48044, 47871,
+    47699, 47527, 47356, 47185, 47015, 46846, 46677, 46509,
+    46341, 46174, 46008, 45842, 45677, 45512, 45348, 45185,
+    45022, 44859, 44698, 44537, 44376, 44216, 44057, 43898,
+    43740, 43582, 43425, 43269, 43113, 42958, 42803, 42649,
+    42495, 42342, 42189, 42037, 41886, 41735, 41584, 41434,
+    41285, 41136, 40988, 10840, 40639, 40566, 40400, 40253,
+    40110, 39965, 39821, 39678, 39535, 39392, 39250, 39109,
+    38968, 38828, 38688, 38548, 38409, 38271, 38133, 37996,
+    37859, 37722, 37586, 37451, 37316, 37181, 37047, 36914,
+    36781, 36648, 36516, 36385, 36254, 36123, 35993, 35863,
+    35734, 35605, 35477, 35349, 35221, 35095, 34968, 34842,
+    34716, 34591, 34467, 34343, 34219, 34095, 33973, 33850,
+    33728, 33607, 33486, 33365, 33245, 33125, 33005, 32887,
+    32768, 32650, 32532, 32415, 32298, 32182, 32066, 31950,
+    31835, 31720, 31606, 31492, 31379, 31266, 31153, 31041,
+    30929, 30817, 30706, 30596, 30485, 30376, 30226, 30157,
+    30048, 29940, 29832, 29725, 29618, 29511, 29405, 29299,
+    29193, 29088, 28983, 28879, 28774, 28671, 28567, 28464,
+    28362, 28260, 28158, 28056, 27955, 27855, 27754, 27654,
+    27554, 27455, 27356, 27258, 27159, 27062, 26964, 26867,
+    26770, 26674, 26577, 26482, 26386, 26291, 26196, 26102,
+    26008,
+]
+
+# Vibrato tables: sine(0), ramp-down(1), square(2)  — values -64..64
+VIB_SINE = [
+     0,  2,  3,  5,  6,  8,  9, 11, 12, 14, 16, 17, 19, 20, 22, 23,
+    24, 26, 27, 29, 30, 32, 33, 34, 36, 37, 38, 39, 41, 42, 43, 44,
+    45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 56, 57, 58, 59,
+    59, 60, 60, 61, 61, 62, 62, 62, 63, 63, 63, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 63, 63, 63, 62, 62, 62, 61, 61, 60, 60,
+    59, 59, 58, 57, 56, 56, 55, 54, 53, 52, 51, 50, 49, 48, 47, 46,
+    45, 44, 43, 42, 41, 39, 38, 37, 36, 34, 33, 32, 30, 29, 27, 26,
+    24, 23, 22, 20, 19, 17, 16, 14, 12, 11,  9,  8,  6,  5,  3,  2,
+     0, -2, -3, -5, -6, -8, -9,-11,-12,-14,-16,-17,-19,-20,-22,-23,
+   -24,-26,-27,-29,-30,-32,-33,-34,-36,-37,-38,-39,-41,-42,-43,-44,
+   -45,-46,-47,-48,-49,-50,-51,-52,-53,-54,-55,-56,-56,-57,-58,-59,
+   -59,-60,-60,-61,-61,-62,-62,-62,-63,-63,-63,-64,-64,-64,-64,-64,
+   -64,-64,-64,-64,-64,-64,-63,-63,-63,-62,-62,-62,-61,-61,-60,-60,
+   -59,-59,-58,-57,-56,-56,-55,-54,-53,-52,-51,-50,-49,-48,-47,-46,
+   -45,-44,-43,-42,-41,-39,-38,-37,-36,-34,-33,-32,-30,-29,-27,-26,
+   -24,-23,-22,-20,-19,-17,-16,-14,-12,-11, -9, -8, -6, -5, -3, -2,
+]
+VIB_RAMP = [
+    64, 63, 63, 62, 62, 61, 61, 60, 60, 59, 59, 58, 58, 57, 57, 56,
+    56, 55, 55, 54, 54, 53, 53, 52, 52, 51, 51, 50, 50, 49, 49, 48,
+    48, 47, 47, 46, 46, 45, 45, 44, 44, 43, 43, 42, 42, 41, 41, 40,
+    40, 39, 39, 38, 38, 37, 37, 36, 36, 35, 35, 34, 34, 33, 33, 32,
+    32, 31, 31, 30, 30, 29, 29, 28, 28, 27, 27, 26, 26, 25, 25, 24,
+    24, 23, 23, 22, 22, 21, 21, 20, 20, 19, 19, 18, 18, 17, 17, 16,
+    16, 15, 15, 14, 14, 13, 13, 12, 12, 11, 11, 10, 10,  9,  9,  8,
+     8,  7,  7,  6,  6,  5,  5,  4,  4,  3,  3,  2,  2,  1,  1,  0,
+     0, -1, -1, -2, -2, -3, -3, -4, -4, -5, -5, -6, -6, -7, -7, -8,
+    -8, -9, -9,-10,-10,-11,-11,-12,-12,-13,-13,-14,-14,-15,-15,-16,
+   -16,-17,-17,-18,-18,-19,-19,-20,-20,-21,-21,-22,-22,-23,-23,-24,
+   -24,-25,-25,-26,-26,-27,-27,-28,-28,-29,-29,-30,-30,-31,-31,-32,
+   -32,-33,-33,-34,-34,-35,-35,-36,-36,-37,-37,-38,-38,-39,-39,-40,
+   -40,-41,-41,-42,-42,-43,-43,-44,-44,-45,-45,-46,-46,-47,-47,-48,
+   -48,-49,-49,-50,-50,-51,-51,-52,-52,-53,-53,-54,-54,-55,-55,-56,
+   -56,-57,-57,-58,-58,-59,-59,-60,-60,-61,-61,-62,-62,-63,-63,-64,
+]
+VIB_SQUARE = (
+    [64]*128 + [0]*128
+)
+VIB_TABLES = [VIB_SINE, VIB_RAMP, VIB_SQUARE]
+
+def _muldiv(a, b, c):
+    """Integer multiply-divide: (a * b) // c  (MikIT's MMulDiv)."""
+    return (a * b) // c if c else 0
+
+def _frq_slide_up(frq, v, linear):
+    v = min(v, 255)
+    if linear:
+        return _muldiv(frq, LINEAR_SLIDE_UP[v], 65536)
+    else:
+        # MikIT Amiga mode: period -= v*4 per tick, clamped to period >= 1.
+        # Equivalent freq formula: BASE * frq / (BASE - frq*v*4).
+        # When denominator <= 0 the period would underflow; clamp to period=1
+        # which gives the maximum possible Amiga frequency = BASE.
+        denom = (1712 * 8363) - frq * v * 4
+        if denom <= 0:
+            return 1712 * 8363   # period = 1 → max Amiga frequency
+        return _muldiv(frq, 1712 * 8363, denom)
+
+def _frq_slide_dn(frq, v, linear):
+    v = min(v, 255)
+    if linear:
+        return _muldiv(frq, LINEAR_SLIDE_DN[v], 65536)
+    else:
+        return _muldiv(frq, 1712 * 8363, (1712 * 8363) + frq * v * 4)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Data structures
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class ITEnvPoint:
+    tick: int
+    value: int  # 0-64 for vol, -32..32 for pan, SWORD for pitch
+
+@dataclass
+class ITEnvelope:
+    enabled: bool = False
+    loop_enabled: bool = False
+    sustain_enabled: bool = False
+    loop_start: int = 0   # index into points
+    loop_end: int = 0
+    sus_start: int = 0    # index into points (SLB)
+    sus_end: int = 0      # index into points (SLE)
+    points: List[ITEnvPoint] = field(default_factory=list)
+
+    def value_at_tick(self, t: float, keyon: bool) -> float:
+        """Return interpolated envelope value (normalized 0.0-1.0 for vol)."""
+        pts = self.points
+        if len(pts) < 2:
+            return 1.0
+        # last point tick
+        last_tick = pts[-1].tick
+        # apply sustain loop while keyon
+        tick = t
+        if keyon and self.sustain_enabled and len(pts) > self.sus_end:
+            slb = pts[self.sus_start].tick
+            sle = pts[self.sus_end].tick
+            if sle > slb:
+                span = sle - slb
+                if tick >= slb:
+                    tick = slb + (tick - slb) % span
+        # apply normal loop after sustain
+        elif self.loop_enabled and len(pts) > self.loop_end:
+            lb = pts[self.loop_start].tick
+            le = pts[self.loop_end].tick
+            if le > lb:
+                span = le - lb
+                if tick >= lb:
+                    tick = lb + (tick - lb) % span
+        # clamp to last
+        if tick >= last_tick:
+            return pts[-1].value / 64.0
+        if tick <= pts[0].tick:
+            return pts[0].value / 64.0
+        # interpolate
+        for i in range(len(pts) - 1):
+            x0, x1 = pts[i].tick, pts[i+1].tick
+            if x0 <= tick <= x1:
+                if x1 == x0:
+                    return pts[i].value / 64.0
+                frac = (tick - x0) / (x1 - x0)
+                return (pts[i].value + frac * (pts[i+1].value - pts[i].value)) / 64.0
+        return pts[-1].value / 64.0
+
+    def is_done(self, t: float, keyon: bool) -> bool:
+        if not self.enabled or len(self.points) < 2:
+            return False
+        if keyon and self.sustain_enabled:
+            return False
+        if self.loop_enabled:
+            return False
+        return t >= self.points[-1].tick
+
+@dataclass
+class ITInstrument:
+    name: str = ""
+    nna: int = 0        # 0=cut 1=continue 2=noteoff 3=notefade
+    dct: int = 0        # 0=off 1=note 2=sample 3=instrument
+    dca: int = 0        # 0=cut 1=noteoff 2=notefade
+    fadeout: int = 0    # 0..1024; per-tick = fadeout/512 of NFC
+    global_vol: int = 128  # 0..128
+    dfp: int = 0        # default panning; bit7=override
+    pps: int = 0        # pan position separation
+    ppc: int = 0        # pan position centre (note)
+    rv: int = 0         # random volume variation
+    rp: int = 0         # random panning variation
+    note_to_sample: List[int] = field(default_factory=lambda: [0]*120)
+    note_to_note:   List[int] = field(default_factory=lambda: list(range(120)))
+    vol_env: ITEnvelope = field(default_factory=ITEnvelope)
+    pan_env: ITEnvelope = field(default_factory=ITEnvelope)
+    ptc_env: ITEnvelope = field(default_factory=ITEnvelope)
+
+@dataclass
+class ITSample:
+    name: str = ""
+    c5speed: int = 8363    # Hz at C-5
+    vol: int = 64          # 0..64
+    global_vol: int = 64   # 0..64
+    dfp: int = 0           # default panning
+    length: int = 0
+    loop_start: int = 0
+    loop_end: int = 0
+    sus_loop_start: int = 0
+    sus_loop_end: int = 0
+    has_loop: bool = False
+    has_sus_loop: bool = False
+    bidi_loop: bool = False
+    bidi_sus: bool = False
+    data: object = None    # numpy array or None
+    # Sample vibrato
+    vib_speed: int = 0
+    vib_depth: int = 0
+    vib_rate: int = 0
+    vib_type: int = 0
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pattern cell
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class ITCell:
+    note: int = 0    # 0=empty, 1-119=note, 254=cut, 255=noteoff
+    inst: int = 0    # 0=empty
+    vol: int = 255   # 255=empty; 0-64=set vol; 65-74=vol slide up; etc.
+    eff: int = 0     # 0=none; 1=A..25=Y
+    par: int = 0
+    has_note: bool = False
+    has_inst: bool = False
+    has_vol: bool = False
+    has_eff: bool = False
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Voice (virtual channel) state — mirrors ITVIRTCH
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ITVoice:
+    def __init__(self, vid):
+        self.vid = vid          # unique voice ID assigned at creation
+        self.owner = -1         # column index that owns this voice (-1 = free)
+        self.active = False
+        self.background = True
+        self.note = 0
+        self.inst_idx = 0       # 1-based; 0 = none
+        self.smp_idx = 0        # 1-based; 0 = none
+        self.inst: Optional[ITInstrument] = None
+        self.smp: Optional[ITSample] = None
+        # Volume components
+        self.nfc = 0            # note fade component 0..1024
+        self.sv = 0             # sample global vol 0..64
+        self.iv = 0             # instrument global vol 0..128
+        self.cv = 0             # channel vol 0..64
+        self.np = 32            # note panning 0..64
+        self.vol = 0            # current column volume 0..64
+        self.frq = 0            # current frequency (Hz-ish, MikIT units)
+        self.vev = 64           # vol envelope value 0..64
+        # Envelope processors (tick counters)
+        self.env_tick_vol = 0.0
+        self.env_tick_pan = 0.0
+        self.env_tick_ptc = 0.0
+        self.keyon = False
+        self.dofade = False
+        self.cut = False
+        self.kick = False
+        self.start_offset = 0
+        # Sample playback tracking for timeline
+        self.trigger_abs_tick = 0    # absolute tick when current note started
+        self.trigger_samp_pos = 0    # sample position at trigger
+        # Vibrato (sample-level)
+        self.vibrunp = 0
+        self.vibrund = 0
+
+    def reset_for_new_note(self, abs_tick):
+        self.nfc = 1024
+        self.env_tick_vol = 0.0
+        self.env_tick_pan = 0.0
+        self.env_tick_ptc = 0.0
+        self.keyon = True
+        self.dofade = False
+        self.cut = False
+        self.vibrunp = 0
+        self.vibrund = 0
+        self.trigger_abs_tick = abs_tick
+        self.trigger_samp_pos = self.start_offset
+
+    def get_final_vol(self, run_gv):
+        """Compute final output volume in 0-255 range (MikIT formula)."""
+        if not self.active or self.cut:
+            return 0
+        endvol = run_gv          # 128
+        endvol *= self.sv        # 64
+        endvol *= self.iv        # 128
+        endvol *= self.cv        # 64
+        endvol >>= 17            # → 512 max
+        endvol *= self.vol       # 64
+        endvol *= self.vev       # 64
+        endvol *= self.nfc       # 1024
+        if endvol > 0:
+            endvol //= 8421504   # → 255 max
+        return min(255, max(0, endvol))
+
+    def get_final_freq(self):
+        """Return frequency in Hz (float)."""
+        return float(self.frq)
+
+    def advance_envelopes(self):
+        """Advance envelope ticks by 1."""
+        if self.inst and self.inst.vol_env.enabled:
+            if self.keyon and self.inst.vol_env.sustain_enabled:
+                pts = self.inst.vol_env.points
+                if pts and self.env_tick_vol < pts[-1].tick:
+                    sus_e = pts[self.inst.vol_env.sus_end].tick if len(pts) > self.inst.vol_env.sus_end else 999999
+                    if self.env_tick_vol < sus_e:
+                        self.env_tick_vol += 1
+                    # Hold at sustain end point
+            else:
+                self.env_tick_vol += 1
+        if self.inst and self.inst.pan_env.enabled:
+            self.env_tick_pan += 1
+        if self.inst and self.inst.ptc_env.enabled:
+            self.env_tick_ptc += 1
+
+    def update_vev(self):
+        if self.inst and self.inst.vol_env.enabled:
+            v = self.inst.vol_env.value_at_tick(self.env_tick_vol, self.keyon)
+            self.vev = int(v * 64)
+        else:
+            self.vev = 64
+
+    def do_nna(self, nna_action):
+        """Apply NNA action (0=cut,1=continue,2=noteoff,3=fade)."""
+        self.background = True
+        self.owner = -1
+        if nna_action == 0:
+            self.cut = True
+            self.active = False
+        elif nna_action == 1:
+            pass  # continue
+        elif nna_action == 2:
+            self.keyon = False
+        elif nna_action == 3:
+            self.dofade = True
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Column (channel) state — mirrors ITCOLUMN
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ITColumn:
+    def __init__(self, col_idx, engine):
+        self.col = col_idx
+        self.eng = engine        # reference to ITPlayer
+        self.voice: Optional[ITVoice] = None
+        # Persistent column state
+        self.note = 0
+        self.inst = 0
+        self.smp = 0
+        self.smpnote = 0
+        self.vol = 64
+        self.frq = 0
+        self.cv = 64             # channel volume
+        self.cp = 32             # channel panning (default centre)
+        self.np = 32             # note panning
+        self.kick = False
+        self.retrig = False
+        self.own_vol = False
+        self.own_frq = False
+        self.own_ofs = False
+        self.ovol = 0
+        self.ofrq = 0
+        self.start_offset = 0
+        self.dest_frq = 0
+        # Effect memory
+        self.volslidespd = 0
+        self.chvolslidespd = 0
+        self.pitchslidespd = 0
+        self.panslidespd = 0
+        self.temposlidespd = 0
+        self.gvolslidespd = 0
+        self.vvolslidespd = 0
+        self.vibspd = 0
+        self.vibdpt = 0
+        self.vibtyp = 0
+        self.vibptr = 0
+        self.trmspd = 0
+        self.trmdpt = 0
+        self.trmtyp = 0
+        self.trmptr = 0
+        self.tremorspd = 0
+        self.tremorptr = 0
+        self.arpeggio = 0
+        self.qspeed = 0
+        self.qptr = 0
+        self.sfxdata = 0
+        self.loopback_point = 0
+        self.loopback_count = 0
+        # Current row note data
+        self.cell = ITCell()
+        self.tick = 0
+
+    def find_smp_note_freq(self):
+        """Resolve sample, transposed note, and frequency for current inst+note."""
+        eng = self.eng
+        if self.inst > 0 and self.inst <= len(eng.instruments):
+            i = eng.instruments[self.inst - 1]
+            note_idx = max(0, min(119, self.note))  # IT notes are 0-based, 0=C-0 .. 119=B-9
+            raw_smp = i.note_to_sample[note_idx]
+            raw_note = i.note_to_note[note_idx]
+            self.smp = raw_smp
+            self.smpnote = raw_note
+            # Frequency
+            if 0 <= raw_note < 120:
+                self.frq = PITCH_TABLE[raw_note]
+            else:
+                self.frq = PITCH_TABLE[60]
+            if self.smp and self.smp <= len(eng.samples):
+                s = eng.samples[self.smp - 1]
+                self.frq = _muldiv(self.frq, s.c5speed, 65536)
+            # Panning: sample override > instrument override > channel pan
+            self.np = self.cp
+            if self.smp and self.smp <= len(eng.samples):
+                s = eng.samples[self.smp - 1]
+                if s.dfp & 0x80:
+                    self.np = s.dfp & 0x7F
+                elif i.dfp & 0x80:
+                    self.np = i.dfp & 0x7F
+                t = self.np + (((self.note - 1 - i.ppc) * i.pps) >> 3)
+                self.np = max(0, min(64, t))
+
+    def process_tick0(self, abs_tick):
+        """Row-start processing (tick == 0 only, or Sxd note-delay)."""
+        cell = self.cell
+        # Sxd note delay: only fire if tick == note_delay_val
+        if cell.has_eff and cell.eff == 19 and (cell.par >> 4) == 0xD:
+            if self.tick != (cell.par & 0xF):
+                return
+        else:
+            if self.tick != 0:
+                return
+
+        doing_slide = False
+        # Check for tone portamento (vol col G, or effect G)
+        is_porta = (
+            (cell.has_vol and 193 <= cell.vol <= 202) or
+            (cell.has_eff and cell.eff == 7)
+        )
+        if is_porta and cell.has_note and cell.note <= 119:
+            doing_slide = True
+            slide_ins = self.inst
+            if cell.has_inst:
+                slide_ins = cell.inst
+            if slide_ins > 0 and slide_ins <= len(self.eng.instruments):
+                ii = self.eng.instruments[slide_ins - 1]
+                raw_smp = ii.note_to_sample[max(0, min(119, cell.note))]
+                raw_note = ii.note_to_note[max(0, min(119, cell.note))]
+                if raw_smp and raw_smp <= len(self.eng.samples):
+                    self.dest_frq = _muldiv(PITCH_TABLE[raw_note],
+                                            self.eng.samples[raw_smp - 1].c5speed, 65536)
+                else:
+                    self.dest_frq = 0
+                    cell.par = 0
+            if not self.voice:
+                doing_slide = False
+
+        # Note column
+        if cell.has_note:
+            if cell.note == 255:      # note-off
+                if self.voice:
+                    self.voice.keyon = False
+            elif cell.note == 254:    # note-cut
+                if self.voice:
+                    self.voice.cut = True
+            elif cell.note <= 119:
+                if not doing_slide:
+                    self.note = cell.note
+                    self.kick = True
+                    self.find_smp_note_freq()
+
+        # Instrument column
+        if cell.has_inst and cell.inst <= len(self.eng.instruments):
+            self.inst = cell.inst
+            if not doing_slide and cell.has_note:
+                self.kick = True
+                self.find_smp_note_freq()
+                self.tremorptr = 0
+                self.vibptr = 0
+                self.trmptr = 0
+                self.qptr = 0
+            if self.smp and self.smp <= len(self.eng.samples):
+                self.vol = self.eng.samples[self.smp - 1].vol
+
+        # Volume column set-vol
+        if cell.has_vol:
+            if cell.vol <= 64:
+                self.vol = cell.vol
+            elif 128 <= cell.vol <= 192:
+                self.cp = cell.vol - 128
+                self.np = self.cp
+
+        # Safety: don't kick with no sample
+        if self.inst == 0 or self.smp == 0:
+            self.kick = False
+        if self.inst > len(self.eng.instruments) or self.smp > len(self.eng.samples):
+            self.kick = False
+
+    # ── Effect helpers ────────────────────────────────────────────────────────
+
+    def _vol_slide_up(self, v):
+        self.vol = min(64, self.vol + v)
+
+    def _vol_slide_dn(self, v):
+        self.vol = max(0, self.vol - v)
+
+    def _frq_up(self, v):
+        self.frq = _frq_slide_up(self.frq, v, self.eng.linear_freq)
+
+    def _frq_dn(self, v):
+        self.frq = _frq_slide_dn(self.frq, v, self.eng.linear_freq)
+
+    def _pan_left(self, v):
+        self.np = max(0, self.np - v)
+
+    def _pan_right(self, v):
+        self.np = min(64, self.np + v)
+
+    def do_vibrato(self):
+        self.own_frq = True
+        vtyp = self.vibtyp & 3
+        if vtyp < 3:
+            val = VIB_TABLES[vtyp][self.vibptr & 0xFF]
+        else:
+            import random
+            val = random.randint(-64, 64)
+        val = val * self.vibdpt >> 8
+        self.ofrq = self.frq
+        if val < 0:
+            self.ofrq = _frq_slide_dn(self.frq, -val, self.eng.linear_freq)
+        elif val > 0:
+            self.ofrq = _frq_slide_up(self.frq, val, self.eng.linear_freq)
+        self.vibptr = (self.vibptr + (self.vibspd << 2)) & 0xFF
+
+    # ── Effect dispatch ───────────────────────────────────────────────────────
+
+    def effects(self):
+        cell = self.cell
+        tick = self.tick
+
+        # Volume column effects
+        if cell.has_vol:
+            v = cell.vol
+            if 65 <= v <= 74:   self._eff_vol_slide_up(v - 65)
+            elif 75 <= v <= 84: self._eff_vol_slide_dn(v - 75)
+            elif 85 <= v <= 94: self._eff_fine_vol_up(v - 85)
+            elif 95 <= v <= 104: self._eff_fine_vol_dn(v - 95)
+            elif 105 <= v <= 114: self._eff_vib_depth(v - 105)
+            elif 115 <= v <= 124: self._eff_vib_speed(v - 115)
+            elif 193 <= v <= 202: self._eff_porta(v - 193, cell.par if cell.has_eff and cell.eff == 7 else None)
+            elif 203 <= v <= 212: self._eff_vib_noteoff(v - 203)
+
+        if not cell.has_eff:
+            return
+
+        eff = cell.eff
+        par = cell.par
+
+        if eff == 1:   self._eff_A(par)   # Set speed
+        elif eff == 2: self._eff_B(par)   # Jump to order
+        elif eff == 3: self._eff_C(par)   # Break to row
+        elif eff == 4: self._eff_D(par)   # Vol slide
+        elif eff == 5: self._eff_E(par)   # Pitch slide down
+        elif eff == 6: self._eff_F(par)   # Pitch slide up
+        elif eff == 7: self._eff_G(par)   # Tone portamento
+        elif eff == 8: self._eff_H(par)   # Vibrato
+        elif eff == 9: self._eff_I(par)   # Tremor
+        elif eff == 10: self._eff_J(par)  # Arpeggio
+        elif eff == 11:                   # K = H00 + D
+            self.do_vibrato()
+            self._eff_D(par)
+        elif eff == 12:                   # L = G00 + D
+            self._eff_G(0)
+            self._eff_D(par)
+        elif eff == 13: self._eff_M(par)  # Set channel vol
+        elif eff == 14: self._eff_N(par)  # Slide channel vol
+        elif eff == 15: self._eff_O(par)  # Sample offset
+        elif eff == 16: self._eff_P(par)  # Pan slide
+        elif eff == 17: self._eff_Q(par)  # Retrig
+        elif eff == 18: self._eff_R(par)  # Tremolo
+        elif eff == 19: self._eff_S(par)  # Special
+        elif eff == 20: self._eff_T(par)  # Tempo
+        elif eff == 21: self._eff_U(par)  # Fine vibrato
+        elif eff == 22: self._eff_V(par)  # Set global vol
+        elif eff == 23: self._eff_W(par)  # Slide global vol
+        elif eff == 24: self._eff_X(par)  # Set pan
+        elif eff == 25: self._eff_Y(par)  # Panbrello
+        elif eff == 26: self._eff_K_delayed(par)  # XM K: key-off at tick par
+        elif eff == 27: self._eff_XM_vib(par)    # XM vibrato (raw depth, no <<2)
+
+    def post_effects(self):
+        cell = self.cell
+        if cell.has_eff and cell.eff == 19:
+            self._post_S(cell.par)
+
+    # ── Individual effects (MikIT mmod_it2.cpp) ───────────────────────────────
+
+    def _eff_A(self, par):
+        if self.tick == 0 and par:
+            self.eng.speed = par
+
+    def _eff_B(self, par):
+        if self.tick == 0:
+            self.eng.order_jump = par + 1
+
+    def _eff_C(self, par):
+        if self.tick == 0:
+            self.eng.break_to_row = par + 1
+
+    def _eff_D(self, par):
+        if self.tick == 0 and par:
+            self.volslidespd = par
+        hi = (self.volslidespd >> 4) & 0xF
+        lo = self.volslidespd & 0xF
+        if self.tick == 0:
+            if hi == 0xF:
+                if lo: self._vol_slide_dn(lo)
+                else:  self._vol_slide_up(0xF)
+            elif lo == 0xF:
+                if hi: self._vol_slide_up(hi)
+                else:  self._vol_slide_dn(0xF)
+        else:
+            if hi == 0:   self._vol_slide_dn(lo)
+            elif lo == 0: self._vol_slide_up(hi)
+
+    def _eff_E(self, par):
+        if self.tick == 0 and par:
+            self.pitchslidespd = par
+        hi = (self.pitchslidespd >> 4) & 0xF
+        lo = self.pitchslidespd & 0xF
+        if self.tick == 0:
+            if hi == 0xF:
+                self._frq_dn(lo)
+            elif hi == 0xE:
+                lin = self.eng.linear_freq
+                self.frq = _muldiv(self.frq, FINE_SLIDE_DN[lo], 65536)
+        else:
+            if hi < 0xE:
+                self._frq_dn(self.pitchslidespd)
+
+    def _eff_F(self, par):
+        if self.tick == 0 and par:
+            self.pitchslidespd = par
+        hi = (self.pitchslidespd >> 4) & 0xF
+        lo = self.pitchslidespd & 0xF
+        if self.tick == 0:
+            if hi == 0xF:
+                self._frq_up(lo)
+            elif hi == 0xE:
+                self.frq = _muldiv(self.frq, FINE_SLIDE_UP[lo], 65536)
+        else:
+            if hi < 0xE:
+                self._frq_up(self.pitchslidespd)
+
+    def _eff_G(self, par):
+        if self.tick == 0 and par:
+            self.pitchslidespd = par
+        if not self.dest_frq:
+            return
+        if self.tick:
+            if self.frq < self.dest_frq:
+                self._frq_up(self.pitchslidespd)
+                if self.frq > self.dest_frq:
+                    self.frq = self.dest_frq
+            elif self.frq > self.dest_frq:
+                self._frq_dn(self.pitchslidespd)
+                if self.frq < self.dest_frq:
+                    self.frq = self.dest_frq
+
+    def _eff_H(self, par):
+        if self.tick == 0:
+            if par >> 4:   self.vibspd = par >> 4
+            if par & 0xF:  self.vibdpt = (par & 0xF) << 2
+        self.do_vibrato()
+
+    def _eff_I(self, par):
+        if self.tick == 0 and par:
+            self.tremorspd = par
+        on  = max(1, self.tremorspd >> 4)
+        off = max(1, self.tremorspd & 0xF)
+        self.tremorptr %= (on + off)
+        self.ovol = self.vol if self.tremorptr < on else 0
+        self.tremorptr += 1
+        self.own_vol = True
+
+    def _eff_J(self, par):
+        if self.tick == 0 and par:
+            self.arpeggio = par
+        phase = self.tick % 3
+        if phase == 1:
+            self.ofrq = _muldiv(self.frq, LINEAR_SLIDE_UP[16 * (self.arpeggio >> 4)], 65536)
+            self.own_frq = True
+        elif phase == 2:
+            self.ofrq = _muldiv(self.frq, LINEAR_SLIDE_UP[16 * (self.arpeggio & 0xF)], 65536)
+            self.own_frq = True
+
+    def _eff_M(self, par):
+        if self.tick == 0 and par <= 64:
+            self.cv = par
+
+    def _eff_N(self, par):
+        if self.tick == 0 and par:
+            self.chvolslidespd = par
+        hi = (self.chvolslidespd >> 4) & 0xF
+        lo = self.chvolslidespd & 0xF
+        if self.tick == 0:
+            if hi == 0xF:
+                self.cv = max(0, self.cv - lo)
+            elif lo == 0xF:
+                self.cv = min(64, self.cv + hi)
+        else:
+            if hi == 0:   self.cv = max(0, self.cv - lo)
+            elif lo == 0: self.cv = min(64, self.cv + hi)
+
+    def _eff_O(self, par):
+        if self.tick == 0 and par:
+            self.start_offset = par << 8
+        self.own_ofs = True
+
+    def _eff_P(self, par):
+        if self.tick == 0 and par:
+            self.panslidespd = par
+        hi = (self.panslidespd >> 4) & 0xF
+        lo = self.panslidespd & 0xF
+        if self.tick == 0:
+            if hi == 0xF: self._pan_right(lo)
+            elif lo == 0xF: self._pan_left(hi)
+        else:
+            if hi == 0:   self._pan_right(lo)
+            elif lo == 0: self._pan_left(hi)
+        self.cp = self.np
+
+    def _eff_Q(self, par):
+        if self.tick == 0 and par:
+            self.qspeed = par
+        qtyp = self.qspeed >> 4
+        qspd = self.qspeed & 0xF
+        val = self.vol
+        if self.qptr >= qspd:
+            vol_mods = {1:-1,2:-2,3:-4,4:-8,5:-16,6:None,7:None,9:1,10:2,11:4,12:8,13:16,14:None,15:None}
+            if qtyp in vol_mods:
+                dm = vol_mods[qtyp]
+                if dm is not None:
+                    val += dm
+                elif qtyp == 6:
+                    val = val * 2 // 3
+                elif qtyp == 7:
+                    val >>= 1
+                elif qtyp == 14:
+                    val = val * 3 >> 1
+                elif qtyp == 15:
+                    val <<= 1
+            val = max(0, min(64, val))
+            self.qptr = 0
+            self.kick = True
+            self.retrig = True
+        self.qptr += 1
+        self.vol = val
+
+    def _eff_R(self, par):
+        if self.tick == 0:
+            if par >> 4:  self.trmspd = par >> 4
+            if par & 0xF: self.trmdpt = par & 0xF
+        vtyp = self.trmtyp & 3
+        if vtyp < 3:
+            val = VIB_TABLES[vtyp][self.trmptr & 0xFF]
+        else:
+            import random
+            val = random.randint(-64, 64)
+        val = val * self.trmdpt >> 6
+        self.ovol = max(0, min(64, self.vol + val))
+        self.own_vol = True
+        self.trmptr = (self.trmptr + (self.trmspd << 2)) & 0xFF
+
+    def _eff_S(self, par):
+        hi = (par >> 4) & 0xF
+        lo = par & 0xF
+        if self.tick == 0:
+            if hi == 0xB:   # pattern loop
+                if lo == 0:
+                    self.loopback_point = self.eng.row
+                else:
+                    if self.loopback_count == 0:
+                        self.loopback_count = lo
+                        self.eng.break_to_row = self.loopback_point + 1
+                    else:
+                        self.loopback_count -= 1
+                        if self.loopback_count > 0:
+                            self.eng.break_to_row = self.loopback_point + 1
+            elif hi == 0xC:   # note cut at tick lo
+                pass  # handled in post
+            elif hi == 0xD:   # note delay at tick lo
+                pass  # handled in process_tick0
+
+    def _post_S(self, par):
+        hi = (par >> 4) & 0xF
+        lo = par & 0xF
+        if hi == 0xC and self.tick == lo:
+            if self.voice:
+                self.voice.cut = True
+
+    def _eff_T(self, par):
+        if self.tick == 0:
+            if par >= 0x20:
+                self.eng.tempo = par
+            else:
+                if par >> 4 == 0:
+                    self.eng.tempo = max(32, self.eng.tempo - (par & 0xF))
+                elif par >> 4 == 1:
+                    self.eng.tempo = min(255, self.eng.tempo + (par & 0xF))
+                else:
+                    if par:
+                        self.temposlidespd = par
+                    hi = (self.temposlidespd >> 4) & 0xF
+                    lo = self.temposlidespd & 0xF
+                    if hi:
+                        self.eng.tempo = min(255, self.eng.tempo + hi)
+                    elif lo:
+                        self.eng.tempo = max(32, self.eng.tempo - lo)
+
+    def _eff_U(self, par):
+        if self.tick == 0:
+            if par >> 4:  self.vibspd = par >> 4
+            if par & 0xF: self.vibdpt = par & 0xF
+        self.do_vibrato()
+
+    def _eff_V(self, par):
+        if self.tick == 0:
+            self.eng.run_gv = max(0, min(128, par))
+
+    def _eff_W(self, par):
+        if self.tick == 0 and par:
+            self.gvolslidespd = par
+        hi = (self.gvolslidespd >> 4) & 0xF
+        lo = self.gvolslidespd & 0xF
+        if self.tick == 0:
+            if hi == 0xF: self.eng.run_gv = min(128, self.eng.run_gv + lo)
+            elif lo == 0xF: self.eng.run_gv = max(0, self.eng.run_gv - hi)
+        else:
+            if hi == 0:   self.eng.run_gv = max(0, self.eng.run_gv - lo)
+            elif lo == 0: self.eng.run_gv = min(128, self.eng.run_gv + hi)
+
+    def _eff_X(self, par):
+        if self.tick == 0:
+            self.cp = max(0, min(64, par))
+            self.np = self.cp
+
+    def _eff_Y(self, par):
+        # Panbrello: like tremolo but on panning
+        if self.tick == 0:
+            if par >> 4:  self.vibspd = par >> 4   # reuse vibspd for panbrello
+            if par & 0xF: self.vibdpt = par & 0xF
+        # Not implementing full panbrello for now
+
+    def _eff_K_delayed(self, par):
+        """XM K effect: key-off at tick par (MikIT UNI_KEYFADE)."""
+        if self.tick == par:
+            if self.voice:
+                self.voice.keyon = False
+
+    def _eff_XM_vib(self, par):
+        """XM effect 4 vibrato: depth = raw nibble (no <<2 scaling, unlike IT EffectH)."""
+        if self.tick == 0:
+            if par >> 4:  self.vibspd = par >> 4
+            if par & 0xF: self.vibdpt = par & 0xF
+        self.do_vibrato()
+
+    # Vol-column effect sub-dispatchers
+    def _eff_vol_slide_up(self, v):
+        if self.tick: self._vol_slide_up(v)
+
+    def _eff_vol_slide_dn(self, v):
+        if self.tick: self._vol_slide_dn(v)
+
+    def _eff_fine_vol_up(self, v):
+        if self.tick == 0: self._vol_slide_up(v)
+
+    def _eff_fine_vol_dn(self, v):
+        if self.tick == 0: self._vol_slide_dn(v)
+
+    def _eff_vib_depth(self, v):
+        if self.tick == 0: self.vibdpt = v << 2
+        self.do_vibrato()
+
+    def _eff_vib_speed(self, v):
+        if self.tick == 0: self.vibspd = v
+        self.do_vibrato()
+
+    def _eff_porta(self, v, override_par):
+        # vol-col portamento (G command value 0-9 stored as speed)
+        spd = override_par if override_par is not None else (v if v else self.pitchslidespd)
+        self._eff_G(spd)
+
+    def _eff_vib_noteoff(self, v):
+        self._eff_H(v)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Voice segment (timeline output)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class VoiceSegment:
+    """One contiguous note-on event on a virtual voice."""
+    voice_id: int         # unique voice ID
+    channel: int          # physical channel index (-1 = NNA ghost)
+    start_tick: int       # absolute tick when note triggered
+    end_tick: int         # absolute tick when voice became silent (-1 = ongoing)
+    sample_idx: int       # 0-based sample index
+    # Per-tick state list: [(abs_tick, freq_hz, vol_f, pan_f, samp_pos)]
+    # tick_states[0] is always at start_tick
+    tick_states: List[tuple] = field(default_factory=list)
+    # Derived loop info (from sample)
+    loop_start: int = 0
+    loop_end: int = 0
+    loop_type: int = 0    # 0=none 1=fwd 2=bidi
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main player engine
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ITPlayer:
+    """
+    Tick-accurate IT/XM/S3M player engine.
+    Call run() to simulate the song and return the voice timeline.
+    """
+    MAX_VOICES = 64
+
+    def __init__(self):
+        self.instruments: List[ITInstrument] = []
+        self.samples: List[ITSample] = []
+        self.patterns: List[List[List[ITCell]]] = []  # [pat][row][ch]
+        self.orders: List[int] = []
+        self.num_channels = 0
+        self.initial_speed = 6
+        self.initial_tempo = 125
+        self.global_volume = 128   # IT header GV
+        self.mix_volume = 128      # IT header MV
+        self.linear_freq = True    # IT_LINEAR_FREQ flag
+        self.channel_pan: List[int] = []   # 0-64 per channel
+        self.channel_vol: List[int] = []   # 0-64 per channel
+
+        # Runtime state
+        self.speed = 6
+        self.tempo = 125
+        self.tick = 0
+        self.row = 0
+        self.song_pos = 0
+        self.abs_tick = 0
+        self.run_gv = 128
+        self.order_jump = 0
+        self.break_to_row = 0
+        self.pattern_delay = 0
+        self.pattern_del_rq = 0
+
+        self.voices: List[ITVoice] = []
+        self.columns: List[ITColumn] = []
+        self._next_vid = 0
+        self._next_seg_id = 0            # unique per note-on event
+        self._voice_segs: dict = {}      # seg_id -> VoiceSegment (in progress)
+        self._voice_seg_id: dict = {}    # vid -> current seg_id
+        self._finished_segs: List[VoiceSegment] = []
+        # Per-row event log: (abs_tick, song_pos, row, pat_no) emitted at row
+        # load time. The HTML segment player uses this to drive the tracker
+        # view: bsearch abs_tick to find current row during audio playback.
+        self.row_events: List[tuple] = []
+
+    def _alloc_voice(self) -> ITVoice:
+        vid = self._next_vid
+        self._next_vid += 1
+        v = ITVoice(vid)
+        return v
+
+    def _find_least_active(self) -> Optional[ITVoice]:
+        """Find free or lowest-NFC background voice (MikIT vFindLeastActive)."""
+        best = None
+        best_nfc = 0xFFFF
+        for v in self.voices:
+            if not v.active:
+                return v
+            if v.background and v.nfc < best_nfc:
+                best_nfc = v.nfc
+                best = v
+        return best
+
+    def _do_nna(self, col: ITColumn):
+        """Handle NNA when a new note triggers on a column that already has a voice."""
+        v = col.voice
+        if v is None:
+            return
+        if not v.active:
+            return
+        # Move old voice to background via its instrument's NNA
+        nna = v.inst.nna if v.inst else 0
+        if nna == 0:  # cut: close immediately — otherwise old voice plays a full extra tick at full
+            self._close_segment(v)  # amplitude while new voice starts, producing an audible click
+        v.do_nna(nna)
+
+    def _find_or_steal_voice(self) -> Optional[ITVoice]:
+        v = self._find_least_active()
+        if v is None and self.voices:
+            # steal the oldest background voice
+            bg = [x for x in self.voices if x.background]
+            if bg:
+                v = min(bg, key=lambda x: x.trigger_abs_tick)
+        return v
+
+    def _dup_check(self, col: ITColumn):
+        """Duplicate Check (MikIT DuplicateCheck)."""
+        if not col.inst or col.inst > len(self.instruments):
+            return
+        inst = self.instruments[col.inst - 1]
+        if inst.dct == 0:
+            return
+        for v in self.voices:
+            if not v.active or not v.background:
+                continue
+            if v.owner != col.col:
+                continue
+            if v.inst_idx != col.inst:
+                continue
+            if inst.dct == 1 and v.note != col.note:
+                continue
+            if inst.dct == 2 and v.smp_idx != col.smp:
+                continue
+            v.do_nna(inst.dca)
+
+    def _start_segment(self, v: ITVoice, col: ITColumn):
+        """Begin recording a VoiceSegment for this voice (new note-on event)."""
+        # Close any previous segment on this voice first
+        self._close_segment(v)
+        if v.smp_idx == 0 or v.smp_idx > len(self.samples):
+            return
+        smp = self.samples[v.smp_idx - 1]
+        lt = 0
+        if smp.has_loop:
+            lt = 2 if smp.bidi_loop else 1
+        seg_id = self._next_seg_id
+        self._next_seg_id += 1
+        seg = VoiceSegment(
+            voice_id=seg_id,           # unique per note-on, not per physical voice
+            channel=col.col if col else -1,
+            start_tick=self.abs_tick,
+            end_tick=-1,
+            sample_idx=v.smp_idx - 1,
+            loop_start=smp.loop_start,
+            loop_end=smp.loop_end,
+            loop_type=lt,
+        )
+        self._voice_segs[seg_id] = seg
+        self._voice_seg_id[v.vid] = seg_id
+
+    def _close_segment(self, v: ITVoice):
+        seg_id = self._voice_seg_id.pop(v.vid, None)
+        if seg_id is not None:
+            seg = self._voice_segs.pop(seg_id, None)
+            if seg:
+                seg.end_tick = self.abs_tick
+                self._finished_segs.append(seg)
+
+    def _snapshot_voice(self, v: ITVoice, col: ITColumn):
+        """Record current voice state into the active segment."""
+        seg_id = self._voice_seg_id.get(v.vid)
+        if seg_id is None:
+            return
+        seg = self._voice_segs.get(seg_id)
+        if seg is None:
+            return
+        # Compute final volume as float 0-1
+        vol_255 = v.get_final_vol(self.run_gv)
+        vol_f = vol_255 / 255.0
+        # Pan: NP 0-64 → 0.0-1.0
+        pan_f = v.np / 64.0
+        freq_hz = float(v.frq)
+        # Sample position: approximate based on elapsed ticks
+        dt_ticks = self.abs_tick - v.trigger_abs_tick
+        ticks_per_sec = self.tempo * 2.0 / 5.0
+        dt_sec = dt_ticks / ticks_per_sec
+        if v.smp_idx and v.smp_idx <= len(self.samples):
+            smp = self.samples[v.smp_idx - 1]
+            samp_pos = int(v.trigger_samp_pos + dt_sec * freq_hz)
+            # Apply looping for position estimate
+            if smp.has_loop and smp.loop_end > smp.loop_start:
+                span = smp.loop_end - smp.loop_start
+                if samp_pos >= smp.loop_end and span > 0:
+                    excess = samp_pos - smp.loop_start
+                    samp_pos = smp.loop_start + (excess % span)
+        else:
+            samp_pos = 0
+        seg.tick_states.append((self.abs_tick, freq_hz, vol_f, pan_f, samp_pos))
+
+    def _touch_voice(self, v: ITVoice):
+        """Deactivate voice if it's become silent (MikIT ITVIRTCH::Touch).
+        Called at start of tick, BEFORE column processing."""
+        if not v.active:
+            return
+        if v.cut:
+            v.cut = False
+            v.active = False
+            self._close_segment(v)
+            return
+        if v.nfc == 0 or v.sv == 0 or v.iv == 0:
+            v.active = False
+            self._close_segment(v)
+            return
+        # When a volume envelope has run to completion and its final value is 0
+        # (key-off → sustain released → tail plays out → last point = 0),
+        # deactivate the voice.  The env_tick_vol > 1 guard prevents killing a
+        # voice at tick 0 before the envelope has had a chance to run.
+        if not v.keyon and v.vev == 0 and v.env_tick_vol > 1:
+            v.active = False
+            self._close_segment(v)
+
+    def _update_voice(self, v: ITVoice, col: ITColumn):
+        """Update voice state (MikIT ITVIRTCH::Update).
+        Called AFTER column processing each tick."""
+        if v.kick and v.inst and v.smp_idx:
+            v.reset_for_new_note(self.abs_tick)
+            if v.smp_idx <= len(self.samples):
+                v.sv = self.samples[v.smp_idx - 1].global_vol
+            else:
+                v.sv = 64
+            v.iv = v.inst.global_vol
+            v.nna = v.inst.nna
+            v.kick = False
+            self._start_segment(v, col)
+
+        # Advance envelopes first (MikIT ITPROCESS::Process increments tick before read),
+        # then read the value at the new tick position.
+        v.advance_envelopes()
+        v.update_vev()
+
+        # Key-off → start fade
+        if not v.keyon:
+            vol_env = v.inst.vol_env if v.inst else None
+            has_env = vol_env and vol_env.enabled and len(vol_env.points) >= 2
+            if not has_env or (vol_env and vol_env.loop_enabled):
+                v.dofade = True
+
+        # Vol envelope done → fade
+        if v.inst and v.inst.vol_env.enabled:
+            if v.inst.vol_env.is_done(v.env_tick_vol, v.keyon):
+                v.dofade = True
+
+        # Fade
+        if v.inst and v.dofade:
+            fo = v.inst.fadeout
+            if fo > 0:
+                v.nfc = max(0, v.nfc - fo)
+
+    def _process_tick(self):
+        """Process one tick (MikIT MMODULE_IT::Update inner body)."""
+        # 1. Touch: deactivate voices that died in the PREVIOUS tick
+        for v in self.voices:
+            self._touch_voice(v)
+
+        # Process each column
+        for ci in range(self.num_channels):
+            col = self.columns[ci]
+            col.own_vol = False
+            col.own_frq = False
+            col.own_ofs = False
+            col.retrig = False
+            col.tick = self.tick
+
+            col.process_tick0(self.abs_tick)
+            col.effects()
+
+            if col.kick:
+                if not col.retrig:
+                    # Duplicate check
+                    self._dup_check(col)
+                    # NNA
+                    if col.voice and col.voice.active:
+                        self._do_nna(col)
+                        new_v = self._find_or_steal_voice()
+                    elif col.voice:
+                        new_v = col.voice  # reuse inactive voice
+                    else:
+                        new_v = self._find_or_steal_voice()
+                        if new_v is None:
+                            new_v = self._alloc_voice()
+                            self.voices.append(new_v)
+                else:
+                    new_v = col.voice
+
+                if new_v:
+                    # Close old segment if stealing
+                    if new_v.vid in self._voice_segs and new_v.vid != (col.voice.vid if col.voice else -1):
+                        self._close_segment(new_v)
+                    # Clear stale col.voice on the previous owner so it doesn't overwrite
+                    # this voice's state when that column is processed later in the same tick.
+                    old_owner = new_v.owner
+                    if 0 <= old_owner < len(self.columns) and self.columns[old_owner].voice is new_v:
+                        self.columns[old_owner].voice = None
+                    new_v.owner = ci
+                    new_v.active = True
+                    new_v.keyon = True
+                    new_v.dofade = False
+                    new_v.background = False
+                    new_v.cut = False
+                    new_v.note = col.note
+                    new_v.inst_idx = col.inst
+                    new_v.smp_idx = col.smp
+                    new_v.inst = self.instruments[col.inst - 1] if col.inst and col.inst <= len(self.instruments) else None
+                    new_v.smp = self.samples[col.smp - 1] if col.smp and col.smp <= len(self.samples) else None
+                    new_v.start_offset = col.start_offset if col.own_ofs else 0
+                    new_v.kick = True
+                    col.voice = new_v
+
+                col.kick = False
+
+            if col.voice:
+                v = col.voice
+                v.cv = col.cv
+                v.np = col.np
+                v.vol = col.ovol if col.own_vol else col.vol
+                v.frq = col.ofrq if col.own_frq else col.frq
+                if v.frq < 50:
+                    v.frq = 50
+
+            col.post_effects()
+
+        if self.pattern_del_rq:
+            self.pattern_delay = self.pattern_del_rq
+            self.pattern_del_rq = 0
+
+        # 3. Update all active voices (envelopes, fade)
+        for v in self.voices:
+            if v.active:
+                col_ref = self.columns[v.owner] if 0 <= v.owner < len(self.columns) else None
+                self._update_voice(v, col_ref)
+
+        # 4. Snapshot all active voices AFTER update
+        for v in self.voices:
+            if v.active and v.vid in self._voice_seg_id:
+                col_ref = self.columns[v.owner] if 0 <= v.owner < len(self.columns) else None
+                self._snapshot_voice(v, col_ref)
+
+    def _load_row(self, pat_idx, row_idx):
+        """Load row data into column cells."""
+        if pat_idx >= len(self.patterns):
+            return
+        pat = self.patterns[pat_idx]
+        if row_idx >= len(pat):
+            return
+        row = pat[row_idx]
+        for ci in range(min(self.num_channels, len(row))):
+            self.columns[ci].cell = row[ci]
+
+    def run(self, max_ticks=None) -> List[VoiceSegment]:
+        """
+        Simulate the song and return all voice segments.
+        max_ticks: safety limit (default = 30 minutes at 60 ticks/sec).
+        """
+        if max_ticks is None:
+            max_ticks = 30 * 60 * 60  # 30 min @ 60 ticks/sec
+
+        # Init state
+        self.speed = self.initial_speed
+        self.tempo = self.initial_tempo
+        self.run_gv = self.global_volume
+        self.tick = self.speed  # force row load on first Update
+        self.row = -1
+        self.abs_tick = 0
+        self.song_pos = 0
+        self.order_jump = 0
+        self.break_to_row = 0
+        self.pattern_delay = 0
+        self.pattern_del_rq = 0
+
+        # Init voices pool
+        self.voices = [self._alloc_voice() for _ in range(self.MAX_VOICES)]
+        for v in self.voices:
+            v.active = False
+            v.background = True
+
+        # Init columns
+        self.columns = []
+        for ci in range(self.num_channels):
+            col = ITColumn(ci, self)
+            col.cp = self.channel_pan[ci] if ci < len(self.channel_pan) else 32
+            col.np = col.cp
+            col.cv = self.channel_vol[ci] if ci < len(self.channel_vol) else 64
+            self.columns.append(col)
+
+        # Clear segments
+        self._voice_segs = {}
+        self._finished_segs = []
+        self.row_events = []
+
+        # Find first valid order
+        self.song_pos = 0
+        while self.song_pos < len(self.orders) and self.orders[self.song_pos] >= 0xFE:
+            self.song_pos += 1
+        if self.song_pos >= len(self.orders):
+            return []
+
+        pat_no = self.orders[self.song_pos]
+        if pat_no >= len(self.patterns):
+            return []
+        current_pat_rows = len(self.patterns[pat_no])
+
+        songs_done = False
+        while self.abs_tick < max_ticks and not songs_done:
+            # Advance tick counter
+            self.tick += 1
+            if self.tick >= self.speed:
+                self.tick = 0
+
+                if self.pattern_delay:
+                    self.pattern_delay -= 1
+                    if self.pattern_delay == 0:
+                        self.row += 1
+                else:
+                    self.row += 1
+
+                # Handle pattern boundary / order jump / break
+                if self.row >= current_pat_rows or self.order_jump or self.break_to_row:
+                    if self.order_jump:
+                        self.song_pos = (self.order_jump - 1) % len(self.orders)
+                        self.order_jump = 0
+                        if self.song_pos == 0:
+                            songs_done = True
+                            break
+                    else:
+                        self.song_pos += 1
+
+                    # Skip marker orders
+                    while self.song_pos < len(self.orders) and self.orders[self.song_pos] == 0xFE:
+                        self.song_pos += 1
+
+                    if self.song_pos >= len(self.orders) or self.orders[self.song_pos] == 0xFF:
+                        songs_done = True
+                        break
+
+                    pat_no = self.orders[self.song_pos]
+                    if pat_no >= len(self.patterns):
+                        songs_done = True
+                        break
+
+                    if self.break_to_row:
+                        self.row = max(0, self.break_to_row - 1)
+                        self.break_to_row = 0
+                    else:
+                        self.row = 0
+
+                    current_pat_rows = len(self.patterns[pat_no])
+
+                # Load row data into columns
+                self._load_row(pat_no, self.row)
+                self.row_events.append((self.abs_tick, self.song_pos, self.row, pat_no))
+
+            self._process_tick()
+            self.abs_tick += 1
+
+        # Close any still-open segments
+        for v in self.voices:
+            if v.vid in self._voice_segs:
+                self._close_segment(v)
+
+        return self._finished_segs
+
+# ──────────────────────────────────────────────────────────────────────────────
+# IT file loader (native, not through existing mod_player conversion)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def load_it_native(filename: str) -> ITPlayer:
+    """Parse an .it file and return a configured ITPlayer ready to run()."""
+    with open(filename, 'rb') as f:
+        blob = f.read()
+
+    if blob[:4] != b'IMPM':
+        raise ValueError("Not an IT file")
+
+    player = ITPlayer()
+    # Song name lives at offset 4 (26 bytes, null-padded). load_xm_native does
+    # the equivalent for XM via XMFile; do the same here so the HTML segment
+    # player can show the song title instead of falling back to filename.
+    player.title = blob[4:4+26].rstrip(b'\x00 \r\n').decode('latin-1', errors='ignore')
+
+    # Header
+    ord_num = struct.unpack_from('<H', blob, 32)[0]
+    ins_num = struct.unpack_from('<H', blob, 34)[0]
+    smp_num = struct.unpack_from('<H', blob, 36)[0]
+    pat_num = struct.unpack_from('<H', blob, 38)[0]
+    cmwt    = struct.unpack_from('<H', blob, 42)[0]
+    flags   = struct.unpack_from('<H', blob, 44)[0]
+    player.linear_freq = bool(flags & 8)
+    player.initial_speed = max(1, blob[50])
+    player.initial_tempo = max(32, blob[51])
+    player.global_volume = blob[48]
+    player.mix_volume    = blob[49]
+
+    chn_pan = blob[64:128]
+    chn_vol = blob[128:192]
+
+    cur = 192
+    orders = list(blob[cur:cur+ord_num]); cur += ord_num
+    ins_offsets = list(struct.unpack_from(f'<{ins_num}I', blob, cur)); cur += 4*ins_num
+    smp_offsets = list(struct.unpack_from(f'<{smp_num}I', blob, cur)); cur += 4*smp_num
+    pat_offsets = list(struct.unpack_from(f'<{pat_num}I', blob, cur)); cur += 4*pat_num
+
+    player.orders = [b for b in orders if b != 0xFE or True]  # keep 0xFF end marker
+    player.orders = orders  # raw including 0xFE skip and 0xFF end
+
+    # Channel config
+    def _count_chans():
+        mx = 0
+        lm = [0]*64
+        for po in pat_offsets:
+            if not po or po+8 > len(blob): continue
+            length = struct.unpack_from('<H', blob, po)[0]
+            data = blob[po+8:po+8+length]
+            for i in range(64): lm[i] = 0
+            n = len(data); c = 0
+            while c < n:
+                cv = data[c]; c += 1
+                if cv == 0: continue
+                ch = (cv-1) & 0x3F
+                if ch+1 > mx: mx = ch+1
+                if cv & 0x80:
+                    if c >= n: break
+                    mask = data[c]; c += 1; lm[ch] = mask
+                else:
+                    mask = lm[ch]
+                if mask & 0x01: c += 1
+                if mask & 0x02: c += 1
+                if mask & 0x04: c += 1
+                if mask & 0x08: c += 2
+        return mx
+    try:
+        highest = _count_chans()
+    except Exception:
+        highest = 0
+        for i in range(64):
+            if (chn_pan[i] & 0x80) == 0: highest = i+1
+    player.num_channels = max(4, min(64, highest)) if highest else 4
+
+    player.channel_pan = []
+    player.channel_vol = []
+    for i in range(player.num_channels):
+        p = chn_pan[i] & 0x7F if i < 64 else 32
+        player.channel_pan.append(p)
+        v = chn_vol[i] if i < 64 else 64
+        player.channel_vol.append(v)
+
+    # Load instruments
+    player.instruments = []
+    if cmwt >= 0x200:
+        for off in ins_offsets:
+            if not off or off+64 > len(blob) or blob[off:off+4] != b'IMPI':
+                player.instruments.append(ITInstrument())
+                continue
+            inst = ITInstrument()
+            inst.name = blob[off+32:off+58].rstrip(b'\x00').decode('latin-1', errors='ignore')
+            inst.nna     = blob[off+17]
+            inst.dct     = blob[off+18]
+            inst.dca     = blob[off+19]
+            inst.fadeout = struct.unpack_from('<H', blob, off+20)[0]
+            # IT New Instrument Header offsets (IMPI):
+            #   0x14-0x15: Fadeout
+            #   0x16: PPS (Pitch-Pan Separation, signed -32..+32)
+            #   0x17: PPC (Pitch-Pan Centre, note 0..119)
+            #   0x18: Global Vol (0..128)
+            #   0x19: DfP (Default Pan, bit7=override, bits0-6=pan 0..64)
+            # Bug fix: pps/ppc were being read from off+26/+27 which is
+            # RandomVolVariation/RandomPanVariation — for jeff.it those bytes
+            # were 5 and 4, interpreted as PPS=5/PPC=4 caused every note above
+            # note 4 to clamp pan to 64 (full right).
+            inst.pps = struct.unpack_from('<b', blob, off+22)[0] if off+22 < len(blob) else 0
+            inst.ppc = blob[off+23] if off+23 < len(blob) else 60
+            inst.global_vol = blob[off+24] if off+24 < len(blob) else 128
+            inst.dfp = blob[off+25] if off+25 < len(blob) else 0
+            # Note→sample map (120 entries at +64)
+            n2s = [blob[off+64+n*2+1] for n in range(120)]
+            n2n = [blob[off+64+n*2+0] for n in range(120)]
+            inst.note_to_sample = n2s
+            inst.note_to_note   = n2n
+            # Volume envelope at +304
+            for env_attr, env_base in [('vol_env', off+304), ('pan_env', off+386), ('ptc_env', off+468)]:
+                if env_base + 82 > len(blob): continue
+                flg = blob[env_base]
+                num = blob[env_base+1]
+                env = ITEnvelope()
+                env.enabled        = bool(flg & 0x01) and num > 0
+                env.loop_enabled   = bool(flg & 0x02)
+                env.sustain_enabled= bool(flg & 0x04)
+                env.loop_start     = blob[env_base+2]
+                env.loop_end       = blob[env_base+3]
+                env.sus_start      = blob[env_base+4]
+                env.sus_end        = blob[env_base+5]
+                if env.enabled:
+                    for p in range(min(num, 25)):
+                        v = blob[env_base+6+p*3]
+                        t = struct.unpack_from('<H', blob, env_base+6+p*3+1)[0]
+                        env.points.append(ITEnvPoint(t, v))
+                setattr(inst, env_attr, env)
+            player.instruments.append(inst)
+    else:
+        # Old format / sample mode: create identity instruments
+        for i in range(smp_num):
+            inst = ITInstrument()
+            inst.note_to_sample = [i+1]*120
+            inst.note_to_note   = list(range(120))
+            player.instruments.append(inst)
+
+    # If not using instruments mode, create identity mapping
+    if not (flags & 0x04):  # IT_USE_INST bit
+        player.instruments = []
+        for i in range(smp_num):
+            inst = ITInstrument()
+            inst.note_to_sample = [i+1]*120
+            inst.note_to_note   = list(range(120))
+            player.instruments.append(inst)
+
+    # Load samples (metadata only — PCM data managed by existing mod_player.py)
+    import numpy as np
+    player.samples = []
+    for so in smp_offsets:
+        if not so or so+80 > len(blob) or blob[so:so+4] != b'IMPS':
+            player.samples.append(ITSample())
+            continue
+        s = ITSample()
+        # IMPS layout: +4=dos filename(12), +16=0, +17=GvL, +18=Flg, +19=Vol,
+        # +20=name(26), +46=Cvt, +47=DfP, +48=Length, +52=LoopBeg, +56=LoopEnd,
+        # +60=C5Speed, +64=SusLoopBeg, +68=SusLoopEnd, +72=SmpOffset, +76=ViS..ViT
+        s.global_vol = blob[so+17] if so+17 < len(blob) else 64   # GvL 0..64
+        flags_s      = blob[so+18]
+        s.vol        = blob[so+19]                                  # Vol 0..64
+        s.name       = blob[so+20:so+46].rstrip(b'\x00').decode('latin-1', errors='ignore')
+        cvt          = blob[so+46]
+        s.dfp        = blob[so+47] if so+47 < len(blob) else 0
+        s.length     = struct.unpack_from('<I', blob, so+48)[0]
+        s.loop_start = struct.unpack_from('<I', blob, so+52)[0]
+        s.loop_end   = struct.unpack_from('<I', blob, so+56)[0]
+        s.c5speed    = struct.unpack_from('<I', blob, so+60)[0]
+        s.sus_loop_start = struct.unpack_from('<I', blob, so+64)[0]
+        s.sus_loop_end   = struct.unpack_from('<I', blob, so+68)[0]
+        s.has_loop    = bool(flags_s & 0x10)
+        s.has_sus_loop= bool(flags_s & 0x40)
+        s.bidi_loop   = bool(flags_s & 0x08)
+        s.bidi_sus    = bool(flags_s & 0x20)
+        s.vib_speed  = blob[so+76] if so+76 < len(blob) else 0
+        s.vib_depth  = blob[so+77] if so+77 < len(blob) else 0
+        s.vib_rate   = blob[so+78] if so+78 < len(blob) else 0
+        s.vib_type   = blob[so+79] if so+79 < len(blob) else 0
+        if not s.c5speed: s.c5speed = 8363
+        player.samples.append(s)
+
+    # Decode patterns (native IT cells, not MOD conversion)
+    player.patterns = []
+    for po in pat_offsets:
+        if not po:
+            player.patterns.append(_empty_it_pattern(64, player.num_channels))
+            continue
+        length   = struct.unpack_from('<H', blob, po)[0]
+        num_rows = struct.unpack_from('<H', blob, po+2)[0]
+        data = blob[po+8:po+8+length]
+        player.patterns.append(_decode_it_pattern(data, num_rows, player.num_channels))
+
+    return player
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# S3M loader
+# ──────────────────────────────────────────────────────────────────────────────
+
+# S3M note byte: high nibble = octave (0–7), low nibble = semitone (0–11).
+# c2spd is the sample rate at S3M C-4 (byte 0x40, period 428 = MOD C-2 ref).
+# IT's c5speed is Hz at IT note 60 (C-5 = period 428 in Amiga terms).
+# Map: IT_note = oct*12 + semi + 12  (S3M oct 4 → IT note 60).
+_S3M_NOTE_OFFSET = 12
+
+def _s3m_note_to_it(note_byte):
+    """Convert raw S3M note byte to IT note number (0-based, 0=C-0)."""
+    if note_byte == 0xFF or note_byte == 0xFE:
+        return 255 if note_byte == 0xFF else 254   # no-note / note-off
+    oct_  = (note_byte >> 4) & 0x0F
+    semi  = note_byte & 0x0F
+    return max(0, min(119, oct_ * 12 + semi + _S3M_NOTE_OFFSET))
+
+# S3M command numbers (1=A, 2=B, …) map 1:1 to IT effect numbers (eff=1 is A).
+# Only special cases need adjustment; the mapping is almost fully transparent.
+def _s3m_eff_to_it(cmd, param):
+    """Return (it_eff, it_par) for an S3M (command, param) pair."""
+    if cmd == 0:
+        return 0, 0
+    # S3M C (pattern break) stores the row in BCD; IT C uses plain binary.
+    if cmd == 3:
+        par = ((param >> 4) * 10) + (param & 0xF)
+        return 3, min(par, 63)
+    # S3M A (set speed) and T (set tempo) are separate commands; IT uses the
+    # same numbering so pass through as-is (A=eff1 speed, T=eff20 tempo).
+    return cmd, param
+
+
+def load_s3m_native(filename: str) -> 'ITPlayer':
+    """Parse an S3M file and return an ITPlayer ready to run()."""
+    with open(filename, 'rb') as f:
+        blob = f.read()
+
+    if len(blob) < 96 or blob[28] != 0x1A or blob[44:48] != b'SCRM':
+        raise ValueError("Not an S3M file")
+
+    player = ITPlayer()
+    player.linear_freq = False   # S3M uses Amiga-style log slides
+
+    title = blob[0:28].rstrip(b'\x00').decode('latin-1', errors='ignore')
+
+    ord_num  = struct.unpack_from('<H', blob, 32)[0]
+    ins_num  = struct.unpack_from('<H', blob, 34)[0]
+    pat_num  = struct.unpack_from('<H', blob, 36)[0]
+
+    player.global_volume = blob[48]
+    player.initial_speed = max(1, blob[49])
+    player.initial_tempo = max(32, blob[50])
+    player.run_gv        = player.global_volume
+
+    ffi = blob[0x2A]
+    samples_unsigned = (ffi != 1)
+
+    channel_settings = list(blob[64:96])
+
+    # Count active channels and build pan map
+    active_chans = []
+    for i, cs in enumerate(channel_settings):
+        if cs < 16:
+            active_chans.append(i)
+    player.num_channels = max(4, len(active_chans))
+
+    # S3M channel pan: bits 3-0 of channel_settings encode L/R.
+    # Values 0-7 = left channels, 8-15 = right channels, ≥16 = disabled.
+    player.channel_pan = []
+    player.channel_vol = []
+    for i in range(player.num_channels):
+        cs = channel_settings[i] if i < 32 else 0x08
+        if cs < 8:      # left
+            player.channel_pan.append(0)
+        elif cs < 16:   # right
+            player.channel_pan.append(64)
+        else:
+            player.channel_pan.append(32)
+        player.channel_vol.append(64)
+
+    # Orders
+    cur = 96
+    orders_raw = list(blob[cur:cur+ord_num]); cur += ord_num
+    player.orders = [o for o in orders_raw if o < 254]  # drop skip(254)/end(255)
+
+    ins_paras = list(struct.unpack_from(f'<{ins_num}H', blob, cur)); cur += 2*ins_num
+    pat_paras = list(struct.unpack_from(f'<{pat_num}H', blob, cur)); cur += 2*pat_num
+
+    # Load samples → ITSample + identity ITInstrument
+    import numpy as np
+    player.samples     = []
+    player.instruments = []
+    for i, para in enumerate(ins_paras):
+        smp  = ITSample()
+        inst = ITInstrument()
+        inst.note_to_sample = [i+1]*120
+        inst.note_to_note   = list(range(120))
+
+        if para:
+            off = para * 16
+            if off + 80 <= len(blob) and blob[off] == 1:  # type 1 = PCM sample
+                memseg_hi = blob[off+13]
+                memseg    = struct.unpack_from('<H', blob, off+14)[0]
+                samp_off  = ((memseg_hi << 16) | memseg) * 16
+                smp.length     = struct.unpack_from('<I', blob, off+16)[0]
+                loop_beg       = struct.unpack_from('<I', blob, off+20)[0]
+                loop_end       = struct.unpack_from('<I', blob, off+24)[0]
+                smp.vol        = blob[off+28]
+                smp.global_vol = 64
+                flags          = blob[off+31]
+                c2spd          = struct.unpack_from('<I', blob, off+32)[0]
+                smp.c5speed    = c2spd if c2spd else 8363
+                smp.name       = blob[off+48:off+76].rstrip(b'\x00').decode('latin-1', errors='ignore')
+                if flags & 1:
+                    smp.has_loop   = True
+                    smp.loop_start = loop_beg
+                    smp.loop_end   = loop_end
+                if flags & 4:
+                    smp.bidi_loop  = True
+        player.samples.append(smp)
+        player.instruments.append(inst)
+
+    # Decode patterns
+    player.patterns = []
+    for para in pat_paras:
+        if not para:
+            player.patterns.append(_empty_it_pattern(64, player.num_channels))
+            continue
+        off = para * 16
+        if off + 2 > len(blob):
+            player.patterns.append(_empty_it_pattern(64, player.num_channels))
+            continue
+        plen = struct.unpack_from('<H', blob, off)[0]
+        data = blob[off+2 : off+2+plen]
+        player.patterns.append(_decode_s3m_pattern(data, 64, player.num_channels))
+
+    return player
+
+
+def _decode_s3m_pattern(data, num_rows, num_chans):
+    """Decode S3M packed pattern into list[row][ch] of ITCell."""
+    rows = _empty_it_pattern(num_rows, num_chans)
+    pos = 0; row = 0
+    n = len(data)
+    while row < num_rows and pos < n:
+        what = data[pos]; pos += 1
+        if what == 0:
+            row += 1
+            continue
+        ch = what & 31
+        cell = ITCell()
+        if what & 32:  # note + instrument
+            if pos + 1 >= n: break
+            nb   = data[pos]; pos += 1
+            inst = data[pos]; pos += 1
+            if nb < 0xF0:   # real note
+                cell.note     = _s3m_note_to_it(nb)
+                cell.has_note = True
+            elif nb == 0xFE:
+                cell.note = 254; cell.has_note = True   # note-cut
+            elif nb == 0xFF:
+                pass                                     # no note
+            if inst:
+                cell.inst = inst; cell.has_inst = True
+        if what & 64:  # volume
+            if pos >= n: break
+            vol = data[pos]; pos += 1
+            if vol <= 64:
+                cell.vol = vol; cell.has_vol = True
+        if what & 128:  # effect
+            if pos + 1 >= n: break
+            cmd  = data[pos]; pos += 1
+            par  = data[pos]; pos += 1
+            eff, epar = _s3m_eff_to_it(cmd, par)
+            if eff:
+                cell.eff = eff; cell.par = epar; cell.has_eff = True
+        if ch < num_chans:
+            rows[row][ch] = cell
+    return rows
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MOD loader
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ProTracker period table (C-0 .. B-3), no finetune.  Index = note 0..47.
+# In MOD, C-2 (index 24) = "natural" pitch, mapping to IT C-5 (note 60).
+# Offset = 60 - 24 = 36.
+_MOD_AMIGA_PERIODS = [
+    1712,1616,1525,1440,1357,1281,1209,1141,1077,1017, 961, 907,
+     856, 808, 763, 720, 678, 640, 604, 570, 538, 508, 480, 453,
+     428, 404, 381, 360, 339, 320, 302, 285, 269, 254, 240, 226,
+     214, 202, 190, 180, 170, 160, 151, 143, 135, 127, 120, 113,
+]
+_MOD_NOTE_OFFSET = 36   # IT_note = MOD_period_index + 36
+
+# c4speeds[finetune] — effective C-5 playback rate per finetune nibble.
+_MOD_C4SPEEDS = [8363,8413,8463,8529,8581,8651,8723,8757,
+                 7895,7941,7985,8046,8107,8169,8232,8280]
+
+def _mod_period_to_it_note(period: int, finetune: int) -> int:
+    """Convert a raw MOD period to an IT note number (0-based).
+    Finds the closest entry in the finetune-adjusted period table."""
+    if period <= 0:
+        return 0
+    ft = finetune & 0xF
+    c5 = _MOD_C4SPEEDS[ft]
+    # period_for_note = _MOD_AMIGA_PERIODS[i] * 8363 / c5
+    best_note = 0; best_err = 1 << 30
+    for i, p0 in enumerate(_MOD_AMIGA_PERIODS):
+        adj = int(p0 * 8363 / c5)
+        err = abs(adj - period)
+        if err < best_err:
+            best_err = err; best_note = i
+    return best_note + _MOD_NOTE_OFFSET   # → IT note 36..83
+
+def _mod_eff_to_it(eff, par):
+    """Convert MOD (eff_nibble, param) to (it_eff, it_par).
+    Returns (0, 0) if no IT equivalent."""
+    if eff == 0x0:
+        return (10, par) if par else (0, 0)   # J Arpeggio (skip if par==0)
+    elif eff == 0x1: return (6,  par)          # F Porta up
+    elif eff == 0x2: return (5,  par)          # E Porta down
+    elif eff == 0x3: return (7,  par)          # G Tone porta
+    elif eff == 0x4: return (8,  par)          # H Vibrato
+    elif eff == 0x5: return (12, par)          # L Tone porta + vol slide
+    elif eff == 0x6: return (11, par)          # K Vibrato + vol slide
+    elif eff == 0x7: return (18, par)          # R Tremolo
+    elif eff == 0x8:                           # Set pan → X (0-255 → 0-64)
+        return (24, max(0, min(64, par >> 2)))
+    elif eff == 0x9: return (15, par)          # O Sample offset
+    elif eff == 0xA: return (4,  par)          # D Vol slide
+    elif eff == 0xB: return (2,  par)          # B Jump to order
+    elif eff == 0xC: return (0,  0)            # Set vol — handled as vol column
+    elif eff == 0xD:                           # Pattern break (BCD in MOD)
+        row = ((par >> 4) * 10) + (par & 0xF)
+        return (3, min(row, 63))
+    elif eff == 0xE:                           # Extended effects
+        sub = (par >> 4) & 0xF
+        val = par & 0xF
+        if sub == 0x1: return (6,  0xF0 | val)   # Fine porta up
+        elif sub == 0x2: return (5,  0xF0 | val)  # Fine porta down
+        elif sub == 0x9: return (17, 0x00 | val)  # Retrig (Q0x)
+        elif sub == 0xA: return (4,  0xF0 | val)  # Fine vol up
+        elif sub == 0xB: return (4,  (val << 4) | 0xF)  # Fine vol down
+        elif sub == 0xC: return (19, 0xC0 | val)  # S Cut note (SCx)
+        elif sub == 0xD: return (19, 0xD0 | val)  # S Note delay (SDx)
+        elif sub == 0x6: return (19, 0x60 | val)  # S Pattern loop (S6x)
+        return (0, 0)
+    elif eff == 0xF:
+        if par == 0:   return (0,  0)
+        elif par < 32: return (1,  par)   # A Set speed
+        else:          return (20, par)   # T Set tempo
+    return (0, 0)
+
+
+def load_mod_native(filename: str) -> 'ITPlayer':
+    """Parse a MOD file and return an ITPlayer ready to run()."""
+    with open(filename, 'rb') as f:
+        blob = f.read()
+
+    if len(blob) < 1084:
+        raise ValueError("File too short for MOD")
+
+    player = ITPlayer()
+    player.linear_freq = False   # MOD uses Amiga log slides
+
+    # Determine channel count from signature at offset 1080
+    sig = blob[1080:1084]
+    if sig in (b'M.K.', b'M!K!', b'M&K!', b'N.T.', b'FLT4', b'4CHN'):
+        num_ch = 4
+    elif sig in (b'FLT8', b'OCTA', b'CD81', b'OKTA'):
+        num_ch = 8
+    elif sig[1:4] == b'CHN' and sig[0:1].isdigit():
+        num_ch = int(sig[0:1])
+    elif sig[2:4] in (b'CH', b'CN') and sig[0:2].isdigit():
+        num_ch = int(sig[0:2])
+    elif sig[:3] == b'TDZ' and sig[3:4].isdigit():
+        num_ch = int(sig[3:4])
+    else:
+        num_ch = 4
+    player.num_channels = num_ch
+
+    # Standard MOD 4-channel LRRL pan layout (0=L, 64=R, 32=C)
+    _pan4 = [0, 64, 64, 0]
+    player.channel_pan = [_pan4[i % 4] for i in range(num_ch)]
+    player.channel_vol = [64] * num_ch
+
+    # Read 31-sample headers
+    import numpy as np
+    samples_meta = []
+    cur = 20
+    for i in range(31):
+        sname  = blob[cur:cur+22].rstrip(b'\x00').decode('latin-1', errors='ignore')
+        slen   = struct.unpack_from('>H', blob, cur+22)[0] * 2
+        ft_raw = blob[cur+24] & 0x0F
+        finetune = ft_raw if ft_raw <= 7 else ft_raw - 16
+        vol    = blob[cur+25]
+        rpt    = struct.unpack_from('>H', blob, cur+26)[0] * 2
+        rlen   = struct.unpack_from('>H', blob, cur+28)[0] * 2
+        if rlen <= 2: rlen = 0
+        samples_meta.append({'name': sname, 'length': slen, 'finetune': ft_raw,
+                              'volume': vol, 'repeat_point': rpt, 'repeat_length': rlen})
+        cur += 30
+
+    song_length = blob[cur]; cur += 1
+    cur += 1   # restart byte
+    orders_raw = list(blob[cur:cur+128]); cur += 128
+    player.orders = orders_raw[:song_length]
+    num_patterns = max(player.orders) + 1
+
+    cur += 4   # skip signature
+
+    # Build patterns
+    player.patterns = []
+    for _ in range(num_patterns):
+        rows = _empty_it_pattern(64, num_ch)
+        for row in range(64):
+            for ch in range(num_ch):
+                if cur + 4 > len(blob): break
+                word = struct.unpack_from('>I', blob, cur)[0]; cur += 4
+                snum   = ((word >> 24) & 0xF0) | ((word >> 12) & 0x0F)
+                period = (word >> 16) & 0x0FFF
+                eff    = (word >> 8)  & 0x0F
+                par    = word & 0xFF
+
+                cell = ITCell()
+                if period:
+                    # Determine note from period using this sample's finetune
+                    ft = samples_meta[snum - 1]['finetune'] if 1 <= snum <= 31 else 0
+                    it_note = _mod_period_to_it_note(period, ft)
+                    cell.note = it_note; cell.has_note = True
+                if snum:
+                    cell.inst = snum; cell.has_inst = True
+                if eff == 0xC:   # Set volume → volume column
+                    cell.vol = min(64, par); cell.has_vol = True
+                else:
+                    it_eff, it_par = _mod_eff_to_it(eff, par)
+                    if it_eff:
+                        cell.eff = it_eff; cell.par = it_par; cell.has_eff = True
+                rows[row][ch] = cell
+        player.patterns.append(rows)
+
+    # Scan first pattern for initial speed/tempo (MOD Fxx in row 0)
+    player.initial_speed = 6
+    player.initial_tempo = 125
+    if player.orders and num_patterns > 0:
+        p0 = player.patterns[player.orders[0]]
+        for row in p0[:8]:
+            for cell in row:
+                if cell.has_eff and cell.eff == 1 and cell.par:   # A = speed
+                    player.initial_speed = cell.par
+                elif cell.has_eff and cell.eff == 20 and cell.par: # T = tempo
+                    player.initial_tempo = cell.par
+
+    # Load sample PCM data and build ITSample + identity ITInstrument
+    player.samples     = []
+    player.instruments = []
+    for i, sm in enumerate(samples_meta):
+        smp  = ITSample()
+        inst = ITInstrument()
+        inst.note_to_sample = [i+1]*120
+        inst.note_to_note   = list(range(120))
+        smp.c5speed    = _MOD_C4SPEEDS[sm['finetune'] & 0xF]
+        smp.vol        = sm['volume']
+        smp.global_vol = 64
+        smp.name       = sm['name']
+        smp.length     = sm['length']
+        if sm['repeat_length'] > 0:
+            smp.has_loop   = True
+            smp.loop_start = sm['repeat_point']
+            smp.loop_end   = sm['repeat_point'] + sm['repeat_length']
+        if sm['length'] > 0 and cur + sm['length'] <= len(blob):
+            cur += sm['length']   # skip raw PCM (not used by mikit_engine)
+        player.samples.append(smp)
+        player.instruments.append(inst)
+
+    return player
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# XM loader
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _xm_volcol_to_it(vcol):
+    """Map XM volume-column byte to IT volume-column byte (255 = empty)."""
+    if vcol == 0:          return 255
+    if 16 <= vcol <= 80:   return vcol - 16            # set vol 0-64
+    if 96 <= vcol <= 111:  return 75 + (vcol - 96)     # vol slide down
+    if 112 <= vcol <= 127: return 65 + (vcol - 112)    # vol slide up
+    if 128 <= vcol <= 143: return 95 + (vcol - 128)    # fine vol down
+    if 144 <= vcol <= 159: return 85 + (vcol - 144)    # fine vol up
+    if 160 <= vcol <= 175: return 115 + (vcol - 160)   # vibrato speed
+    if 176 <= vcol <= 191: return 105 + (vcol - 176)   # vibrato depth
+    if 192 <= vcol <= 207: return 128 + (vcol - 192) * 4  # set pan → IT 128-192
+    if 240 <= vcol <= 255: return 193 + (vcol - 240)   # tone porta speed
+    return 255
+
+def _xm_eff_to_it(eff, par):
+    """Map XM (effect_byte, param) to (it_eff, it_par)."""
+    if eff == 0:    return (10, par) if par else (0, 0)   # arpeggio
+    elif eff == 1:  return (6,  par)     # porta up
+    elif eff == 2:  return (5,  par)     # porta down
+    elif eff == 3:  return (7,  par)     # tone porta
+    elif eff == 4:  return (27, par)     # XM vibrato (raw depth)
+    elif eff == 5:  return (12, par)     # tone porta + vol slide
+    elif eff == 6:  return (11, par)     # vibrato + vol slide (uses stored vibdpt)
+    elif eff == 7:  return (18, par)     # tremolo
+    elif eff == 8:  return (24, min(64, par >> 2))   # set pan (0-255 → 0-64)
+    elif eff == 9:  return (15, par)     # sample offset
+    elif eff == 10: return (4,  par)     # vol slide
+    elif eff == 11: return (2,  par)     # jump to order
+    elif eff == 12: return (0,  0)       # set vol — handled as vol column
+    elif eff == 13:                      # pattern break (BCD param)
+        row = ((par >> 4) * 10) + (par & 0xF)
+        return (3, min(row, 63))
+    elif eff == 14:                      # extended Exx
+        sub = (par >> 4) & 0xF; val = par & 0xF
+        if sub == 0x1: return (6,  0xF0 | val)
+        elif sub == 0x2: return (5, 0xF0 | val)
+        elif sub == 0x6: return (19, 0x60 | val)
+        elif sub == 0x9: return (17, val)
+        elif sub == 0xA: return (4,  0xF0 | val)
+        elif sub == 0xB: return (4,  (val << 4) | 0xF)
+        elif sub == 0xC: return (19, 0xC0 | val)
+        elif sub == 0xD: return (19, 0xD0 | val)
+        return (0, 0)
+    elif eff == 15:                      # set speed / BPM
+        if par == 0:    return (0, 0)
+        elif par < 32:  return (1, par)
+        else:           return (20, par)
+    elif eff == 16: return (22, min(128, par * 2))   # G set global vol (XM 0-64 → IT 0-128)
+    elif eff == 17: return (23, par)     # H global vol slide
+    elif eff == 20: return (0,  0)       # K key-off (handled as note=255 in pattern decoder)
+    elif eff == 21: return (0,  0)       # L set envelope pos — skip
+    elif eff == 23: return (16, par)     # P pan slide
+    elif eff == 25: return (17, par)     # R multi-retrig
+    elif eff == 27: return (9,  par)     # T tremor
+    elif eff == 30:                      # X extra-fine porta
+        sub = (par >> 4) & 0xF; val = par & 0xF
+        if sub == 1: return (6, 0xE0 | val)
+        elif sub == 2: return (5, 0xE0 | val)
+        return (0, 0)
+    return (0, 0)
+
+
+def _decode_xm_pattern_to_it(blob, start, pack_size, num_rows, num_chans):
+    """Decode XM packed pattern data into list[row][ch] of ITCell."""
+    rows = _empty_it_pattern(max(1, min(num_rows, 256)), num_chans)
+    cur = start
+    end = start + pack_size
+    for row in range(min(num_rows, 256)):
+        for ch in range(num_chans):
+            if cur >= end:
+                break
+            b = blob[cur]; cur += 1
+            note = inst = vcol = eff = par = 0
+            if b & 0x80:   # packed cell
+                if b & 0x01:
+                    if cur >= end: break
+                    note = blob[cur]; cur += 1
+                if b & 0x02:
+                    if cur >= end: break
+                    inst = blob[cur]; cur += 1
+                if b & 0x04:
+                    if cur >= end: break
+                    vcol = blob[cur]; cur += 1
+                if b & 0x08:
+                    if cur >= end: break
+                    eff = blob[cur]; cur += 1
+                if b & 0x10:
+                    if cur >= end: break
+                    par = blob[cur]; cur += 1
+            else:           # full 5-byte cell
+                note = b
+                if cur + 3 >= end: break
+                inst = blob[cur]; cur += 1
+                vcol = blob[cur]; cur += 1
+                eff  = blob[cur]; cur += 1
+                par  = blob[cur]; cur += 1
+
+            cell = ITCell()
+            if note == 97:          # key-off note
+                cell.note = 255; cell.has_note = True
+            elif 1 <= note <= 96:
+                cell.note = note - 1; cell.has_note = True  # XM 1-based → IT 0-based
+            if inst:
+                cell.inst = inst; cell.has_inst = True
+            if vcol:
+                iv = _xm_volcol_to_it(vcol)
+                if iv != 255:
+                    cell.vol = iv; cell.has_vol = True
+            # XM effect C = set volume → vol column
+            if eff == 12:
+                cell.vol = min(64, par); cell.has_vol = True
+            # XM effect K = key-off at tick par (K00 → immediate note-off)
+            elif eff == 20:
+                if par == 0:
+                    cell.note = 255; cell.has_note = True
+                else:
+                    # Delayed key-off: fire at tick par (stored as eff=26 = XM K delayed)
+                    cell.eff = 26; cell.par = par; cell.has_eff = True
+            elif eff:
+                it_eff, it_par = _xm_eff_to_it(eff, par)
+                if it_eff:
+                    cell.eff = it_eff; cell.par = it_par; cell.has_eff = True
+            if ch < num_chans:
+                rows[row][ch] = cell
+    return rows
+
+
+def load_xm_native(filename: str) -> 'ITPlayer':
+    """Parse an XM file and return an ITPlayer ready to run()."""
+    with open(filename, 'rb') as f:
+        blob = f.read()
+    if blob[:17] != b'Extended Module: ':
+        raise ValueError("Not an XM file")
+
+    player = ITPlayer()
+    # XM song title at offset 17 (20 bytes, null/space-padded). Mirrors XMFile.
+    player.title = blob[17:17+20].rstrip(b'\x00 \r\n').decode('latin-1', errors='ignore')
+
+    hdr_size      = struct.unpack_from('<I', blob, 60)[0]
+    song_len      = struct.unpack_from('<H', blob, 64)[0]
+    player.num_channels   = struct.unpack_from('<H', blob, 68)[0]
+    num_patterns  = struct.unpack_from('<H', blob, 70)[0]
+    num_insts     = struct.unpack_from('<H', blob, 72)[0]
+    flags         = struct.unpack_from('<H', blob, 74)[0]
+    player.linear_freq    = bool(flags & 1)
+    player.initial_speed  = max(1, struct.unpack_from('<H', blob, 76)[0])
+    player.initial_tempo  = max(32, struct.unpack_from('<H', blob, 78)[0])
+
+    order_table = list(blob[80:80 + song_len])
+    player.orders = [b for b in order_table if b < num_patterns]
+    if not player.orders:
+        player.orders = [0]
+
+    # XM channel panning: standard LRRL per group of 4
+    _pan4 = [0, 64, 64, 0]
+    player.channel_pan = [_pan4[i % 4] for i in range(player.num_channels)]
+    player.channel_vol = [64] * player.num_channels
+
+    # ── Patterns ──────────────────────────────────────────────────────────────
+    cur = 60 + hdr_size
+    player.patterns = []
+    for _ in range(num_patterns):
+        ph_size   = struct.unpack_from('<I', blob, cur)[0]
+        num_rows  = struct.unpack_from('<H', blob, cur + 5)[0]
+        pack_size = struct.unpack_from('<H', blob, cur + 7)[0]
+        pat_start = cur + ph_size
+        player.patterns.append(
+            _decode_xm_pattern_to_it(blob, pat_start, pack_size, num_rows, player.num_channels))
+        cur = pat_start + pack_size
+
+    # ── Instruments + Samples ─────────────────────────────────────────────────
+    global_smp_idx = 0
+    player.samples     = []
+    player.instruments = []
+
+    for inst_i in range(num_insts):
+        inst_size = struct.unpack_from('<I', blob, cur)[0]
+        if inst_size == 0: inst_size = 29
+        inst_name = blob[cur+4:cur+26].rstrip(b'\x00 \r\n').decode('latin-1', errors='ignore')
+        num_smp_in_inst = struct.unpack_from('<H', blob, cur+27)[0] if cur+29 <= len(blob) else 0
+
+        inst = ITInstrument()
+        inst.name = inst_name
+        inst.nna  = 0   # XM: cut on new note (no NNA)
+
+        if num_smp_in_inst == 0:
+            # Empty instrument — identity note mapping, no samples
+            inst.note_to_sample = [0] * 120
+            inst.note_to_note   = list(range(120))
+            player.instruments.append(inst)
+            cur += inst_size
+            continue
+
+        # Note-to-sample map: 96 entries at cur+33 (0-based within this instrument)
+        xm_n2s = list(blob[cur+33:cur+33+96]) if cur+129 <= len(blob) else [0]*96
+
+        # Volume envelope
+        vol_env = ITEnvelope()
+        if cur + 241 <= len(blob):
+            vol_type     = blob[cur+233]
+            fadeout_raw  = struct.unpack_from('<H', blob, cur+239)[0]
+            if vol_type & 0x01:
+                n_pts = min(blob[cur+225], 12)
+                vol_env.enabled          = True
+                vol_env.sustain_enabled  = bool(vol_type & 0x02)
+                vol_env.loop_enabled     = bool(vol_type & 0x04)
+                vol_env.sus_start        = blob[cur+227]
+                vol_env.sus_end          = blob[cur+227]
+                vol_env.loop_start       = blob[cur+228]
+                vol_env.loop_end         = blob[cur+229]
+                for p in range(n_pts):
+                    x = struct.unpack_from('<H', blob, cur+129+p*4)[0]
+                    y = struct.unpack_from('<H', blob, cur+131+p*4)[0]
+                    vol_env.points.append(ITEnvPoint(x, min(y, 64)))
+        else:
+            fadeout_raw = 0
+        inst.vol_env = vol_env
+
+        # Panning envelope
+        pan_env = ITEnvelope()
+        if cur + 241 <= len(blob):
+            pan_type = blob[cur+234]
+            if pan_type & 0x01:
+                n_pts = min(blob[cur+226], 12)
+                pan_env.enabled         = True
+                pan_env.sustain_enabled = bool(pan_type & 0x02)
+                pan_env.loop_enabled    = bool(pan_type & 0x04)
+                pan_env.sus_start       = blob[cur+230]
+                pan_env.sus_end         = blob[cur+230]
+                pan_env.loop_start      = blob[cur+231]
+                pan_env.loop_end        = blob[cur+232]
+                for p in range(n_pts):
+                    x = struct.unpack_from('<H', blob, cur+177+p*4)[0]
+                    y = struct.unpack_from('<H', blob, cur+179+p*4)[0]
+                    # XM pan env values are 0-64 (center=32); store as-is for now
+                    pan_env.points.append(ITEnvPoint(x, min(y, 64)))
+        inst.pan_env = pan_env
+
+        # Fadeout: XM 0..0xFFF per tick; IT nfc starts at 1024, so scale by /64.
+        # When no vol env and fadeout=0, XM holds notes indefinitely after key-off
+        # (NNA=cut handles eventual release); set a minimal non-zero fadeout so
+        # envelope-done voices still decay naturally.
+        if vol_env.enabled:
+            inst.fadeout = max(1, fadeout_raw >> 6)
+        else:
+            # No vol env: key-off has no effect; voice held until next note on channel.
+            inst.fadeout = 1   # negligible; NNA=cut ends it on next trigger
+
+        inst.global_vol = 128
+
+        # Sample headers + data
+        samp_hdr_size = struct.unpack_from('<I', blob, cur+29)[0]
+        sh_base = cur + inst_size
+        samp_meta = []
+        for s_i in range(num_smp_in_inst):
+            sh = sh_base + s_i * samp_hdr_size
+            if sh + 40 > len(blob): break
+            length   = struct.unpack_from('<I', blob, sh)[0]
+            loop_st  = struct.unpack_from('<I', blob, sh+4)[0]
+            loop_len = struct.unpack_from('<I', blob, sh+8)[0]
+            vol      = blob[sh+12]
+            ftune    = struct.unpack('b', bytes([blob[sh+13]]))[0]   # signed -128..127
+            stype    = blob[sh+14]
+            pan      = blob[sh+15]   # 0-255, center=128
+            rel_note = struct.unpack('b', bytes([blob[sh+16]]))[0]   # signed semitones
+            sname    = blob[sh+18:sh+40].rstrip(b'\x00 \r\n').decode('latin-1', errors='ignore')
+            samp_meta.append({'length': length, 'loop_st': loop_st, 'loop_len': loop_len,
+                               'vol': vol, 'ftune': ftune, 'stype': stype, 'pan': pan,
+                               'rel_note': rel_note, 'name': sname})
+
+        data_cur = sh_base + num_smp_in_inst * samp_hdr_size
+        inst_smp_globals = []   # 1-based global sample indices for this instrument
+        for sm in samp_meta:
+            data_cur += sm['length']   # skip raw PCM (VQ encoder reads from XMFile)
+            smp = ITSample()
+            smp.name = sm['name'] or inst_name
+            smp.vol  = min(sm['vol'], 64)
+            smp.global_vol = 64
+            # c5speed from finetune only; rel_note goes into note_to_note[]
+            # ftune is ±128 per semitone → cents = ftune/128 * 100
+            # XM reference rate is at C-4 (IT note 48); IT reference is C-5 (IT note 60).
+            # C-5 = C-4 * 2, so multiply by 2 to shift reference up one octave.
+            smp.c5speed = max(256, int(16726.0 * (2.0 ** (sm['ftune'] / (128.0 * 12.0)))))
+            # Loop (byte offsets → sample offsets)
+            bps = 2 if (sm['stype'] & 0x10) else 1
+            smp.length = sm['length'] // bps
+            loop_type  = sm['stype'] & 0x03
+            if loop_type:
+                smp.has_loop   = True
+                smp.loop_start = sm['loop_st'] // bps
+                smp.loop_end   = (sm['loop_st'] + sm['loop_len']) // bps
+                smp.bidi_loop  = (loop_type == 2)
+            # XM samples always have a panning byte; apply it (bit7=override).
+            # pan 0-255 → IT 0-64, center=128→32
+            smp.dfp = 0x80 | min(64, sm['pan'] >> 2)
+            player.samples.append(smp)
+            inst_smp_globals.append(global_smp_idx + 1)  # 1-based
+            global_smp_idx += 1
+
+        # Build note_to_sample and note_to_note from XM note-to-sample map
+        # XM notes are 0-based here (decoded from 96-entry table)
+        for it_note in range(120):
+            xm_idx = min(it_note, 95)   # clamp; XM only has 96 entries
+            s_idx = xm_n2s[xm_idx] if xm_idx < len(xm_n2s) else 0
+            if s_idx < len(samp_meta) and s_idx < len(inst_smp_globals):
+                inst.note_to_sample[it_note] = inst_smp_globals[s_idx]
+                # rel_note transposes the pitch without changing the note column value
+                rn = samp_meta[s_idx]['rel_note']
+                inst.note_to_note[it_note] = max(0, min(119, it_note + rn))
+            else:
+                inst.note_to_sample[it_note] = 0
+                inst.note_to_note[it_note]   = it_note
+
+        player.instruments.append(inst)
+        cur = data_cur
+
+    return player
+
+
+def _empty_it_pattern(num_rows, num_chans):
+    return [[ITCell() for _ in range(num_chans)] for _ in range(num_rows)]
+
+
+def _decode_it_pattern(data, num_rows, num_chans):
+    """Decode IT compressed pattern into list[row][ch] of ITCell."""
+    rows = _empty_it_pattern(num_rows, num_chans)
+    last_mask = [0]*64
+    last_note = [0]*64
+    last_inst = [0]*64
+    last_vol  = [0xFF]*64
+    last_eff  = [0]*64
+    last_par  = [0]*64
+    # IT effect memory
+    last_D = [0]*64; last_E = [0]*64; last_F = [0]*64; last_G = [0]*64
+    n = len(data); cur = 0; row = 0
+    while row < num_rows and cur < n:
+        chvar = data[cur]; cur += 1
+        if chvar == 0:
+            row += 1
+            continue
+        ch = (chvar - 1) & 0x3F
+        if chvar & 0x80:
+            if cur >= n: break
+            mask = data[cur]; cur += 1
+            last_mask[ch] = mask
+        else:
+            mask = last_mask[ch]
+        note = inst = vol = eff = par = 0
+        has_note = has_inst = has_vol = has_eff = False
+        if mask & 0x01:
+            note = data[cur]; cur += 1
+            last_note[ch] = note
+            has_note = True
+        if mask & 0x02:
+            inst = data[cur]; cur += 1
+            last_inst[ch] = inst
+            has_inst = True
+        if mask & 0x04:
+            vol = data[cur]; cur += 1
+            last_vol[ch] = vol
+            has_vol = True
+        if mask & 0x08:
+            eff = data[cur]; par = data[cur+1]; cur += 2
+            last_eff[ch] = eff; last_par[ch] = par
+            has_eff = True
+        if mask & 0x10:
+            note = last_note[ch]; has_note = True
+        if mask & 0x20:
+            inst = last_inst[ch]
+            # Don't set has_inst for inherited — no envelope/vol reset
+        if mask & 0x40:
+            vol = last_vol[ch]; has_vol = True
+        if mask & 0x80:
+            eff = last_eff[ch]; par = last_par[ch]; has_eff = True
+
+        if ch >= num_chans:
+            continue
+
+        # IT effect memory (D/E/F/G with par=0 → reuse last)
+        if has_eff:
+            if eff == 4 and par == 0 and last_D[ch]: par = last_D[ch]
+            elif eff == 5 and par == 0 and last_E[ch]: par = last_E[ch]
+            elif eff == 6 and par == 0 and last_F[ch]: par = last_F[ch]
+            elif eff == 7 and par == 0 and last_G[ch]: par = last_G[ch]
+            if par:
+                if eff == 4: last_D[ch] = par
+                elif eff == 5: last_E[ch] = par
+                elif eff == 6: last_F[ch] = par
+                elif eff == 7: last_G[ch] = par
+
+        cell = ITCell(
+            note=note, inst=inst, vol=vol, eff=eff, par=par,
+            has_note=has_note, has_inst=has_inst, has_vol=has_vol, has_eff=has_eff,
+        )
+        rows[row][ch] = cell
+
+    return rows
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Timeline → GLSL encoder
+# ──────────────────────────────────────────────────────────────────────────────
+
+def encode_timeline_glsl(segments: List[VoiceSegment], ticks_per_sec: float) -> dict:
+    """
+    Convert voice segments to compact GLSL-ready arrays.
+
+    Returns a dict with keys:
+        num_segs         int
+        seg_start_tick   list[int]
+        seg_end_tick     list[int]
+        seg_sample       list[int]   (0-based)
+        seg_loop_start   list[int]
+        seg_loop_end     list[int]
+        seg_loop_type    list[int]
+        seg_freq         list[float] per segment start freq in Hz
+        seg_vol          list[float] per segment start vol 0-1
+        seg_pan          list[float] per segment start pan 0-1
+        seg_samp_pos     list[int]   sample position at start_tick
+        seg_freq_mul     list[float] per-tick freq multiplier (1.0 = constant)
+        seg_vol_delta    list[float] per-tick vol delta (0.0 = constant)
+    """
+    out = {
+        'num_segs': 0,
+        'seg_start_tick': [], 'seg_end_tick': [],
+        'seg_sample': [],
+        'seg_loop_start': [], 'seg_loop_end': [], 'seg_loop_type': [],
+        'seg_freq': [], 'seg_vol': [], 'seg_pan': [],
+        'seg_samp_pos': [],
+        'seg_freq_mul': [], 'seg_vol_delta': [],
+    }
+
+    for seg in segments:
+        if not seg.tick_states:
+            continue
+
+        t0, f0, _, p0, pos0 = seg.tick_states[0]
+
+        # Peak volume: XM envelopes start at 0 (attack) and end at 0 (release), so
+        # first/last give delta=0 → silence.  Use max volume as the baseline; vol_delta
+        # is then the per-tick decay rate from peak to final.  Attack ramp is collapsed
+        # to instant (cosmetically acceptable; the ramp is usually very short).
+        v_peak = max(s[2] for s in seg.tick_states)
+
+        freq_mul = 1.0
+        vol_delta = 0.0
+        if len(seg.tick_states) > 1:
+            t_last, f_last, v_last, _, _ = seg.tick_states[-1]
+            dt = t_last - t0
+            if dt > 0 and f0 > 0:
+                freq_mul = (f_last / f0) ** (1.0 / dt)
+            if dt > 0:
+                vol_delta = (v_last - v_peak) / dt
+
+        end_tick = seg.end_tick if seg.end_tick >= 0 else (
+            seg.tick_states[-1][0] + 1 if seg.tick_states else seg.start_tick + 1
+        )
+
+        out['seg_start_tick'].append(seg.start_tick)
+        out['seg_end_tick'].append(end_tick)
+        out['seg_sample'].append(seg.sample_idx)
+        out['seg_loop_start'].append(seg.loop_start)
+        out['seg_loop_end'].append(seg.loop_end)
+        out['seg_loop_type'].append(seg.loop_type)
+        out['seg_freq'].append(f0)
+        out['seg_vol'].append(v_peak)
+        out['seg_pan'].append(p0)
+        out['seg_samp_pos'].append(pos0)
+        out['seg_freq_mul'].append(freq_mul)
+        out['seg_vol_delta'].append(vol_delta)
+
+    out['num_segs'] = len(out['seg_start_tick'])
+    return out
+
+
+def timeline_to_glsl_arrays(tl: dict, ticks_per_sec: float) -> str:
+    """
+    Emit GLSL const array declarations from a timeline dict.
+    Returns a GLSL string fragment to inject into the Common tab.
+    """
+    n = tl['num_segs']
+    if n == 0:
+        return "// timeline: no segments\nconst int TL_NUM_SEGS = 0;\n"
+
+    def _ints(arr, name):
+        vals = ', '.join(str(int(x)) for x in arr)
+        return f"const int {name}[{n}] = int[]({vals});\n"
+
+    def _floats(arr, name, scale=1.0):
+        vals = ', '.join(f"{float(x)*scale:.6f}" for x in arr)
+        return f"const float {name}[{n}] = float[]({vals});\n"
+
+    lines = [f"const int TL_NUM_SEGS = {n};\n"]
+    lines.append(f"const float TL_TICKS_PER_SEC = {ticks_per_sec:.4f};\n")
+    lines.append(_ints(tl['seg_start_tick'],  'tlSegStart'))
+    lines.append(_ints(tl['seg_end_tick'],    'tlSegEnd'))
+    lines.append(_ints(tl['seg_sample'],      'tlSegSample'))
+    lines.append(_ints(tl['seg_loop_start'],  'tlSegLoopSt'))
+    lines.append(_ints(tl['seg_loop_end'],    'tlSegLoopEn'))
+    lines.append(_ints(tl['seg_loop_type'],   'tlSegLoopTy'))
+    lines.append(_floats(tl['seg_freq'],      'tlSegFreq'))
+    lines.append(_floats(tl['seg_vol'],       'tlSegVol'))
+    lines.append(_floats(tl['seg_pan'],       'tlSegPan'))
+    lines.append(_ints(tl['seg_samp_pos'],    'tlSegPos'))
+    lines.append(_floats(tl['seg_freq_mul'],  'tlSegFreqMul'))
+    lines.append(_floats(tl['seg_vol_delta'], 'tlSegVolDelta'))
+    return ''.join(lines)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GLSL Sound shader fragment for timeline playback
+# ──────────────────────────────────────────────────────────────────────────────
+
+GLSL_TIMELINE_SOUND = r"""
+// ── Timeline-based channel output ─────────────────────────────────────────
+// Replaces the old pattern-simulation getChannelOutput.
+// At time T: find all active segments, sum their sample outputs.
+
+float tlReadSample(int smpIdx, int pos) {
+    // Delegates to the existing VQ sample reader from Common.
+    return getSampleAt(smpIdx, pos);
+}
+
+vec2 tlGetOutput(float T) {
+    vec2 out_lr = vec2(0.0);
+    int tick_T = int(T * TL_TICKS_PER_SEC);
+
+    for (int i = 0; i < TL_NUM_SEGS; i++) {
+        if (tick_T < tlSegStart[i] || tick_T >= tlSegEnd[i])
+            continue;
+
+        float seg_start_sec = float(tlSegStart[i]) / TL_TICKS_PER_SEC;
+        float dt = T - seg_start_sec;
+        if (dt < 0.0) continue;
+
+        // Reconstruct frequency at time T
+        float freq = tlSegFreq[i] * pow(tlSegFreqMul[i],
+            (T - seg_start_sec) * TL_TICKS_PER_SEC);
+
+        // Reconstruct volume at time T
+        float vol = clamp(tlSegVol[i] + tlSegVolDelta[i] *
+            (T - seg_start_sec) * TL_TICKS_PER_SEC, 0.0, 1.0);
+
+        float pan = tlSegPan[i];  // 0=L, 1=R
+
+        // Compute sample position
+        int samp_pos = tlSegPos[i] + int(dt * freq);
+
+        // Apply looping
+        int ls = tlSegLoopSt[i], le = tlSegLoopEn[i];
+        int lt = tlSegLoopTy[i];
+        if (lt > 0 && le > ls && samp_pos >= le) {
+            int span = le - ls;
+            samp_pos = ls + ((samp_pos - ls) % span);
+        }
+
+        float s = tlReadSample(tlSegSample[i], samp_pos);
+        float panR = 0.25 + 0.5 * pan;
+        out_lr += s * vol * vec2(1.0 - panR, panR);
+    }
+    return out_lr;
+}
+"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Quick self-test
+# ──────────────────────────────────────────────────────────────────────────────
+
 
 # ============================================================================
 # OPTIMIZATION 1: Efficient int32 Packing
@@ -983,17 +3582,19 @@ class XMFile:
                 pat = pat[:64]
             elif len(pat) < 64:
                 # Pad with empty rows so engine's fixed-64 indexing is safe.
-                empty_row = [{'sample':0,'period':0,'effect':0,'param':0}
+                empty_row = [{'sample':0,'period':0,'effect':0,'param':0,'vol_col':0}
                              for _ in range(self.num_channels)]
                 pat = pat + [list(empty_row) for _ in range(64 - len(pat))]
             self.patterns.append(pat)
             cur = pat_data_start + pack_size
 
         # ── Instruments → flat samples list ──
-        # MOD format limits us to 31 sample slots; truncate if more.
-        self.samples = [self._empty_sample() for _ in range(31)]
-        flatten_count = min(num_instruments, 31)
-        warn_skipped_inst = max(0, num_instruments - 31)
+        # JS engine uses 6-bit instrument numbers (bits 0-5 of sample byte),
+        # supporting up to 63 instruments. Bits 6-7 are reserved for note-cut
+        # and key-off flags respectively.
+        self.samples = [self._empty_sample() for _ in range(63)]
+        flatten_count = min(num_instruments, 63)
+        warn_skipped_inst = max(0, num_instruments - 63)
         for inst_i in range(num_instruments):
             inst_size = struct.unpack_from('<I', blob, cur)[0]
             inst_name = blob[cur+4:cur+4+22].rstrip(b'\x00 \r\n').decode('latin-1', errors='ignore')
@@ -1134,8 +3735,8 @@ class XMFile:
             cur = data_cur
 
         if warn_skipped_inst:
-            print(f"   ⚠️  XM has {num_instruments} instruments — engine cap is 31; "
-                  f"skipped {warn_skipped_inst} (instruments {31}+)")
+            print(f"   ⚠️  XM has {num_instruments} instruments — engine cap is 63; "
+                  f"skipped {warn_skipped_inst} (instruments {63}+)")
         if self._unsupported_effects:
             print(f"   ⚠️  XM has {self._unsupported_effects} XM-specific effect cells "
                   f"(G/H/K/L/P/R/T/X) — silently dropped (Phase 1)")
@@ -1170,7 +3771,7 @@ class XMFile:
         See XM agent report §2 for the bit-7 prefix scheme."""
         rows = []
         if pack_size == 0:
-            empty_row = [{'sample':0,'period':0,'effect':0,'param':0}
+            empty_row = [{'sample':0,'period':0,'effect':0,'param':0,'vol_col':0}
                          for _ in range(num_chan)]
             return [list(empty_row) for _ in range(num_rows)]
         cur = start
@@ -1214,24 +3815,50 @@ class XMFile:
                 if eff != 0 and m_eff == 0 and m_par == 0:
                     self._unsupported_effects += 1
 
-                # Volume column → translate to MOD effect when nothing else
-                # is using the slot. 0x10..0x50 = set volume 0..64.
-                if vol >= 0x10 and vol <= 0x50 and m_eff == 0 and m_par == 0:
-                    m_eff = 0xC
-                    m_par = vol - 0x10
-                # Other volume-column commands (slides, vibrato, panning, etc.)
-                # are dropped in Phase 1 — too many to handle without breaking
-                # the existing single-effect-per-cell engine model.
+                # Volume column handling.  XM vol-col byte ranges:
+                #   0x10-0x50 = set volume 0-64
+                #   0x60-0x6F = vol slide down 0-15 (regular, skips tick 0)
+                #   0x70-0x7F = vol slide up  0-15 (regular, skips tick 0)
+                #   0x80-0x8F = fine vol down  0-15 (tick 0 only)
+                #   0x90-0x9F = fine vol up    0-15 (tick 0 only)
+                #   (vibrato, pan, tone-porta: Phase 1 drop)
+                cell_vol_col = 0
+                if vol >= 0x10 and vol <= 0x50:
+                    set_vol = vol - 0x10
+                    if m_eff == 0 and m_par == 0:
+                        m_eff = 0xC
+                        m_par = set_vol
+                    elif set_vol > 0:
+                        # Vol-col coexists with effect (e.g. tone portamento).
+                        # Capture separately — same fix as ITFile (line ~4436).
+                        cell_vol_col = set_vol
+                elif vol >= 0x60 and vol <= 0x6F and m_eff == 0 and m_par == 0:
+                    val = vol - 0x60
+                    if val > 0:
+                        m_eff = 0xA; m_par = val          # A0N = vol slide down
+                elif vol >= 0x70 and vol <= 0x7F and m_eff == 0 and m_par == 0:
+                    val = vol - 0x70
+                    if val > 0:
+                        m_eff = 0xA; m_par = val << 4     # AN0 = vol slide up
+                elif vol >= 0x80 and vol <= 0x8F and m_eff == 0 and m_par == 0:
+                    val = vol - 0x80
+                    if val > 0:
+                        m_eff = 0xE; m_par = 0xB0 | val   # EBx = fine vol dn
+                elif vol >= 0x90 and vol <= 0x9F and m_eff == 0 and m_par == 0:
+                    val = vol - 0x90
+                    if val > 0:
+                        m_eff = 0xE; m_par = 0xA0 | val   # EAx = fine vol up
 
-                samp_byte = inst & 0x1F
+                samp_byte = inst & 0x3F   # 6 bits: instruments 0-63
                 if keyoff:
-                    samp_byte |= 0x80
+                    samp_byte |= 0x80     # bit 7 = key-off (note-cut uses bit 6)
                     period = 0
                 row.append({
-                    'sample': samp_byte,
-                    'period': period,
-                    'effect': m_eff,
-                    'param':  m_par,
+                    'sample':  samp_byte,
+                    'period':  period,
+                    'effect':  m_eff,
+                    'param':   m_par,
+                    'vol_col': cell_vol_col,
                 })
             rows.append(row)
         return rows
@@ -1433,13 +4060,16 @@ class ITFile:
                 )
 
         # ── Samples ──
-        # Each sample is loaded into a MOD slot; we cap at 31 sample slots
-        # (engine constraint). NNA/DCT/DCA/fadeout are inherited from the
-        # FIRST instrument that references each sample via its note→sample
-        # table — sufficient for engine-side per-sample NNA dispatch.
-        self.samples = [self._empty_sample() for _ in range(31)]
-        slot_count = min(smp_num, 31)
-        warn_skipped = max(0, smp_num - 31)
+        # Each sample is loaded into a slot. The IT pattern instrument byte
+        # uses 6-bit mask (0x3F = 63 max) plus we may have files with up to
+        # 99 instrument slots per the IT spec. Lifted cap from 31 to 99 so
+        # jeff.it (40 samples) and other rich IT files work in the segment
+        # player; the legacy JS engine can address up to 63 via its 0x3F
+        # mask, so files needing 64-98 only work via the segment player.
+        IT_SAMPLE_CAP = 99
+        self.samples = [self._empty_sample() for _ in range(IT_SAMPLE_CAP)]
+        slot_count = min(smp_num, IT_SAMPLE_CAP)
+        warn_skipped = max(0, smp_num - IT_SAMPLE_CAP)
         compressed_skipped = 0
         for s_i in range(smp_num):
             so = smp_offsets[s_i]
@@ -1558,7 +4188,7 @@ class ITFile:
         for inst_idx, inst in _ord_insts:
             inst_gv = inst.get('global_volume', 128)
             for samp_n in inst['note_to_sample']:
-                if 1 <= samp_n <= 31 and samp_n not in _annotated:
+                if 1 <= samp_n <= IT_SAMPLE_CAP and samp_n not in _annotated:
                     s = self.samples[samp_n - 1]
                     if s['nna'] == 0 and s['dct'] == 0 and s['fadeout'] == 0:
                         s['nna']     = inst['nna']
@@ -1587,8 +4217,8 @@ class ITFile:
                     _annotated.add(samp_n)
 
         if warn_skipped:
-            print(f"   ⚠️  IT has {smp_num} samples — engine cap is 31; "
-                  f"skipped {warn_skipped} (samples {31}+)")
+            print(f"   ⚠️  IT has {smp_num} samples — cap is {IT_SAMPLE_CAP}; "
+                  f"skipped {warn_skipped} (samples {IT_SAMPLE_CAP}+)")
         if compressed_skipped:
             print(f"   ⚠️  IT has {compressed_skipped} stereo sample(s) — "
                   f"silently dropped (Phase 1)")
@@ -1884,13 +4514,13 @@ class ITFile:
             # use note transposition to map drums/leads onto specific sample
             # regions play every note at the wrong pitch (often whole octaves
             # off — the "wrong samples + wrong pitch" GADGET.IT symptom).
-            samp_resolved = inst & 0x1F
+            samp_resolved = inst & 0x3F
             if self.inst_table and 1 <= inst <= 128 and 0 < note < 120:
                 inst_data = self.inst_table.get(inst)
                 if inst_data:
                     table_samp = inst_data['note_to_sample'][note]
-                    if 1 <= table_samp <= 31:
-                        samp_resolved = table_samp & 0x1F
+                    if 1 <= table_samp <= 63:
+                        samp_resolved = table_samp & 0x3F
                     # Apply note transposition: recompute period from the
                     # table-resolved smpnote rather than the played note.
                     table_note = inst_data['note_to_note'][note]
@@ -2878,7 +5508,7 @@ class MODPlayer {{
     getNote(pattern, row, channel) {{
         const nc = this.numChannels;
         const idx = (pattern * 64 * nc) + (row * nc) + channel;
-        return modData.patterns[idx] || {{ sample: 0, period: 0, effect: 0, param: 0 }};
+        return modData.patterns[idx] || {{ sample: 0, period: 0, effect: 0, param: 0, vol_col: 0 }};
     }}
 
     // ── NNA dispatch: convert old voice to a ghost ────────────────────────
@@ -3214,7 +5844,7 @@ class MODPlayer {{
                     this.channels[ch].keyOn = false;
                     continue;
                 }}
-                const noteSample = note.sample & 0x1F;
+                const noteSample = note.sample & 0x3F;
 
                 // Handle new sample trigger
                 if (noteSample > 0) {{
@@ -3466,14 +6096,16 @@ class MODPlayer {{
                 
             case 0x1: // Portamento up
                 if (!tick0 && param > 0) {{
-                    state.period = Math.max(113, state.period - param);
+                    const _pMin = this.numChannels > 4 ? 13 : 113;
+                    state.period = Math.max(_pMin, state.period - param);
                     state.basePeriod = state.period;
                 }}
                 break;
-                
+
             case 0x2: // Portamento down
                 if (!tick0 && param > 0) {{
-                    state.period = Math.min(856, state.period + param);
+                    const _pMax = this.numChannels > 4 ? 13696 : 856;
+                    state.period = Math.min(_pMax, state.period + param);
                     state.basePeriod = state.period;
                 }}
                 break;
@@ -3674,7 +6306,7 @@ class MODPlayer {{
                             if (!tick0 && this.currentTick === val && state._delayedNote) {{
                                 const dn = state._delayedNote;
                                 state._delayedNote = null;
-                                const dnSample = dn.sample & 0x1F;
+                                const dnSample = dn.sample & 0x3F;
                                 const info = modData.sampleMap[dnSample - 1];
                                 state.sample = dnSample - 1;
                                 // Same vol-col handling as immediate trigger.
@@ -3719,13 +6351,15 @@ class MODPlayer {{
                             break;
                         case 0x1: // E1x — Fine porta up (TICK 0 ONLY)
                             if (tick0 && val > 0) {{
-                                state.period = Math.max(113, state.period - val);
+                                const _epMin = this.numChannels > 4 ? 13 : 113;
+                                state.period = Math.max(_epMin, state.period - val);
                                 state.basePeriod = state.period;
                             }}
                             break;
                         case 0x2: // E2x — Fine porta down (TICK 0 ONLY)
                             if (tick0 && val > 0) {{
-                                state.period = Math.min(856, state.period + val);
+                                const _epMax = this.numChannels > 4 ? 13696 : 856;
+                                state.period = Math.min(_epMax, state.period + val);
                                 state.basePeriod = state.period;
                             }}
                             break;
@@ -4153,8 +6787,16 @@ class MODPlayer {{
                      - 0.50537109375*x6 + 0.1993408203125*x8
                      + 0.634521484375*x10 - 0.6513671875*x12;
             }};
-            outL = outL * (1.0 + fat_cs1(outL) * FAT_AMOUNT);
-            outR = outR * (1.0 + fat_cs1(outR) * FAT_AMOUNT);
+            // Soft-limit to 1.1 before fat_cs1 (polynomial diverges past |x|=1.1).
+            // Knee at 0.95→1.1 preserves transient shape vs a hard clamp.
+            const _softLim11 = (x) => {{
+                const ax = Math.abs(x), T = 0.95, HEAD = 0.15, over = ax - T;
+                return ax <= T ? x : Math.sign(x) * (T + (HEAD * over) / (over + HEAD));
+            }};
+            const _csInL = _softLim11(outL);
+            const _csInR = _softLim11(outR);
+            outL = outL * (1.0 + fat_cs1(_csInL) * FAT_AMOUNT);
+            outR = outR * (1.0 + fat_cs1(_csInR) * FAT_AMOUNT);
 
             // ── AdaptiveLimiter (sits after PhatBass + FAT4X) ────────────
             // Stereo-linked, 1–8 ms adaptive attack, 30–110 ms adaptive
@@ -4552,6 +7194,901 @@ console.log('MOD Player Ready!');
     with open(output_file, 'w') as f:
         f.write(html)
 
+def create_segment_player_html(player, segs, mod_samples, filename, title=""):
+    """Create HTML player using pre-baked ITPlayer VoiceSegments (render_pcm.py approach).
+
+    No JS effect engine. Python ITPlayer produces tick-accurate (freq,vol,pan) data;
+    JS mirrors render_pcm.py render loop using AudioBuffer — plays back once rendered.
+
+    player      : ITPlayer with player.samples (ITSample, loop info)
+    segs        : List[VoiceSegment] from player.run()
+    mod_samples : list of sample dicts {'data': np.int8 array, ...} — raw PCM,
+                  index-aligned with player.samples (XMFile/ITFile output)
+    filename    : output HTML path
+    title       : song title for display
+    """
+    import json as _json
+
+    if not title:
+        title = getattr(player, 'title', '') or os.path.splitext(os.path.basename(filename))[0]
+
+    CHUNK_SIZE = 50000
+
+    # ── Sample storage (bw_compress same as create_fixed_player_html) ──────────
+    sample_map = []
+    all_samples = []
+    cur_pos = 0
+
+    for i, smp in enumerate(player.samples):
+        sdict = mod_samples[i] if i < len(mod_samples) else None
+        raw = (sdict.get('data') if isinstance(sdict, dict) else
+               getattr(sdict, 'data', None)) if sdict is not None else None
+
+        if raw is not None and hasattr(raw, '__len__') and len(raw) > 1 and smp.length > 0:
+            # Store RAW int8 PCM (no bw_compress) — bw_compression's LPF was
+            # introducing aliasing artifacts when high-pitched samples
+            # replayed at extreme rates (BUTTERFL 0:12 distorto-vibrato).
+            # For the HTML player we don't have GLSL's tight storage budget,
+            # so we keep full fidelity. The renderer's step formula simplifies
+            # to step = freq / SR (bw_factor=1).
+            if hasattr(raw, 'dtype') and raw.dtype == np.int16:
+                raw_i8 = (raw.astype(np.float32) / 256.0).astype(np.int8)
+            else:
+                raw_i8 = np.asarray(raw, dtype=np.int8)
+
+            data_f = np.concatenate([
+                raw_i8.astype(np.float32) / 128.0,
+                np.zeros(32, dtype=np.float32),   # guard
+            ])
+
+            ls_c = smp.loop_start if smp.has_loop else 0
+            le_c = smp.loop_end   if smp.has_loop and smp.loop_end > smp.loop_start else 0
+            lt   = (2 if smp.bidi_loop else 1) if smp.has_loop else 0
+
+            sample_map.append({
+                'start':      cur_pos,
+                'length':     len(raw_i8),
+                'loop_start': ls_c,
+                'loop_end':   le_c,
+                'loop_type':  lt,
+                'bw_factor':  1,
+            })
+            all_samples.extend(data_f.tolist())
+            cur_pos += len(data_f)
+        else:
+            sample_map.append({'start': 0, 'length': 0,
+                               'loop_start': 0, 'loop_end': 0,
+                               'loop_type': 0, 'bw_factor': 1})
+
+    # ── Segment data: [si, ch, sp0, [[t,f,v,p],...], et] ──────────────────────
+    # ch is the physical channel (-1 for NNA ghost). Used by the solo UI to
+    # mute/unmute voices by channel for debugging which channel produces a bug.
+    seg_data = []
+    for seg in segs:
+        if not seg.tick_states:
+            continue
+        si = seg.sample_idx
+        if si < 0 or si >= len(sample_map) or sample_map[si]['length'] == 0:
+            continue
+        ts = [[int(t), round(float(f), 1), round(float(v), 5), round(float(p), 5)]
+              for t, f, v, p, _ in seg.tick_states]
+        seg_data.append([si, seg.channel, round(float(seg.tick_states[0][4]), 1), ts, seg.end_tick])
+
+    # ── Metrics ──────────────────────────────────────────────────────────────
+    tps = player.initial_tempo * 2.0 / 5.0
+    max_tick = 0
+    for seg in segs:
+        if not seg.tick_states:
+            continue
+        et = seg.end_tick if seg.end_tick >= 0 else seg.tick_states[-1][0] + 1
+        if et > max_tick:
+            max_tick = et
+    total_sec = max_tick / tps + 2.0
+
+    print(f"   Segments: {len(seg_data)}, samples: {len([m for m in sample_map if m['length']>0])}, "
+          f"duration: {total_sec-2:.1f}s")
+
+    # ── Sample chunks ─────────────────────────────────────────────────────────
+    sample_chunks = [all_samples[i:i+CHUNK_SIZE] for i in range(0, len(all_samples), CHUNK_SIZE)]
+    chunk_decls   = "\n".join(f"const sampleChunk{i}={_json.dumps(c)};"
+                              for i, c in enumerate(sample_chunks))
+    chunk_concat  = "[..." + ", ...".join(f"sampleChunk{i}" for i in range(len(sample_chunks))) + "]"
+
+    seg_json      = _json.dumps(seg_data, separators=(',', ':'))
+    smap_json     = _json.dumps(sample_map, separators=(',', ':'))
+
+    # ── Pattern + row event data for tracker UI ──────────────────────────────
+    # Encode cells as [note, inst, vol, eff, par] or 0 if empty. ITCell has
+    # has_note/has_inst/has_vol/has_eff flags; non-empty cells get the array.
+    patterns_data = []
+    for pat in player.patterns:
+        pat_rows = []
+        for row in pat:
+            row_cells = []
+            for c in row:
+                if hasattr(c, 'note') and (c.has_note or c.has_inst or c.has_vol or c.has_eff):
+                    row_cells.append([
+                        c.note if c.has_note else 0,
+                        c.inst if c.has_inst else 0,
+                        c.vol if c.has_vol else 255,
+                        c.eff if c.has_eff else 0,
+                        c.par if c.has_eff else 0,
+                    ])
+                else:
+                    row_cells.append(0)
+            pat_rows.append(row_cells)
+        patterns_data.append(pat_rows)
+    patterns_json = _json.dumps(patterns_data, separators=(',', ':'))
+    orders_json   = _json.dumps(list(player.orders), separators=(',', ':'))
+    # Row events: (abs_tick, song_pos, row, pat_no) — emitted at row-load time
+    rev = getattr(player, 'row_events', [])
+    rev_json = _json.dumps([[t, sp, r, pn] for t, sp, r, pn in rev], separators=(',', ':'))
+    chan_pan_json = _json.dumps(list(player.channel_pan), separators=(',', ':'))
+    num_ch = player.num_channels
+
+    fmt_fn = lambda s: (str(int(s//60)) + ':' + str(int(s%60)).zfill(2))
+    dur_str = fmt_fn(total_sec - 2)
+
+    # Pre-build channel panel HTML — CH# + S/M buttons on one row (CH# uses just
+    # the number to fit narrow panels). Note and volume bar stack below.
+    _ch_panel_html = "\n".join(
+        f'    <div class="ch-panel" id="chP{i}" data-ch="{i}">'
+        f'<div class="ch-header-row">'
+        f'<span class="ch-num" title="Channel {i+1}">{i+1:02d}</span>'
+        f'<span class="ch-btn ch-btn-s" id="chS{i}" title="Solo CH{i+1}">S</span>'
+        f'<span class="ch-btn ch-btn-m" id="chM{i}" title="Mute CH{i+1}">M</span>'
+        f'</div>'
+        f'<div class="ch-note dim" id="chN{i}">---</div>'
+        f'<div class="ch-bar-wrap"><div class="ch-bar" id="chB{i}"></div></div></div>'
+        for i in range(num_ch)
+    )
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>{title} — MOD Player</title>
+<style>
+:root{{--bg0:#0d0d12;--bg1:#13131a;--bg2:#1c1c26;--bg3:#252533;
+  --acc:#3d8ef0;--acc2:#5af0c8;--txt:#c8ccd8;--dim:#555870;--bdr:#2a2a3c;
+  --font:'Courier New',monospace}}
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:var(--bg0);color:var(--txt);font-family:var(--font);
+  display:flex;flex-direction:column;align-items:center;min-height:100vh}}
+#topbar{{width:100%;background:var(--bg1);border-bottom:1px solid var(--bdr);
+  display:flex;align-items:center;gap:16px;padding:10px 20px}}
+.logo{{color:var(--acc);font-size:13px;letter-spacing:2px;font-weight:bold}}
+.ttl{{color:var(--acc2);font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.spc{{flex:1}}
+.meta{{color:var(--dim);font-size:11px;white-space:nowrap}}
+#loadSection{{width:100%;padding:40px 20px;display:flex;flex-direction:column;
+  align-items:center;gap:16px}}
+.load-label{{color:var(--dim);font-size:13px;letter-spacing:2px}}
+#loadBar{{width:320px;height:5px;background:var(--bg3);border-radius:3px;overflow:hidden}}
+#loadFill{{height:100%;background:var(--acc);width:0%;transition:width .1s}}
+.load-pct{{color:var(--acc2);font-size:22px;font-weight:bold;letter-spacing:2px}}
+#playerSection{{width:100%;display:none;flex-direction:column}}
+#seekBar{{width:100%;height:5px;background:var(--bg3);cursor:pointer;position:relative}}
+#seekFill{{height:100%;background:var(--acc);width:0%}}
+#seekFill::after{{content:'';position:absolute;right:-5px;top:-3px;width:10px;height:10px;
+  border-radius:50%;background:var(--acc)}}
+#ctrls{{width:100%;background:var(--bg1);border-bottom:1px solid var(--bdr);
+  display:flex;align-items:center;gap:8px;padding:8px 16px}}
+.btn{{background:var(--bg2);border:1px solid var(--bdr);color:var(--txt);
+  font-family:var(--font);font-size:13px;padding:6px 14px;cursor:pointer;border-radius:3px;
+  transition:all .15s;letter-spacing:1px;display:inline-flex;align-items:center;justify-content:center;
+  min-width:42px;height:30px}}
+.btn:hover{{border-color:var(--acc)}}
+.ico-play{{width:0;height:0;border-left:11px solid #3df0a0;border-top:7px solid transparent;border-bottom:7px solid transparent;margin-left:2px}}
+.ico-pause{{width:4px;height:14px;background:#f0d040;box-shadow:8px 0 0 #f0d040;margin-right:8px}}
+.ico-stop{{width:11px;height:11px;background:#e8e8e8}}
+#timeDisp{{margin-left:auto;color:var(--dim);font-size:12px;letter-spacing:1px}}
+#infoGrid{{width:100%;display:grid;grid-template-columns:repeat(4,1fr);
+  border-bottom:1px solid var(--bdr)}}
+.ic{{padding:10px 16px;border-right:1px solid var(--bdr);background:var(--bg1)}}
+.ic:last-child{{border-right:none}}
+.il{{font-size:10px;color:var(--dim);letter-spacing:2px;text-transform:uppercase;margin-bottom:4px}}
+.iv{{font-size:22px;color:var(--acc2);letter-spacing:1px;font-weight:bold}}
+.iv .sub{{color:var(--dim);font-size:13px;font-weight:normal}}
+#volWrap{{display:flex;align-items:center;gap:8px;color:var(--dim);font-size:12px;margin-left:8px}}
+#volSlider{{-webkit-appearance:none;width:80px;height:4px;border-radius:2px;background:var(--bg3);outline:none;cursor:pointer}}
+#volSlider::-webkit-slider-thumb{{-webkit-appearance:none;width:12px;height:12px;border-radius:50%;background:var(--acc);cursor:pointer}}
+#channels{{width:100%;display:grid;grid-template-columns:repeat({num_ch},1fr);gap:1px;background:var(--bdr);border-bottom:1px solid var(--bdr)}}
+.ch-panel{{background:var(--bg1);padding:5px 4px;min-width:0;transition:opacity .15s}}
+.ch-panel.muted{{opacity:0.35}}
+.ch-header-row{{display:flex;align-items:center;gap:2px;margin-bottom:4px;height:14px}}
+.ch-num{{font-size:10px;color:#c8ccd8;font-weight:bold;letter-spacing:0;
+  flex:1;min-width:0;overflow:hidden;text-overflow:clip;white-space:nowrap}}
+.ch-btn-row{{display:flex;gap:2px;margin-bottom:4px;justify-content:flex-start}}
+.ch-btn{{display:inline-flex;align-items:center;justify-content:center;
+  width:11px;height:12px;font-size:8px;font-weight:bold;border-radius:2px;
+  background:var(--bg2);color:var(--dim);cursor:pointer;
+  border:1px solid var(--bdr);user-select:none;line-height:1;flex:0 0 auto}}
+.ch-btn:hover{{background:var(--bg3);color:var(--txt)}}
+.ch-btn-s.active{{background:#f0d040;color:#000;border-color:#f0d040}}
+.ch-btn-m.active{{background:#e04040;color:#fff;border-color:#e04040}}
+#renderPill{{display:none;position:absolute;right:20px;top:50%;
+  transform:translateY(-50%);background:var(--bg2);border:1px solid var(--bdr);
+  padding:2px 8px;border-radius:10px;font-size:10px;color:var(--acc2);
+  letter-spacing:1px}}
+#renderPill.show{{display:inline-block}}
+#topbar{{position:relative}}
+.ch-note{{font-size:14px;font-weight:bold;letter-spacing:1px;height:18px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.ch-bar-wrap{{height:3px;background:var(--bg3);border-radius:2px;overflow:hidden;margin-top:4px}}
+.ch-bar{{height:100%;width:0%;border-radius:2px;transition:width .08s ease-out}}
+.ch-note.dim{{color:#252535;font-weight:normal}}
+#tracker{{width:100%;background:var(--bg0);border-bottom:1px solid var(--bdr);
+  overflow:hidden;font-size:12px;font-family:var(--font)}}
+.trk-header{{display:flex;background:var(--bg2);border-bottom:1px solid var(--bdr);padding:3px 0}}
+.trk-col-hdr{{font-size:10px;letter-spacing:1px;color:#e8e8e8;font-weight:bold;text-transform:uppercase;padding:2px 6px;flex:1;min-width:0}}
+.trk-col-hdr:first-child{{flex:0 0 44px;text-align:right;color:var(--dim);font-weight:normal}}
+.trk-row{{display:flex;border-bottom:1px solid #0f0f18}}
+.trk-row.current{{background:rgba(255,255,255,0.07)!important;border-left:3px solid var(--acc)}}
+.trk-row:nth-child(even){{background:#0d0d14}}
+.trk-row:nth-child(odd){{background:#101018}}
+.trk-rownum{{flex:0 0 44px;color:var(--dim);font-size:10px;padding:2px 8px;align-self:center;text-align:right}}
+.trk-row.current .trk-rownum{{color:var(--acc);font-weight:bold}}
+.trk-cell{{flex:1;padding:2px 6px;font-family:var(--font);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}}
+.trk-empty{{color:#252535}}
+.trk-note{{color:var(--acc2)}}
+.trk-samp{{color:#6677aa;font-size:10px}}
+.trk-eff{{color:#557799;font-size:10px}}
+#footer{{width:100%;padding:10px 20px;color:var(--dim);font-size:11px;
+  display:flex;justify-content:space-between;border-top:1px solid var(--bdr);margin-top:auto}}
+</style>
+</head>
+<body>
+<div id="topbar">
+  <span class="logo">MOD PLAYER</span>
+  <span class="ttl">{title}</span>
+  <span class="spc"></span>
+  <span class="meta">{len(seg_data)} segs &bull; {dur_str}</span>
+  <span id="renderPill">RERENDER <span id="renderPct">0</span>%</span>
+</div>
+
+<div id="loadSection">
+  <div class="load-label">RENDERING AUDIO</div>
+  <div id="loadBar"><div id="loadFill"></div></div>
+  <div class="load-pct"><span id="loadPct">0</span>%</div>
+  <div style="color:var(--dim);font-size:11px">Pre-baking {len(seg_data)} voice segments via Python ITPlayer (MikIT port)</div>
+</div>
+
+<div id="playerSection">
+  <div id="seekBar"><div id="seekFill"></div></div>
+  <div id="ctrls">
+    <button class="btn" id="btnPlayPause" title="Play"><span class="ico-play" id="icoPP"></span></button>
+    <button class="btn" id="btnStop" title="Stop"><span class="ico-stop"></span></button>
+    <span id="volWrap">VOL <input type="range" id="volSlider" min="0" max="100" value="100"></span>
+    <span id="timeDisp">0:00 / {dur_str}</span>
+  </div>
+  <div id="infoGrid">
+    <div class="ic"><div class="il">POSITION</div><div class="iv"><span id="iPos">0</span><span class="sub">/{len(player.orders)}</span></div></div>
+    <div class="ic"><div class="il">ROW</div><div class="iv"><span id="iRow">0</span><span class="sub">/64</span></div></div>
+    <div class="ic"><div class="il">TEMPO</div><div class="iv">{player.initial_tempo} <span class="sub">BPM</span></div></div>
+    <div class="ic"><div class="il">CHANNELS</div><div class="iv">{num_ch}</div></div>
+  </div>
+  <div id="channels">
+{_ch_panel_html}
+  </div>
+  <div id="tracker">
+    <div class="trk-header" id="trkHeader"></div>
+    <div id="trkBody"></div>
+  </div>
+</div>
+
+<div id="footer">
+  <span>Python ITPlayer (MikIT port) &rarr; segment pre-bake &rarr; Web Audio API</span>
+  <span>MOD2GLSL</span>
+</div>
+
+<script>
+// ── Embedded data ─────────────────────────────────────────────────────────────
+const INITIAL_TEMPO = {player.initial_tempo};
+const NUM_CHANNELS  = {num_ch};
+const sampleMap = {smap_json};
+const segments  = {seg_json};
+const patterns  = {patterns_json};
+const orders    = {orders_json};
+const rowEvents = {rev_json};
+const channelPan = {chan_pan_json};
+{chunk_decls}
+const allSamples = {chunk_concat};
+
+// Mute/solo state. channelMuted[i] is the FINAL gate used by the renderer;
+// it's computed from channelSoloed[] + channelExplicitMuted[] (see below).
+const channelMuted = new Array(NUM_CHANNELS).fill(false);
+const channelSoloed = new Array(NUM_CHANNELS).fill(false);
+
+// ── Renderer (mirrors render_pcm.py) ──────────────────────────────────────────
+// FADE = voice start/end micro-fade length. 128 samples = 2.9ms — long enough
+// to fully mask sample[0] != 0 click on note-trigger and to avoid the audible
+// 32-sample step-down at the end of a faded chunk.
+// NOCLICK_N = inter-tick vol/pan smoothing ramp length. Vol/pan stay constant
+// within each tick (matches MikIT's behavior), with this many samples at the
+// start of each tick ramping from the previous tick's vol to the current's.
+// MikIT uses `frequency / 689 = 64` samples at 44100 Hz — see mdrv_mix.cpp:746.
+const SR = 44100, GUARD = 32, FADE = 128, NOCLICK_N = 64;
+const TPS = INITIAL_TEMPO * 2.0 / 5.0;
+
+// Build extended sample buffers (float32 with guard-extension at loop boundary).
+// For forward loops, crossfade the last CF samples of the loop into the first CF
+// of the loop so ext[le-1] ≈ ext[ls]. Without this, the abrupt value jump every
+// loop wrap repeats at freq/span Hz — for ~1845-sample loops at 18774 Hz that is
+// 10.18 Hz, right in the audible click/tremolo range (the BUTTERFL CH1 bug and
+// the 0:12 "mad vibrato" bug are both this same mechanism).
+const smpExt = new Array(sampleMap.length).fill(null);
+for (let si = 0; si < sampleMap.length; si++) {{
+  const m = sampleMap[si];
+  if (!m.length) continue;
+  const ext = new Float32Array(m.length + GUARD);
+  for (let k = 0; k < m.length; k++) ext[k] = allSamples[m.start + k];
+  const ls = m.loop_start, le = m.loop_end, lt = m.loop_type;
+  if (lt > 0 && le > ls) {{
+    const span = le - ls;
+    // Guard fill: GUARD samples past le for linear interpolation across wrap.
+    for (let t = 0; t < GUARD; t++) {{
+      ext[le + t] = (lt === 2)
+        ? (le - 1 - t >= 0 ? ext[le - 1 - t] : 0.0)
+        : ext[ls + (t % span)];
+    }}
+    // Forward-loop crossfade: blend ext[le-cf..le-1] toward ext[ls..ls+cf-1] so
+    // the loop-wrap boundary is smooth. Uses a raised-cosine (Hann) window:
+    // zero slope at both ends eliminates the slope corners that the old linear
+    // ramp left at the crossfade entry/exit (which themselves could click at
+    // the loop rate). cf=256 gives ~13 ms of smoothing at typical playback
+    // speeds — enough to suppress loop-boundary clicks down to inaudibility
+    // even on tight 1845-sample loops (BUTTERFL CH1 forward-loop / D-effects).
+    if (lt === 1) {{
+      const cf = Math.min(256, span >> 2);
+      for (let t = 0; t < cf; t++) {{
+        const f = 0.5 * (1.0 - Math.cos(Math.PI * (t + 1) / (cf + 1)));
+        ext[le - cf + t] = ext[le - cf + t] * (1.0 - f) + ext[ls + t] * f;
+      }}
+    }}
+  }}
+  smpExt[si] = ext;
+}}
+
+// Compute song duration in output samples
+let maxTick = 0;
+for (const seg of segments) {{
+  const ts = seg[3], et = seg[4];
+  const end = et >= 0 ? et : (ts.length ? ts[ts.length-1][0]+1 : 0);
+  if (end > maxTick) maxTick = end;
+}}
+const totalSamples = Math.ceil(maxTick / TPS * SR) + SR * 2;
+const bufL = new Float32Array(totalSamples);
+const bufR = new Float32Array(totalSamples);
+
+function renderSeg(seg) {{
+  const si = seg[0], ch = seg[1], sp0 = seg[2], ts = seg[3], et = seg[4];
+  if (si < 0 || si >= smpExt.length || !smpExt[si]) return;
+  if (!ts.length) return;
+  // Solo/mute: skip segments on muted channels. NNA ghost voices (ch=-1)
+  // follow their parent channel's mute state — they're stored with ch>=0 in
+  // the segment encoder since they were spawned by that physical channel.
+  if (ch >= 0 && ch < NUM_CHANNELS && channelMuted[ch]) return;
+  const ext = smpExt[si], m = sampleMap[si];
+  const bf = m.bw_factor, ls = m.loop_start, le = m.loop_end, lt = m.loop_type;
+  const span = (le > ls) ? (le - ls) : 1.0;
+  const smpLen = m.length, extLen = ext.length;
+
+  // Pre-compute segment output range. NOTE: previously I extended segEnd by
+  // FADE samples to overlap with the next segment's fade-in (crossfade), but
+  // that added 128 samples of OLD-voice contribution past its logical end —
+  // for samples that didn't actually have audio at that point (sample
+  // exhausted past end) this could replay loop content unintentionally.
+  // The MikIT-style noclick at tick boundaries handles the typical click
+  // case (vol jumps); fade-in at segment start handles silence-to-audio.
+  const segStart = Math.round(ts[0][0] / TPS * SR);
+  const segEndTick = (et >= 0) ? et : (ts[ts.length-1][0] + 1);
+  let segEnd = Math.round(segEndTick / TPS * SR);
+  if (segEnd > totalSamples) segEnd = totalSamples;
+  if (segStart >= segEnd || segStart >= totalSamples) return;
+  const segLen = segEnd - segStart;
+  const segL = new Float32Array(segLen);
+  const segR = new Float32Array(segLen);
+
+  let currentPos = sp0 / bf;
+  // prev-tick vol/pan = the value at the END of the previous tick's render.
+  // For the FIRST tick we initialise to the same as current so the noclick
+  // ramp degenerates to a constant (no ramp); the segment-level fade-in
+  // handles the actual silence-to-audio transition.
+  let prevTickVol = ts[0][2], prevTickPan = ts[0][3];
+
+  for (let i = 0; i < ts.length; i++) {{
+    const st = ts[i];
+    const tAbs = st[0], freq = st[1], vol = st[2], pan = st[3];
+    let tNext, freqE, volE, panE;
+    if (i + 1 < ts.length) {{
+      tNext = ts[i+1][0]; freqE = ts[i+1][1]; volE = ts[i+1][2]; panE = ts[i+1][3];
+    }} else {{
+      tNext = et >= 0 ? et : tAbs + 1;
+      freqE = freq; volE = vol; panE = pan;
+    }}
+
+    const outStart = Math.round(tAbs / TPS * SR);
+    const outEnd   = Math.round(tNext / TPS * SR);
+    const nOut     = Math.max(1, outEnd - outStart);
+    if (outStart >= segEnd) break;
+    const nAct = Math.min(nOut, segEnd - outStart);
+    if (nAct <= 0) break;
+    const relStart = outStart - segStart;   // index into segL/segR
+
+    // Step size: CONSTANT for the whole tick (no LERP between tick freq values).
+    // MikIT plays each tick at its discrete pitch — LERPing the freq across the
+    // tick smears arpeggio (3-tick cycle) and discrete portamento jumps into
+    // glides, perceived as "wrong vibrato speed". Volume/pan still LERP for
+    // smooth dynamics, but pitch holds constant per tick like real trackers.
+    const step = freq / (SR * bf);
+
+    let pos = currentPos;
+    for (let j = 0; j < nAct; j++) {{
+      let p = pos;
+      if (lt > 0 && le > ls && p >= le) {{
+        let rel = (p - ls) % (2.0 * span);
+        if (rel < 0) rel += 2.0 * span;
+        p = (lt === 2) ? (rel < span ? ls + rel : le - (rel - span)) : ls + (rel % span);
+      }} else if (lt === 0) {{
+        if (p > smpLen - 0.001) p = smpLen - 0.001;
+        if (p < 0) p = 0;
+      }}
+      if (p < 0) p = 0;
+      if (p > extLen - 1.001) p = extLen - 1.001;
+      const idx0 = p | 0;
+      const frac = p - idx0;
+      // Linear 2-tap interpolation. Cubic introduced HF overshoot at
+      // 8-bit quantization steps (XM 16→8-bit truncation in XMFile) and
+      // amplified those overshoots as crackling.
+      const _i1 = (idx0 + 1 < extLen) ? idx0 + 1 : idx0;
+      const pcmv = ext[idx0] * (1.0 - frac) + ext[_i1] * frac;
+      // MikIT-style noclick: each tick plays at CONSTANT vol/pan, with a
+      // 32-sample ramp at the START of each tick smoothing the jump from
+      // the previous tick's value. Previously my LERP smeared each tick's
+      // vol across the full tick duration, which (1) shifted the vol curve
+      // by half a tick vs MikIT, and (2) produced slope corners at row
+      // plateaus (D01/D02/D03 had a "no slide on tick 0" plateau every
+      // 5 ticks → 11 Hz click pattern).
+      let v, pa;
+      if (j < NOCLICK_N) {{
+        const rt = 0.5 * (1.0 - Math.cos(Math.PI * j / (NOCLICK_N - 1)));
+        v  = prevTickVol + (vol - prevTickVol) * rt;
+        pa = prevTickPan + (pan - prevTickPan) * rt;
+      }} else {{
+        v = vol; pa = pan;
+      }}
+      const ri = relStart + j;
+      if (ri >= 0 && ri < segLen) {{
+        // ProTracker/Amiga 75% stereo separation: hard-L = 87.5%L/12.5%R,
+        // hard-R = 12.5%L/87.5%R.  pa=0=L, pa=0.5=C, pa=1=R.
+        const _pr = 0.125 + 0.75 * pa;
+        segL[ri] += pcmv * v * (1.0 - _pr);
+        segR[ri] += pcmv * v * _pr;
+      }}
+      pos += step;
+    }}
+
+    // Save this tick's vol/pan as the "previous" for the next tick's noclick ramp.
+    prevTickVol = vol;
+    prevTickPan = pan;
+
+    // Advance currentPos by exactly nAct * step (constant step within tick).
+    currentPos += nAct * step;
+    if (lt === 1 && le > ls && currentPos >= le) {{
+      // Forward loop: fold into [ls, le)
+      currentPos = ls + (currentPos - ls) % span;
+    }} else if (lt === 2 && le > ls) {{
+      // Bidi loop: keep currentPos MONOTONICALLY INCREASING in [ls, ls+2*span).
+      // DO NOT fold to [ls, le) — that loses the direction phase (which half of
+      // the bidi cycle we are in). The inner loop's modular math maps this
+      // monotonic value to the correct reflected position for interpolation.
+      // Modulo-reduce only to prevent float64 drift on very long notes.
+      const twoSpan = 2.0 * span;
+      if (currentPos < ls) currentPos = ls;
+      else if (currentPos >= ls + twoSpan) currentPos = ls + (currentPos - ls) % twoSpan;
+    }} else if (lt === 0 && currentPos > smpLen - 0.001) {{
+      currentPos = smpLen - 0.001;
+    }}
+  }}
+
+  // Micro-fade applied to THIS segment's contribution only. Hann window:
+  // zero slope at both endpoints so no slope corners at fade entry/exit.
+  // Linear fade had slope corners that clicked at the note-onset rate.
+  const fn = Math.min(FADE, segLen >> 1);
+  if (fn > 1) {{
+    for (let j = 0; j < fn; j++) {{
+      const f = 0.5 * (1.0 - Math.cos(Math.PI * j / (fn - 1)));
+      segL[j] *= f;
+      segR[j] *= f;
+      const k = segLen - fn + j;
+      segL[k] *= (1.0 - f);
+      segR[k] *= (1.0 - f);
+    }}
+  }}
+
+  // Mix into output buffers
+  for (let j = 0; j < segLen; j++) {{
+    bufL[segStart + j] += segL[j];
+    bufR[segStart + j] += segR[j];
+  }}
+}}
+
+// ── Batch renderer with progress ──────────────────────────────────────────────
+let segIdx = 0;
+const BATCH = 300;
+let audioCtx = null, audioBuffer = null;
+let sourceNode = null, playing = false;
+let playOffset = 0, playStartTime = 0;
+const totalDuration = totalSamples / SR;
+
+function renderBatch() {{
+  const end = Math.min(segIdx + BATCH, segments.length);
+  for (let s = segIdx; s < end; s++) renderSeg(segments[s]);
+  segIdx = end;
+  const pct = Math.round(segIdx / Math.max(1, segments.length) * 100);
+  document.getElementById('loadPct').textContent = pct;
+  document.getElementById('loadFill').style.width = pct + '%';
+  if (segIdx < segments.length) {{
+    setTimeout(renderBatch, 0);
+  }} else {{
+    finishRender();
+  }}
+}}
+
+let gainNode = null;
+function finishRender() {{
+  // Normalize
+  let peak = 1e-9;
+  for (let i = 0; i < totalSamples; i++) {{
+    const al = Math.abs(bufL[i]), ar = Math.abs(bufR[i]);
+    if (al > peak) peak = al;
+    if (ar > peak) peak = ar;
+  }}
+  if (peak > 1.0) {{
+    const g = 1.0 / peak;
+    for (let i = 0; i < totalSamples; i++) {{ bufL[i] *= g; bufR[i] *= g; }}
+  }}
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  gainNode = audioCtx.createGain();
+  gainNode.gain.value = parseFloat(document.getElementById('volSlider').value) / 100;
+  gainNode.connect(audioCtx.destination);
+  audioBuffer = audioCtx.createBuffer(2, totalSamples, SR);
+  audioBuffer.copyToChannel(bufL, 0);
+  audioBuffer.copyToChannel(bufR, 1);
+  document.getElementById('loadSection').style.display = 'none';
+  document.getElementById('playerSection').style.display = 'flex';
+  updateTimeDisplay();
+  console.log('Render done. Duration:', (totalSamples/SR).toFixed(1)+'s, peak was:', peak.toFixed(4));
+  // Autostart: kick off playback as soon as render finishes. Most browsers
+  // allow this because the user already gestured to open the file/tab. If
+  // the browser's autoplay policy blocks it, the audioCtx stays suspended
+  // and the user just clicks Play.
+  const _autoStart = () => {{
+    try {{ startPlay(); setPPIcon(); }} catch (e) {{}}
+  }};
+  if (audioCtx.state === 'suspended') {{
+    audioCtx.resume().then(_autoStart).catch(_autoStart);
+  }} else {{
+    _autoStart();
+  }}
+}}
+
+function fmtTime(s) {{
+  return String(Math.floor(s/60)).padStart(1,'0') + ':' + String(Math.floor(s%60)).padStart(2,'0');
+}}
+function currentTime() {{
+  if (!playing) return playOffset;
+  return Math.min(audioCtx.currentTime - playStartTime + playOffset, totalDuration);
+}}
+
+// ── Tracker / channel UI ──────────────────────────────────────────────────────
+const NOTE_NAMES = ['C-','C#','D-','D#','E-','F-','F#','G-','G#','A-','A#','B-'];
+function noteToStr(n) {{
+  if (!n) return '---';
+  if (n === 254) return '^^^';
+  if (n === 255) return '===';
+  return NOTE_NAMES[n % 12] + Math.floor(n / 12);
+}}
+function effChar(e) {{
+  if (!e) return '.';
+  // IT effect 1-25 → 'A'..'Y' (skip none = 0)
+  return String.fromCharCode(64 + e);
+}}
+function hex2(v) {{ return ('00' + v.toString(16).toUpperCase()).slice(-2); }}
+
+// Cell encoded as [note, inst, vol, eff, par] or 0 for empty
+function fmtCell(c) {{
+  if (!c || c === 0) return '<span class="trk-empty">--- .. .. ...</span>';
+  const [n, i, vol, e, p] = c;
+  const ns = noteToStr(n);
+  const is = i ? hex2(i) : '..';
+  let vs = '..';
+  if (vol !== 255) {{
+    if (vol <= 64) vs = hex2(vol);
+    else vs = '?' + hex2(vol);
+  }}
+  const es = e ? effChar(e) + hex2(p) : '...';
+  return `<span class="trk-note">${{ns}}</span> <span class="trk-samp">${{is}}</span> <span class="trk-samp">${{vs}}</span> <span class="trk-eff">${{es}}</span>`;
+}}
+
+function findRowAt(absTick) {{
+  // Binary search rowEvents for the row currently active at absTick.
+  // Returns the index in rowEvents (most recent row at-or-before absTick).
+  if (!rowEvents.length) return -1;
+  let lo = 0, hi = rowEvents.length - 1, ans = 0;
+  while (lo <= hi) {{
+    const mid = (lo + hi) >> 1;
+    if (rowEvents[mid][0] <= absTick) {{ ans = mid; lo = mid + 1; }}
+    else hi = mid - 1;
+  }}
+  return ans;
+}}
+
+// Build static tracker header once
+(function buildTrackerHeader() {{
+  let h = '<div class="trk-col-hdr">#</div>';
+  for (let c = 0; c < NUM_CHANNELS; c++) h += `<div class="trk-col-hdr">CH${{c+1}}</div>`;
+  document.getElementById('trkHeader').innerHTML = h;
+}})();
+
+const TRACKER_ROWS = 17;  // visible rows (current row + 8 above + 8 below)
+let lastRowIdx = -1;
+
+function updateTracker(absTick) {{
+  const idx = findRowAt(absTick);
+  if (idx < 0) return;
+  const [, songPos, row, patNo] = rowEvents[idx];
+  if (idx === lastRowIdx) return;   // no change
+  lastRowIdx = idx;
+
+  // Update info grid
+  document.getElementById('iPos').textContent = songPos;
+  const pat = (patNo >= 0 && patNo < patterns.length) ? patterns[patNo] : null;
+  document.getElementById('iRow').textContent = row;
+  if (pat) {{
+    document.querySelector('#iRow + .sub') || null;
+    // Update the row total in subtle
+    const subEl = document.querySelector('.ic:nth-child(2) .sub');
+    if (subEl) subEl.textContent = '/' + pat.length;
+  }}
+
+  // Render tracker body — show TRACKER_ROWS centered on current row
+  const half = (TRACKER_ROWS - 1) >> 1;
+  let html = '';
+  if (pat) {{
+    for (let off = -half; off <= half; off++) {{
+      const r = row + off;
+      const isCur = (off === 0);
+      const cls = 'trk-row' + (isCur ? ' current' : '');
+      if (r < 0 || r >= pat.length) {{
+        html += `<div class="${{cls}}"><div class="trk-rownum">--</div>`;
+        for (let c = 0; c < NUM_CHANNELS; c++) {{
+          html += '<div class="trk-cell trk-empty">---</div>';
+        }}
+        html += '</div>';
+        continue;
+      }}
+      const rowCells = pat[r];
+      html += `<div class="${{cls}}"><div class="trk-rownum">${{r.toString(16).padStart(2,'0').toUpperCase()}}</div>`;
+      for (let c = 0; c < NUM_CHANNELS; c++) {{
+        const cell = (c < rowCells.length) ? rowCells[c] : 0;
+        html += `<div class="trk-cell">${{fmtCell(cell)}}</div>`;
+      }}
+      html += '</div>';
+    }}
+  }}
+  document.getElementById('trkBody').innerHTML = html;
+
+  // Update channel panels — use the current row's cells for note/sample display
+  if (pat && row >= 0 && row < pat.length) {{
+    const rowCells = pat[row];
+    for (let c = 0; c < NUM_CHANNELS; c++) {{
+      const cell = (c < rowCells.length) ? rowCells[c] : 0;
+      const noteEl = document.getElementById('chN' + c);
+      if (cell && cell !== 0) {{
+        const note = cell[0];
+        noteEl.textContent = noteToStr(note);
+        noteEl.classList.remove('dim');
+        // Color hint by sample idx
+        const inst = cell[1];
+        if (inst) noteEl.style.color = `hsl(${{(inst * 47) % 360}},70%,65%)`;
+      }}
+    }}
+  }}
+}}
+
+// Channel volume bars driven by active segments at current absTick
+function updateChannelBars(absTick) {{
+  // Build map: channel → max vol of currently-active segments
+  const chVol = new Array(NUM_CHANNELS).fill(0);
+  // Scan all segments — could be slow; for 2000 segs it's OK at 60fps
+  for (let i = 0; i < segments.length; i++) {{
+    const seg = segments[i];
+    const ts = seg[3], et = seg[4];
+    if (!ts.length) continue;
+    const t0 = ts[0][0], t1 = (et >= 0) ? et : (ts[ts.length-1][0] + 1);
+    if (t0 > absTick || t1 <= absTick) continue;
+    // Find tick state at absTick
+    let v = 0;
+    for (let k = 0; k < ts.length; k++) {{
+      if (ts[k][0] <= absTick) v = ts[k][2];
+      else break;
+    }}
+    // We don't bake channel info per-seg here, so use segment.channel proxy via index
+    // (rough: assume seg order ≈ channel order at trigger time — imperfect but visual)
+    const ch = i % NUM_CHANNELS;
+    if (v > chVol[ch]) chVol[ch] = v;
+  }}
+  for (let c = 0; c < NUM_CHANNELS; c++) {{
+    const bar = document.getElementById('chB' + c);
+    if (bar) bar.style.width = Math.min(100, chVol[c] * 100) + '%';
+  }}
+}}
+
+function updateTimeDisplay() {{
+  const c = currentTime();
+  document.getElementById('timeDisp').textContent = fmtTime(c) + ' / ' + fmtTime(totalDuration);
+  document.getElementById('seekFill').style.width = (c / totalDuration * 100) + '%';
+  const absTick = Math.floor(c * TPS);
+  updateTracker(absTick);
+  if (playing) requestAnimationFrame(updateTimeDisplay);
+}}
+
+function startPlay(offset) {{
+  if (!audioBuffer) return;
+  if (sourceNode) {{ sourceNode.stop(); sourceNode.disconnect(); sourceNode = null; }}
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  sourceNode = audioCtx.createBufferSource();
+  sourceNode.buffer = audioBuffer;
+  sourceNode.connect(gainNode);
+  playOffset    = (offset !== undefined) ? offset : playOffset;
+  playStartTime = audioCtx.currentTime;
+  sourceNode.start(0, playOffset);
+  playing = true;
+  sourceNode.onended = () => {{
+    playing = false;
+    setPPIcon();
+    updateTimeDisplay();
+  }};
+  updateTimeDisplay();
+}}
+function doPause() {{
+  if (!playing) return;
+  playOffset += audioCtx.currentTime - playStartTime;
+  if (sourceNode) {{ sourceNode.stop(); sourceNode.disconnect(); sourceNode = null; }}
+  playing = false;
+}}
+
+function setPPIcon() {{
+  const ico = document.getElementById('icoPP');
+  const btn = document.getElementById('btnPlayPause');
+  if (playing) {{
+    ico.className = 'ico-pause';
+    btn.title = 'Pause';
+  }} else {{
+    ico.className = 'ico-play';
+    btn.title = 'Play';
+  }}
+}}
+document.getElementById('btnPlayPause').onclick = () => {{
+  if (!audioBuffer) return;
+  playing ? doPause() : startPlay();
+  setPPIcon();
+}};
+document.getElementById('btnStop').onclick = () => {{
+  if (!audioBuffer) return;
+  doPause(); playOffset = 0; updateTimeDisplay(); setPPIcon();
+}};
+document.getElementById('seekBar').onclick = (e) => {{
+  if (!audioBuffer) return;
+  const r = e.currentTarget.getBoundingClientRect();
+  const f = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+  const off = f * totalDuration;
+  if (playing) {{ doPause(); startPlay(off); }} else {{ playOffset = off; updateTimeDisplay(); }}
+}};
+document.getElementById('volSlider').addEventListener('input', (e) => {{
+  if (gainNode) gainNode.gain.value = parseFloat(e.target.value) / 100;
+}});
+
+// ── Solo / mute: separate S and M buttons per channel ──────────────────────
+// channelExplicitMuted[i] = user clicked M button on this channel
+// channelSoloed[i]        = user clicked S button on this channel
+// Final mute state = explicit mute OR (any solo && not soloed)
+const channelExplicitMuted = new Array(NUM_CHANNELS).fill(false);
+function recomputeMutedFromButtons() {{
+  const anySolo = channelSoloed.some(s => s);
+  for (let i = 0; i < NUM_CHANNELS; i++) {{
+    channelMuted[i] = channelExplicitMuted[i] || (anySolo && !channelSoloed[i]);
+  }}
+}}
+function refreshChannelPanelStyles() {{
+  for (let c = 0; c < NUM_CHANNELS; c++) {{
+    const p = document.getElementById('chP' + c);
+    const s = document.getElementById('chS' + c);
+    const m = document.getElementById('chM' + c);
+    if (!p) continue;
+    p.classList.toggle('muted', channelMuted[c]);
+    if (s) s.classList.toggle('active', channelSoloed[c]);
+    if (m) m.classList.toggle('active', channelExplicitMuted[c]);
+  }}
+}}
+let rerenderPending = false, rerenderQueued = false;
+function reRenderAudio() {{
+  if (rerenderPending) {{ rerenderQueued = true; return; }}
+  rerenderPending = true;
+  const wasPlaying = playing;
+  const resumeOffset = wasPlaying ? currentTime() : playOffset;
+  if (wasPlaying) doPause();
+  bufL.fill(0);
+  bufR.fill(0);
+  segIdx = 0;
+  // Show subtle pill in topbar instead of swapping to full loading section
+  const pill = document.getElementById('renderPill');
+  pill.classList.add('show');
+  document.getElementById('renderPct').textContent = '0';
+  setTimeout(() => {{
+    const renderBatchSolo = () => {{
+      const end = Math.min(segIdx + BATCH, segments.length);
+      for (let s = segIdx; s < end; s++) renderSeg(segments[s]);
+      segIdx = end;
+      const pct = Math.round(segIdx / Math.max(1, segments.length) * 100);
+      document.getElementById('renderPct').textContent = pct;
+      if (segIdx < segments.length) {{
+        setTimeout(renderBatchSolo, 0);
+      }} else {{
+        let peak = 1e-9;
+        for (let i = 0; i < totalSamples; i++) {{
+          const al = Math.abs(bufL[i]), ar = Math.abs(bufR[i]);
+          if (al > peak) peak = al; if (ar > peak) peak = ar;
+        }}
+        if (peak > 1.0) {{
+          const g = 1.0 / peak;
+          for (let i = 0; i < totalSamples; i++) {{ bufL[i] *= g; bufR[i] *= g; }}
+        }}
+        audioBuffer = audioCtx.createBuffer(2, totalSamples, SR);
+        audioBuffer.copyToChannel(bufL, 0);
+        audioBuffer.copyToChannel(bufR, 1);
+        pill.classList.remove('show');
+        rerenderPending = false;
+        if (wasPlaying) startPlay(resumeOffset);
+        else {{ playOffset = resumeOffset; updateTimeDisplay(); }}
+        setPPIcon();
+        if (rerenderQueued) {{ rerenderQueued = false; reRenderAudio(); }}
+      }}
+    }};
+    renderBatchSolo();
+  }}, 10);
+}}
+function onSoloClick(c) {{
+  channelSoloed[c] = !channelSoloed[c];
+  recomputeMutedFromButtons();
+  refreshChannelPanelStyles();
+  reRenderAudio();
+}}
+function onMuteClick(c) {{
+  channelExplicitMuted[c] = !channelExplicitMuted[c];
+  recomputeMutedFromButtons();
+  refreshChannelPanelStyles();
+  reRenderAudio();
+}}
+for (let c = 0; c < NUM_CHANNELS; c++) {{
+  const s = document.getElementById('chS' + c);
+  const m = document.getElementById('chM' + c);
+  if (s) s.addEventListener('click', (e) => {{ e.stopPropagation(); onSoloClick(c); }});
+  if (m) m.addEventListener('click', (e) => {{ e.stopPropagation(); onMuteClick(c); }});
+}}
+
+// Kick off rendering after the page has loaded
+setTimeout(renderBatch, 50);
+</script>
+</body>
+</html>"""
+
+    with open(filename, 'w') as f:
+        f.write(html)
+    print(f"   📄 Segment player written → {filename}  ({os.path.getsize(filename)//1024} KB)")
+
+
 def to_glsl_font_chars(text, max_len=24):
     """Convert text to kishimisu font-framework char macro sequence. _ = space."""
     MAP = {' ':'_', '!':'_EX','"':'_DBQ','#':'_NUM','$':'_DOL','%':'_PER',
@@ -4660,9 +8197,9 @@ def _emit_visualizer_synth_glsl(wave_types):
         "}\n\n"
     )
 
-def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compressed_pattern_size=None, 
+def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compressed_pattern_size=None,
                           pattern_bytes_data=None, sample_bytes_data=None, seek_table=None, vec_dim=2, viz=1,
-                          compat=None):
+                          compat=None, timeline_glsl=None):
     """Generate ShaderToy GLSL code with texture-based OR embedded data.
     viz: 0=None, 1=Reactive 001 (default), 2=Fluxline Surfer, 3=Zuvuya,
          4=Maya tunnel-warp, 5=Dodecahedron (Philip Bertani),
@@ -4670,7 +8207,10 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
          7=Sparkly 4D (Philip Bertani — 4D IFS fractal raymarcher)
     compat: optional dict of compatibility overrides from --max-compat. Keys:
             no_surround, no_fat, reverb_2x2, fft_n, extra_pragmas. Missing
-            keys default to permissive values (full-quality mode)."""
+            keys default to permissive values (full-quality mode).
+    timeline_glsl: pre-baked voice timeline string from mikit_engine (IT files).
+                   When provided, Sound shader uses tlGetOutput instead of
+                   getChannelOutput, skipping stateless pattern re-simulation."""
 
     # Compat defaults — used when the caller didn't pass a compat dict, or
     # when it passed one missing some keys. These match v1.37 default behavior.
@@ -4684,6 +8224,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
     }
     if compat:
         _compat.update(compat)
+    _use_timeline = timeline_glsl is not None
 
     # Human-readable visualizer name (stamped into every tab header).
     _VIZ_NAMES = {
@@ -4954,7 +8495,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
     # USE_142_DSP toggle — emit as 0/1 for the GLSL #define
     use_142_dsp_int = 1 if compat.get('use_142_dsp', False) else 0
     common_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.54 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.55 (c) 2026 Orblivius
    
    32 Tracks support, IT/XM/S3M/MOD loader, 3D Surround, PHAT Bass, Velvet Reverb, 
    Comb Reverb, FAT, W1 Limiter, RVQ sample compression, configurable downsample
@@ -4994,6 +8535,9 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
 //                   All correctness fixes (EAx/EBx, EEx, etc.) and the
 //                   master softLimit are preserved either way.
 #define USE_142_DSP {use_142_dsp_int}
+// USE_TIMELINE_DSP=1: Sound shader reads pre-baked mikit_engine voice segments
+// instead of re-simulating pattern effects via getChannelOutput. IT files only.
+#define USE_TIMELINE_DSP {1 if _use_timeline else 0}
 
 // ── Audio effects — toggle here in Common tab ─────────────────────────────────
 // Each module is independently toggleable. Flip false to disable.
@@ -5911,6 +9455,11 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     #   'sample' → force per-sample (uses isBass[] flags as encoded)
     #   'mix'    → force mix-wide (Hilbert cross-pan on entire mixdown)
     _pb_mode = _compat['phatbass_mode']
+    # IT/XM: NNA-retrigger routing makes per-sample bass detection unreliable.
+    # Silently promote the default 'sample' to 'mix' for these formats so
+    # PhatBass always runs mix-wide unless the user explicitly forces 'sample'.
+    if _pb_mode == 'sample' and (getattr(mod, 'is_it', False) or getattr(mod, 'is_xm', False)):
+        _pb_mode = 'mix'
     if _pb_mode == 'sample':
         phatbass_mix_mode = 0
         print(f"   🎚️  PhatBass routing: per-sample (forced via --phatbass-mode sample)")
@@ -5955,8 +9504,55 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     _ap_p0_1, _ap_p1p2_1, _ap_delay_1 = _only3d_coeffs(_ONLY3D_FREQ1)
     _ap_p0_2, _ap_p1p2_2, _ap_delay_2 = _only3d_coeffs(_ONLY3D_FREQ2)
 
+    # ── Timeline injection for IT files (mikit_engine pre-baked voice segments) ──
+    # If timeline_glsl is provided, inject the TL const arrays + tlGetOutput into
+    # the Sound shader right after getSampleF (which tlGetOutput calls).
+    # The plain-string concatenation keeps GLSL braces from being misread as
+    # Python f-string markers.
+    _TLGETOUTPUT_GLSL = (
+        "\n// ── Timeline output: sum active voice segments at time T ─────────────────\n"
+        "// Replaces the channel loop for IT files.  Each VoiceSegment stores start freq,\n"
+        "// vol, pan, sample position and per-tick derivatives; this function integrates\n"
+        "// them in continuous time so the loop runs over segments (TL_NUM_SEGS), not\n"
+        "// channels×rows.  Loop count is bounded by a non-const local so ANGLE/D3D11\n"
+        "// does not unroll it (runtime loop, data-dependent early-continue).\n"
+        "#if USE_TIMELINE_DSP\n"
+        "vec2 tlGetOutput(float T) {\n"
+        "    vec2 out_lr = vec2(0.0);\n"
+        "    int tick_T = int(T * TL_TICKS_PER_SEC);\n"
+        "    int _nseg = TL_NUM_SEGS;  // non-const var prevents ANGLE unrolling\n"
+        "    for (int i = 0; i < _nseg; i++) {\n"
+        "        if (tick_T < tlSegStart[i] || tick_T >= tlSegEnd[i])\n"
+        "            continue;\n"
+        "        float seg_t0 = float(tlSegStart[i]) / TL_TICKS_PER_SEC;\n"
+        "        float dt = T - seg_t0;\n"
+        "        if (dt < 0.0) continue;\n"
+        "        float freq = tlSegFreq[i] * pow(tlSegFreqMul[i], dt * TL_TICKS_PER_SEC);\n"
+        "        float vol  = clamp(tlSegVol[i] + tlSegVolDelta[i] * dt * TL_TICKS_PER_SEC,\n"
+        "                           0.0, 1.0);\n"
+        "        float fpos = float(tlSegPos[i]) + dt * freq;\n"
+        "        int ls = tlSegLoopSt[i], le = tlSegLoopEn[i];\n"
+        "        if (tlSegLoopTy[i] > 0 && le > ls && fpos >= float(le)) {\n"
+        "            float span = float(le - ls);\n"
+        "            fpos = float(ls) + mod(fpos - float(ls), span);\n"
+        "        }\n"
+        "        SampleInfo smp = samples[clamp(tlSegSample[i], 0, 30)];\n"
+        "        float s = getSampleF(smp.start, fpos, smp.length, ls,\n"
+        "                             le > ls ? le - ls : 0);\n"
+        "        float panR = 0.25 + 0.5 * tlSegPan[i];\n"
+        "        out_lr += s * vol * vec2(1.0 - panR, panR);\n"
+        "    }\n"
+        "    return out_lr;\n"
+        "}\n"
+        "#endif // USE_TIMELINE_DSP\n"
+    )
+    if _use_timeline:
+        _tl_injection = timeline_glsl + _TLGETOUTPUT_GLSL
+    else:
+        _tl_injection = ""
+
     sound_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.54 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.55 (c) 2026 Orblivius
    
    32 Tracks support, IT/XM/S3M/MOD loader, 3D Surround, PHAT Bass, Velvet Reverb, 
    Comb Reverb, FAT, W1 Limiter, RVQ sample compression, configurable downsample
@@ -5967,8 +9563,15 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
    Contact:  subband@gmail.com or
              subband@protonmail.com
   ============================================================================ */
-// getByte / getPatternByte / getSample / getNote / getChannelOutput are in Common.
-
+// USE_TIMELINE_DSP defined here as well as Common — the VQ-encoded Common
+// generator doesn't preserve this define, and Sound's #if blocks below need
+// it to compile. Safe to define in both places (same value).
+#ifndef USE_TIMELINE_DSP
+#define USE_TIMELINE_DSP {1 if _use_timeline else 0}
+#endif
+// getByte / getPatternByte / getSample / getSampleF / getNote / getChannelOutput are in Common.
+// tlGetOutput (if USE_TIMELINE_DSP) is injected below after getSampleF is prepended by VQ post-proc.
+{_tl_injection}
 // Bass sample flags (true = instrument detected as bass) — for PhatBass
 const bool isBass[31] = bool[]({bass_flags_str});
 
@@ -6028,12 +9631,12 @@ vec2 softLimit(vec2 x) {{
     // even if T is set to 1.0 or above. Catches PhatBass / FAT4X overshoot
     // before WebAudio hard-clips. NaN in → NaN out is impossible because
     // every branch only does mul/div on bounded magnitudes.
-    // Soft-knee from T to CEIL. T MUST be < CEIL so the soft branch runs;
-    // otherwise we fall back to hard-clip (audible as distortion). With
-    // CEIL ≤ 1.1 the output is also a safe input for fat_cs1's polynomial,
-    // which diverges past |x| = 1.1.
+    // CEIL=1.0: fat_cs1 polynomial is only well-behaved on |x|<=1.0. Past 1.0
+    // it goes non-monotonic (at x=1.1, fat_cs1≈-1.71, flipping FAT4X's sign
+    // and crushing a 1.1 peak to ~0.63 — audible as crunchy distortion on
+    // bright mixes). Knee 0.85→1.0 keeps PhatBass/reverb transients clean.
     const float T    = 0.85;    // knee start (signals below this are bit-perfect)
-    const float CEIL = 1.0;     // absolute ceiling — DAC clips above this
+    const float CEIL = 1.0;     // ceiling — keep fat_cs1 strictly in [-1,1]
     vec2 ax = abs(x);
     if (T >= CEIL) {{
         // No soft-knee headroom available — hard-clip at CEIL.
@@ -6050,12 +9653,14 @@ vec2 softLimit(vec2 x) {{
 // Mono input + pan coefficients = stereo output (standard reverb design)
 float getMixedMono(float time_offset, Position pos, float rowTime) {{
     float mix = 0.0;
+#if USE_TIMELINE_DSP
+    vec2 _tm = tlGetOutput(time_offset);
+    mix = (_tm.x + _tm.y) * 0.5;
+#else
     for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
         mix += getChannelOutput(ch, time_offset, pos, rowTime);
     }}
-    // Loud mode: 4-ch MOD keeps the original 2/N; multi-ch formats get
-    // a flat 0.45 (single voice at vol=64 reaches 45% of full scale).
-    // softLimit / FAT4X handle multi-voice peaks downstream.
+#endif
     const float normFactor = (NUM_CHANNELS <= 4) ? (2.0 / float(NUM_CHANNELS)) : 0.85;
     return mix * normFactor;
 }}
@@ -6174,6 +9779,17 @@ vec2 mainSound(int samp, float time) {{
     // OPT: vec2 (.x = L, .y = R) — modern GPUs vectorize 2-lane FP ops at
     // the same cost as scalar, and the source is half as noisy as the
     // separate L/R floats it replaces.
+    // OPT: const-qualified — NUM_CHANNELS is a #define.
+    // Loud mode: 4-ch MOD keeps the original 2/N; multi-ch formats get
+    // a flat 0.45 (single voice at vol=64 reaches 45% of full scale).
+    // softLimit / FAT4X handle multi-voice peaks downstream.
+    const float normFactor = (NUM_CHANNELS <= 4) ? (2.0 / float(NUM_CHANNELS)) : 0.85;
+#if USE_TIMELINE_DSP
+    // IT pre-baked timeline path: tlGetOutput sums all active voice segments.
+    // Pan is already baked per-segment; no surr/cent split needed.
+    vec2 surr = tlGetOutput(playbackTime) * normFactor;
+    vec2 cent = vec2(0.0);
+#else
     vec2 surr = vec2(0.0);
     vec2 cent = vec2(0.0);
 
@@ -6202,14 +9818,9 @@ vec2 mainSound(int samp, float time) {{
         else          surr += panned;
 #endif
     }}
-
-    // OPT: const-qualified — NUM_CHANNELS is a #define.
-    // Loud mode: 4-ch MOD keeps the original 2/N; multi-ch formats get
-    // a flat 0.45 (single voice at vol=64 reaches 45% of full scale).
-    // softLimit / FAT4X handle multi-voice peaks downstream.
-    const float normFactor = (NUM_CHANNELS <= 4) ? (2.0 / float(NUM_CHANNELS)) : 0.85;
     surr *= normFactor;
     cent *= normFactor;
+#endif // USE_TIMELINE_DSP
     
     // ── Only3D — proper allpass technique with precomputed coefficients ──────
     // Direct port from Only3D.h by Dmitry Boldyrev / mss
@@ -6238,11 +9849,23 @@ vec2 mainSound(int samp, float time) {{
     const vec2 AP_DELAY      = vec2({_ap_delay_1:.7f}, {_ap_delay_2:.7f});
 
     if (enable3D) {{
-#if USE_142_DSP
+#if USE_TIMELINE_DSP
+        // ── Only3D, timeline path: call tlGetOutput at the allpass delay offsets ──
+        // The stereo difference between delayed and current output forms the
+        // allpass input. No per-channel loop needed.
+        vec2 t3d = vec2(playbackTime) - AP_DELAY;
+        if (t3d.x >= 0.0 && t3d.y >= 0.0) {{
+            float diffNow = surr.x - surr.y;
+            vec2 out1 = tlGetOutput(t3d.x) * normFactor;
+            vec2 out2 = tlGetOutput(t3d.y) * normFactor;
+            vec2 diffDelayed = vec2(out1.x - out1.y, out2.x - out2.y);
+            vec2 ap = diffNow * AP_P0 + diffDelayed * AP_P1_PLUS_P2;
+            vec2 dd = ap * inversesqrt(1.0 + ap * ap * SATURATION);
+            float shuffle = (dd.x - dd.y) * ONLY3D_DEPTH;
+            surr += vec2(shuffle, -shuffle);
+        }}
+#elif USE_142_DSP
         // ── Only3D, single-tap (v1.42 path) — lower shader complexity ──
-        // Bass channels bypass widening — feeding bass through allpass +
-        // cross-mix produces audible cracking on transients (same reason
-        // v1.45 has the `if (isBass1) continue;` guard below).
         float tW = playbackTime - AP_DELAY.x;
         if (tW >= 0.0) {{
             Position posW = getPosition(tW);
@@ -6266,11 +9889,6 @@ vec2 mainSound(int samp, float time) {{
         }}
 #else
         // ── Only3D, 2-tap parallel allpass (v1.45 path) — wider, smoother ──
-        // First-order allpass approximation in parallel for both freqs.
-        // Stateless: use delayed difference for both x[n-1] and y[n-1].
-        //   y[n] = x[n]*p0 + x[n-1]*(p1+p2)
-        // Bass channels bypass surround widening (low freqs through allpass +
-        // cross-mix shuffle thrash and saturate, audible as cracking).
         vec2 t = vec2(playbackTime) - AP_DELAY;
         if (t.x >= 0.0 && t.y >= 0.0) {{
             Position pos1 = getPosition(t.x);
@@ -6301,59 +9919,63 @@ vec2 mainSound(int samp, float time) {{
 #endif
     }}
     
-    // ── PhatBass — bass enhancement (cross-panned allpass) ─────────────────
-    // Two modes:
-    //  1. Per-sample: process only channels playing bass-detected samples.
-    //     Cleaner — leaves leads/pads alone — but requires reliable detection.
-    //  2. Mix-wide: process a low-passed copy of the full mix.  Works on any
-    //     song without bass detection, but slightly colors mid-bass content.
-    // We pick mix-wide automatically when no bass samples were detected at
-    // encode time (PHATBASS_MIX_MODE = 1).
-    const float PHAT_T     = 0.001814;  // T = 80/44100 s
-    const float PHAT_H1   = 0.6366;    // 2/π — 1-tap FIR Hilbert coefficient
-    const float PHAT_DEPTH = 1.7;      // Cranked again — user wants OBVIOUS bass
-    // Chain order (user spec): cs1 → phatbass → reverb → softlim. So we
-    // COMPUTE pb here but DON'T add it to cent — instead apply it to
-    // post-fat_cs1 _out further below.
+    // ── PhatBass — low-shelf bass boost + Haas-delayed cross-pan widening ───
+    // Replaces the previous truncated-Hilbert (h1, h3 coefficients with 80-
+    // sample tap spacing) which had heavy comb-aliasing (bandpass peak at
+    // ~137 Hz + alias lobes above) and sounded gritty on bright transients.
+    //
+    // New design — stateless per-sample, cheap, clean:
+    //   1. 2-tap boxcar LPF on the bass signal (taps at t and t-0.5ms).
+    //      First null at ~1 kHz, gentle rolloff — passes bass, kills mids.
+    //   2. SAME-pan: add LPF'd signal at SHELF_DEPTH → low-shelf boost.
+    //   3. OPPOSITE-pan: add 8 ms Haas-delayed dry signal at HAAS_DEPTH →
+    //      classic stereo widening without comb-aliasing or phase issues.
+    //
+    // Two modes (selected at encode time via PHATBASS_MIX_MODE):
+    //  0 = Per-sample: only channels playing bass-tagged instruments.
+    //  1 = Mix-wide: applied to the full mix (auto when no bass detected).
+    const float PHAT_SHELF_T     = 0.0005;  // 0.5 ms (22 sample) LPF spacing
+    const float PHAT_HAAS_T      = 0.008;   // 8 ms Haas widening delay
+    const float PHAT_SHELF_DEPTH = 0.7;     // same-pan low-shelf gain
+    const float PHAT_HAAS_DEPTH  = 0.4;     // opposite-pan Haas gain
     vec2 _phatPB = vec2(0.0);
     if (enablePhatBass) {{
-        float tP  = playbackTime - PHAT_T;
-        float t3T = playbackTime - 3.0 * PHAT_T;
-        // Guard: skip until t3T >= 0 so both Hilbert taps are within rendered audio.
-        // Without this, getPosition() wraps to song-end and injects song-tail
-        // audio into voice-attack regions, audible as a click on the lead.
-        if (t3T < 0.0) {{
-            // Skip PhatBass; far tap not yet available.
+        float tA = playbackTime - PHAT_SHELF_T;
+        float tH = playbackTime - PHAT_HAAS_T;
+        // Guard: skip until both taps are within rendered audio (Haas tap
+        // is the longest, so checking it covers tA too).
+        if (tH < 0.0) {{
+            // Skip PhatBass; Haas tap not yet available.
         }} else {{
-        Position posP  = getPosition(tP);
-        Position pos3T = getPosition(t3T);
-        // pb accumulates the Hilbert quadrature component of each channel.
+#if USE_TIMELINE_DSP
+        // Mix-wide via timeline taps. LPF same-pan + Haas opposite-pan (.yx).
+        vec2 dryNow = tlGetOutput(playbackTime) * normFactor;
+        vec2 dryA   = tlGetOutput(tA)           * normFactor;
+        vec2 dryH   = tlGetOutput(tH)           * normFactor;
+        vec2 lp     = 0.5 * (dryNow + dryA);
+        _phatPB     = lp * PHAT_SHELF_DEPTH + dryH.yx * PHAT_HAAS_DEPTH;
+#else
+        Position posA = getPosition(tA);
+        Position posH = getPosition(tH);
         vec2 pb = vec2(0.0);
 #if PHATBASS_MIX_MODE
-        // Mix-wide: Q(t-2T) ≈ (2/π)·(x(t-T) − x(t-3T)) — true 90° phase shift.
+        // Mix-wide: sum all channels at the three tap times.
         for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
-            float spN = getChannelOutput(ch, tP,  posP,  rowTime);  // x(t-T)
-            float spF = getChannelOutput(ch, t3T, pos3T, rowTime);  // x(t-3T)
-            float q   = PHAT_H1 * (spN - spF);                      // H{{x}}(t-2T)
             float panR = 0.25 + 0.5 * channelPan[ch];
             vec2  pan  = vec2(1.0 - panR, panR);
-            pb += q * pan.yx;
+            float s0 = getChannelOutput(ch, playbackTime, pos,  rowTime);
+            float sA = getChannelOutput(ch, tA, posA, rowTime);
+            float sH = getChannelOutput(ch, tH, posH, rowTime);
+            float lp = 0.5 * (s0 + sA);
+            pb += lp * PHAT_SHELF_DEPTH * pan + sH * PHAT_HAAS_DEPTH * pan.yx;
         }}
 #else
         // Per-sample: only bass-detected instruments.
         for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
 #if USE_142_DSP
-            // v1.42 path: 8-row backward scan to find most-recent instrument
-            // trigger on this channel. Single-row lookup (the original v1.42
-            // behaviour) was a click source — bass tag flickered ON at trigger
-            // rows and OFF at continuation rows, abruptly toggling PhatBass's
-            // ~3 dB low-end contribution on every row boundary. 8 rows is
-            // enough to span any sustaining bass note at typical BPM, and is
-            // 8× cheaper than the v1.45 path's 64-row scan, preserving the
-            // "compiles on weak drivers" goal of USE_142_DSP=1.
             int inst2 = 0;
             {{
-                int _sR = posP.row, _sP = posP.songPos;
+                int _sR = pos.row, _sP = pos.songPos;
                 for (int _lb = 0; _lb < 8; _lb++) {{
                     Note _n2 = getNote(_sP, _sR, ch);
                     if (_n2.instrument > 0 && _n2.instrument <= 31) {{ inst2 = _n2.instrument; break; }}
@@ -6368,10 +9990,8 @@ vec2 mainSound(int samp, float time) {{
             }}
             bool bass  = (inst2 >= 1 && inst2 <= 31) ? isBass[inst2 - 1] : false;
 #else
-            // v1.45 path: walk back up to 64 rows to find the most-recently
-            // triggered instrument — keeps bass tag stable on continuation rows.
             int inst2 = 0;
-            int sR = posP.row, sP = posP.songPos;
+            int sR = pos.row, sP = pos.songPos;
             for (int lb = 0; lb < 64; lb++) {{
                 Note n2 = getNote(sP, sR, ch);
                 if (n2.instrument > 0) {{ inst2 = n2.instrument; break; }}
@@ -6386,20 +10006,25 @@ vec2 mainSound(int samp, float time) {{
             bool bass = (inst2 >= 1 && inst2 <= 31) ? isBass[inst2 - 1] : false;
 #endif
             if (bass) {{
-                float spN = getChannelOutput(ch, tP,  posP,  rowTime);  // x(t-T)
-                float spF = getChannelOutput(ch, t3T, pos3T, rowTime);  // x(t-3T)
-                float q   = PHAT_H1 * (spN - spF);                      // H{{x}}(t-2T)
                 float panR = 0.25 + 0.5 * channelPan[ch];
                 vec2  pan  = vec2(1.0 - panR, panR);
-                pb += q * pan.yx;
+                float s0 = getChannelOutput(ch, playbackTime, pos,  rowTime);
+                float sA = getChannelOutput(ch, tA, posA, rowTime);
+                float sH = getChannelOutput(ch, tH, posH, rowTime);
+                float lp = 0.5 * (s0 + sA);
+                pb += lp * PHAT_SHELF_DEPTH * pan + sH * PHAT_HAAS_DEPTH * pan.yx;
             }}
         }}
 #endif
-        _phatPB = pb * (normFactor * PHAT_DEPTH);
-        }}  // end else (t3T >= 0)
+        _phatPB = pb * normFactor;
+#endif // USE_TIMELINE_DSP
+        }}  // end else (tH >= 0)
     }}
     
     vec2 _out = surr + cent;
+
+    // ── PhatBass — add cross-panned bass signal (chain: 3D → PhatBass → ...) ─
+    _out += _phatPB;
 
     // ── Velvet-noise reverb (sparse-tap convolution) ─────────────────────
     // 6 random-sign taps spread across an ~80 ms tail with exponential
@@ -6423,8 +10048,12 @@ vec2 mainSound(int samp, float time) {{
         for (int _vi = 0; _vi < _VELV_N; _vi++) {{
             float _vtt = playbackTime - _VELV_T[_vi];
             if (_vtt < 0.0) continue;
+#if USE_TIMELINE_DSP
+            float _vdry = dot(tlGetOutput(_vtt), vec2(0.5, 0.5)) * normFactor;
+#else
             Position _vp = getPosition(_vtt);
             float _vdry = getMixedMono(_vtt, _vp, rowTime);
+#endif
             float _vamp = exp(-_VELV_T[_vi] / _VELV_RT60) * _VELV_S[_vi];
             _wet.x += _vdry *  _vamp;
             _wet.y -= _vdry *  _vamp;     // L/R polarity flip → stereo width
@@ -6432,17 +10061,10 @@ vec2 mainSound(int samp, float time) {{
         _out += _wet * _VELV_WET;
     }}
 
-    // Limiter sits BEFORE FAT4X so the saturator sees already-tamed peaks
-    // (PhatBass overshoot is the main culprit; FAT4X then colors the limited
-    // signal instead of pushing it further over). Velvet wet path goes
-    // through here too so any reverb peaks get caught by softLimit.
+    // Soft-limit to 1.1 before FAT4X: fat_cs1 polynomial diverges past |x|=1.1.
+    // Soft knee from 0.95→1.1 lets PhatBass/reverb transients breathe without
+    // hard-clipping; the polynomial then colors the result, not the limiter.
     _out = softLimit(_out);
-    // Belt-and-suspenders: explicit hard clamp to ±1.0 before fat_cs1.
-    // softLimit already asymptotes to ±1 from below, so this is a no-op
-    // for normal signals — but it guarantees the polynomial input never
-    // exceeds 1.0 even under floating-point edge cases. cs1 diverges
-    // catastrophically past |x|=1.1, so this is cheap insurance.
-    _out = clamp(_out, vec2(-1.0), vec2(1.0));
 
     // ── FAT4X harmonic exciter (stateless) ─────────────────────────────────
     // Applied BEFORE reverb (reverb currently disabled — see block below).
@@ -6459,18 +10081,6 @@ vec2 mainSound(int samp, float time) {{
         const float FAT_AMOUNT = 0.5;
         _out = _out * (1.0 + 0.5 * fat_cs1(_out) * FAT_AMOUNT);
     }}
-
-    // ── PhatBass mixed AFTER fat_cs1 ───────────────────────────────────
-    // Chain order is fat_cs1 → phatbass → (reverb) → softlim. Adding the
-    // bass-cross-pan signal here means cs1's saturation only colors the
-    // dry mix, leaving the sub-bass clean and punchy underneath.
-    _out += _phatPB;
-
-    // ── (Reverb stage placeholder — currently disabled by default) ─────
-    // The Velvet/Freeverb blocks above are between the channel mix and
-    // the safety softLimit. With the new chain order, "reverb" here would
-    // mean adding wet to _out post-fat_cs1; left as a no-op until we
-    // re-enable a stage explicitly.
 
     // ── End-of-chain soft-limit at 1.0 (clean ceiling) ─────────────────
     // Previously: ×1.3 crank + 1.1 ceiling → "intentional 0.1 overdrive".
@@ -8137,7 +11747,7 @@ vec3 _VizScene(vec2 u) {
 
 
     image_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.54 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.55 (c) 2026 Orblivius
    
    32 Tracks support, IT/XM/S3M/MOD loader, 3D Surround, PHAT Bass, Velvet Reverb, 
    Comb Reverb, FAT, W1 Limiter, RVQ sample compression, configurable downsample
@@ -8249,7 +11859,7 @@ makeStr(printBPMVal) {bpm_val_chars} _end
 makeStr(printSpdVal) {spd_val_chars} _end
 
 // ---- Static label strings ----
-makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _5 _4 _ _NUM _NUM _NUM _end
+makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _5 _5 _ _NUM _NUM _NUM _end
 makeStr(printCredit) _COPY _2 _0 _2 _6 _ _O _R _B _L _I _V _I _U _S _end
 makeStr(printLoad)   _L _O _A _D _I _N _G _DOT _DOT _DOT _end
 makeStr(printSpec)   _S _P _E _C _T _R _U _M _end
@@ -8939,7 +12549,7 @@ void mainImage(out vec4 O, vec2 C) {{
     # Setup: Buffer A iChannel0 = Buffer A (self-ref)
     #        Image   iChannel1 = Buffer A output
     buffer_a_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.54 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.55 (c) 2026 Orblivius
    
    32 Tracks support, IT/XM/S3M/MOD loader, 3D Surround, PHAT Bass, Velvet Reverb, 
    Comb Reverb, FAT, W1 Limiter, RVQ sample compression, configurable downsample
@@ -12723,19 +16333,34 @@ def main():
     # Detect file format
     fmt = detect_module_format(args.modfile)
     print(f"📻 Detected format: {fmt}")
-    
+    # Timeline GLSL — populated by mikit_engine for IT/S3M/MOD; None on fallback.
+    _it_timeline_glsl = None
+
     if fmt == 'S3M':
         s3m = S3MFile(args.modfile)
         print(f"🎵 {s3m.title}")
         print(f"   Instruments: {s3m.num_instruments}, Patterns: {s3m.num_patterns}, Channels: {s3m.num_channels}")
         print(f"   Speed: {s3m.initial_speed}, Tempo: {s3m.initial_tempo}")
-        print("   ⚠️  S3M support is partial: file loads but effect commands are not yet")
-        print("      remapped from S3M (A,B,C,…) to MOD (1,2,3,…) numbering, c2spd is not")
-        print("      applied, and the volume column is dropped. Many S3Ms will play with")
-        print("      wrong effects/pitches until that work lands.")
         
-        # Convert S3M to MOD-compatible structure for now (effect-letter and
-        # c2spd remapping is still TODO — see warning above).
+        # ── mikit_engine: tick-accurate S3M simulation ─────────────────────
+        try:
+            print("   🔬 Running mikit_engine tick simulation...")
+            _mk_player = load_s3m_native(args.modfile)
+            _mk_segs   = _mk_player.run()
+            _mk_tps    = _mk_player.initial_tempo * 2.0 / 5.0
+            print(f"   ✓  {len(_mk_segs)} voice segments, {_mk_tps:.1f} ticks/sec")
+            _180_max_tick = int(180.0 * _mk_tps)
+            _mk_segs_st = [s for s in _mk_segs if s.tick_states and s.tick_states[0][0] < _180_max_tick]
+            if len(_mk_segs_st) < len(_mk_segs):
+                print(f"   ⏱️  180s clip: {len(_mk_segs)} → {len(_mk_segs_st)} segs for ShaderToy")
+            _mk_tl = encode_timeline_glsl(_mk_segs_st, _mk_tps)
+            _it_timeline_glsl = timeline_to_glsl_arrays(_mk_tl, _mk_tps)
+            print(f"   ✓  Timeline: {_mk_tl['num_segs']} segments encoded to GLSL")
+        except Exception as _mk_err:
+            print(f"   ⚠️  mikit_engine failed ({_mk_err}), using Phase-1 GLSL sim")
+            _it_timeline_glsl = None
+
+        # Convert S3M to MOD-compatible structure for the existing GLSL path.
         # IMPORTANT: keep `patterns` indexable by the ORIGINAL pattern number,
         # NOT reordered into song-play order. `song_positions` carries the
         # original pattern indices (0..num_patterns-1), and `mod.patterns[i]`
@@ -12768,19 +16393,50 @@ def main():
         mod = MODFile(args.modfile)
         mod.is_s3m = False
         mod.num_channels = 4
+        print(f"🎵 {mod.title}")
+        print(f"   Patterns: {mod.num_patterns}, Channels: {mod.num_channels}")
+        print(f"   Speed: {mod.initial_speed}, Tempo: {mod.initial_tempo}")
+        # ── mikit_engine: tick-accurate MOD simulation ──────────────────────
+        try:
+            print("   🔬 Running mikit_engine tick simulation...")
+            _mk_player = load_mod_native(args.modfile)
+            _mk_segs   = _mk_player.run()
+            _mk_tps    = _mk_player.initial_tempo * 2.0 / 5.0
+            print(f"   ✓  {len(_mk_segs)} voice segments, {_mk_tps:.1f} ticks/sec")
+            _180_max_tick = int(180.0 * _mk_tps)
+            _mk_segs_st = [s for s in _mk_segs if s.tick_states and s.tick_states[0][0] < _180_max_tick]
+            if len(_mk_segs_st) < len(_mk_segs):
+                print(f"   ⏱️  180s clip: {len(_mk_segs)} → {len(_mk_segs_st)} segs for ShaderToy")
+            _mk_tl = encode_timeline_glsl(_mk_segs_st, _mk_tps)
+            _it_timeline_glsl = timeline_to_glsl_arrays(_mk_tl, _mk_tps)
+            print(f"   ✓  Timeline: {_mk_tl['num_segs']} segments encoded to GLSL")
+        except Exception as _mk_err:
+            print(f"   ⚠️  mikit_engine failed ({_mk_err}), using Phase-1 GLSL sim")
+            _it_timeline_glsl = None
     elif fmt == 'XM':
-        # Phase-1 XM support — parser flattens instruments to one sample
-        # each, clamps patterns to 64 rows, drops XM-only effects (G/H/K/L/
-        # P/R/T/X), and downconverts 16-bit samples to 8-bit. Engine path
-        # below is the same as for MOD.
         xm = XMFile(args.modfile)
         print(f"🎵 {xm.title}")
         print(f"   Patterns: {xm.num_patterns}, Channels: {xm.num_channels}")
         print(f"   Speed: {xm.initial_speed}, Tempo: {xm.initial_tempo}")
-        print("   ⚠️  XM support is Phase-1: envelopes/NNA/multi-sample-per-instrument")
-        print("      not yet implemented; XM-specific letter effects (G/H/K/L/P/R/T/X)")
-        print("      drop to no-ops. Most files play recognizably; high-pitched leads")
-        print("      and sub-bass may sit at the wrong octave (engine period clamp).")
+        # ── mikit_engine: tick-accurate XM simulation ────────────────────────
+        # Full envelopes, multi-sample per instrument, key-off, rel_note, NNA.
+        try:
+            print("   🔬 Running mikit_engine tick simulation...")
+            _mk_player = load_xm_native(args.modfile)
+            _mk_segs   = _mk_player.run()
+            _mk_tps    = _mk_player.initial_tempo * 2.0 / 5.0
+            print(f"   ✓  {len(_mk_segs)} voice segments, {_mk_tps:.1f} ticks/sec")
+            _180_max_tick = int(180.0 * _mk_tps)
+            _mk_segs_st = [s for s in _mk_segs if s.tick_states and s.tick_states[0][0] < _180_max_tick]
+            if len(_mk_segs_st) < len(_mk_segs):
+                print(f"   ⏱️  180s clip: {len(_mk_segs)} → {len(_mk_segs_st)} segs for ShaderToy")
+            _mk_tl = encode_timeline_glsl(_mk_segs_st, _mk_tps)
+            _it_timeline_glsl = timeline_to_glsl_arrays(_mk_tl, _mk_tps)
+            print(f"   ✓  Timeline: {_mk_tl['num_segs']} segments encoded to GLSL")
+        except Exception as _mk_err:
+            import traceback; traceback.print_exc()
+            print(f"   ⚠️  mikit_engine failed ({_mk_err}), using Phase-1 GLSL sim")
+            _it_timeline_glsl = None
         mod = type('obj', (object,), {
             'title':         xm.title,
             'samples':       xm.samples,
@@ -12807,9 +16463,6 @@ def main():
         print(f"🎵 {it.title}")
         print(f"   Patterns: {it.num_patterns}, Channels: {it.num_channels}")
         print(f"   Speed: {it.initial_speed}, Tempo: {it.initial_tempo}")
-        print("   ⚠️  IT support is Phase-1: envelopes/NNA/filters/pitch-envelope/")
-        print("      stereo samples not yet implemented; old (cmwt<0x200) instruments")
-        print("      use simplified mapping. Most files play recognizably.")
         mod = type('obj', (object,), {
             'title':         it.title,
             'samples':       it.samples,
@@ -12833,6 +16486,25 @@ def main():
             # MOD-style hardcoded LRRL pattern in the audio mix.
             'channel_pan':   it.channel_pan,
         })()
+        # ── mikit_engine: run tick-accurate IT simulation → pre-baked timeline ──
+        # Replaces stateless GLSL getChannelOutput with pre-computed voice segments.
+        # On failure, falls back to the old Phase-1 approach (USE_TIMELINE_DSP=0).
+        try:
+            print("   🔬 Running mikit_engine tick simulation...")
+            _mk_player = load_it_native(args.modfile)
+            _mk_segs = _mk_player.run()
+            _mk_tps = _mk_player.initial_tempo * 2.0 / 5.0
+            print(f"   ✓  {len(_mk_segs)} voice segments, {_mk_tps:.1f} ticks/sec")
+            _180_max_tick = int(180.0 * _mk_tps)
+            _mk_segs_st = [s for s in _mk_segs if s.tick_states and s.tick_states[0][0] < _180_max_tick]
+            if len(_mk_segs_st) < len(_mk_segs):
+                print(f"   ⏱️  180s clip: {len(_mk_segs)} → {len(_mk_segs_st)} segs for ShaderToy")
+            _mk_tl = encode_timeline_glsl(_mk_segs_st, _mk_tps)
+            _it_timeline_glsl = timeline_to_glsl_arrays(_mk_tl, _mk_tps)
+            print(f"   ✓  Timeline: {_mk_tl['num_segs']} segments encoded to GLSL")
+        except Exception as _mk_err:
+            print(f"   ⚠️  mikit_engine failed ({_mk_err}), using Phase-1 GLSL sim")
+            _it_timeline_glsl = None
     elif fmt in ('STM', 'MTM'):
         raise ValueError(
             f"{fmt} format is not yet implemented in this player. "
@@ -13094,6 +16766,29 @@ def main():
             return 0                       # beyond table — caller treats as no-note
         return s3m_note_to_period[idx]
     
+    # ── Truncate song_positions to 180s before pattern encoding ─────────────────
+    # Segments are already clipped above; do the same for the pattern-bytes path
+    # so patterns referenced only beyond 180s are excluded from the GLSL output.
+    _mk_player_ref = locals().get('_mk_player')
+    if _mk_player_ref is not None and hasattr(_mk_player_ref, 'row_events'):
+        _sp_tps = _mk_player_ref.initial_tempo * 2.0 / 5.0
+        _sp_max_tick = int(180.0 * _sp_tps)
+        _sp_last = 0
+        for (_t, _sp, _r, _pn) in _mk_player_ref.row_events:
+            if _t >= _sp_max_tick:
+                break
+            if _sp > _sp_last:
+                _sp_last = _sp
+        _sp_n = _sp_last + 1
+        if _sp_n < len(mod.song_positions):
+            _sp_orig = len(mod.song_positions)
+            mod.song_positions = list(mod.song_positions[:_sp_n])
+            if hasattr(mod, 'orders'):
+                mod.orders = mod.song_positions
+            if hasattr(mod, 'song_length'):
+                mod.song_length = _sp_n
+            print(f"   ✂️  180s clip: song_positions {_sp_orig} → {_sp_n} (patterns beyond 180s excluded)")
+
     # ── Only embed patterns actually referenced in song_positions ──────────────
     # Many MODs allocate 64 pattern slots but use only 15-20.
     # We remap indices to a dense array and rewrite songPositions accordingly.
@@ -13233,16 +16928,69 @@ Just open `{base_name}_player.html` in a browser - works offline!
 - `0` = Normal (full song loop)
 - `255` = Testing (10 second loop)
 
-Generated by MOD2GLSL v1.54
+Generated by MOD2GLSL v1.55
 """)
     
-    # Generate HTML player (now works for both MOD and S3M)
+    # Generate HTML player — segment-based (Python ITPlayer → JS replay) with
+    # fallback to the legacy JS-engine player when mikit segments are unavailable.
     html_file = base_name + "_player.html"
-    create_fixed_player_html(mod, html_file, args.downsample, compress=True, vec_dim=args.vec_dim)
+    _smk_player = locals().get('_mk_player')
+    _smk_segs   = locals().get('_mk_segs')
+    if _smk_player is not None and _smk_segs is not None:
+        print(f"\n🎵 Generating segment-based HTML player ({len(_smk_segs)} segs)...")
+        try:
+            create_segment_player_html(_smk_player, _smk_segs, mod.samples, html_file, mod.title)
+        except Exception as _seg_err:
+            import traceback as _tb; _tb.print_exc()
+            print(f"   ⚠️  Segment player failed ({_seg_err}), falling back to fixed player")
+            create_fixed_player_html(mod, html_file, args.downsample, compress=True, vec_dim=args.vec_dim)
+    else:
+        create_fixed_player_html(mod, html_file, args.downsample, compress=True, vec_dim=args.vec_dim)
+
+    # ── ShaderToy 180s hard limit: truncate song_positions to fit ────────────
+    # ShaderToy caps Sound shader runtime at 180 seconds. Songs longer than
+    # this just get cut off mid-pattern, so we drop trailing orders that
+    # start past TIME_LIMIT and emit a #define TIME_LIMIT into Common. The
+    # HTML player is unaffected (already generated above).
+    TIME_LIMIT_SEC = 180.0
+    if _smk_player is not None and _smk_segs is not None:
+        _tl_tps = _smk_player.initial_tempo * 2.0 / 5.0
+        _tl_max_tick = int(TIME_LIMIT_SEC * _tl_tps)
+        _last_keep_pos = 0
+        for (_t, _sp, _r, _pn) in _smk_player.row_events:
+            if _t > _tl_max_tick:
+                break
+            if _sp > _last_keep_pos:
+                _last_keep_pos = _sp
+        _n_keep = _last_keep_pos + 1
+        if hasattr(mod, 'song_positions') and _n_keep < len(mod.song_positions):
+            _orig_n = len(mod.song_positions)
+            print(f"   ⏱️  TIME_LIMIT={TIME_LIMIT_SEC}s: truncating {_orig_n} → {_n_keep} song positions for ShaderToy")
+            mod.song_positions = list(mod.song_positions[:_n_keep])
+            if hasattr(mod, 'orders'):
+                mod.orders = mod.song_positions
+            if hasattr(mod, 'song_length'):
+                mod.song_length = _n_keep
 
     # ShaderToy Common tab: VQ-encoded via embedded vq_encoder_v2 (default),
     # or legacy PNG-loaded Common via create_shadertoy_glsl when --use-png.
     glsl_common_file = base_name + "_shadertoy_common.glsl"
+
+    # Cap timeline for ShaderToy: 12 arrays × N entries fills Sound tab fast.
+    # 2000 segs ≈ 210 KB of timeline data; combined with VQ codec (~200 KB) the
+    # Sound tab stays under ~500 KB. Songs over this limit fall back to the
+    # traditional pattern player (USE_TIMELINE_DSP=0). HTML player unaffected.
+    _ST_TL_MAX_SEGS = 2000
+    _st_timeline_glsl = _it_timeline_glsl
+    if _it_timeline_glsl is not None:
+        import re as _re_tl
+        _tl_m = _re_tl.search(r'TL_NUM_SEGS\s*=\s*(\d+)', _it_timeline_glsl)
+        if _tl_m and int(_tl_m.group(1)) > _ST_TL_MAX_SEGS:
+            print(f"   ⚠️  Timeline {_tl_m.group(1)} segs > {_ST_TL_MAX_SEGS} ShaderToy limit "
+                  f"(Sound tab would be ~{int(_tl_m.group(1))*12*9//1024} KB). "
+                  f"ShaderToy uses pattern player; HTML keeps full timeline.")
+            _st_timeline_glsl = None
+
     if args.use_png:
         print(f"\n\U0001f5bc\ufe0f  --use-png: skipping VQ encoder, generating PNG-loaded Common")
         # Legacy Common is generated below by create_shadertoy_glsl into the
@@ -13733,7 +17481,7 @@ Generated by MOD2GLSL v1.54
                 import re as _re_v
                 _new_banner = (
                     "/* ============================================================================\n"
-                    "   GLSL (The Last) MOD Player v1.54 (c) 2026 Orblivius\n"
+                    "   GLSL (The Last) MOD Player v1.55 (c) 2026 Orblivius\n"
                     "   \n"
                     "   32 Tracks support, IT/XM/S3M/MOD loader, 3D Surround, PHAT Bass, Velvet Reverb, \n"
                     "   Comb Reverb, FAT, W1 Limiter, RVQ sample compression, configurable downsample\n"
@@ -13791,6 +17539,36 @@ Generated by MOD2GLSL v1.54
                         "// DSP mode switch — 0 = v1.45 (fancy), 1 = v1.42-compatible (simpler).\n"
                         f"#define USE_142_DSP {_use142_int}\n\n"
                     ) + _ct
+
+                # Inject TIME_LIMIT — ShaderToy hard-caps Sound shader at 180s.
+                # song_positions has already been truncated above so the song
+                # fits; this constant lets the Sound tab also clamp its output.
+                if 'TIME_LIMIT' not in _ct:
+                    _ct = (
+                        "// ShaderToy Sound tab is capped at 180 seconds of playback.\n"
+                        f"#define TIME_LIMIT {TIME_LIMIT_SEC}\n"
+                    ) + _ct
+
+                # Also inject USE_TIMELINE_DSP so the Sound tab's #if blocks
+                # have a defined value when Common gets prepended. The VQ
+                # encoder's Common template doesn't emit it; we infer the
+                # value from whether mikit segments were produced.
+                # Use _st_timeline_glsl (not raw _smk_segs) so that songs
+                # whose segment count exceeded _ST_TL_MAX_SEGS emit 0 here,
+                # keeping Common in sync with Sound's actual #if path.
+                _tldsp_int = 1 if _st_timeline_glsl is not None else 0
+                if 'USE_TIMELINE_DSP' not in _ct:
+                    _ct = (
+                        "// USE_TIMELINE_DSP=1: Sound reads pre-baked mikit voice segments.\n"
+                        "// USE_TIMELINE_DSP=0: Sound uses the traditional GLSL pattern player.\n"
+                        f"#define USE_TIMELINE_DSP {_tldsp_int}\n"
+                    ) + _ct
+                else:
+                    import re as _re_tldsp
+                    _ct = _re_tldsp.sub(
+                        r'#define\s+USE_TIMELINE_DSP\s+[01]',
+                        f'#define USE_TIMELINE_DSP {_tldsp_int}',
+                        _ct, count=1)
 
                 # Inject PHATBASS_MIX_MODE into the VQ-emitted Common (encoder
                 # doesn't emit it). 0 = per-sample (only isBass[] taps), 1 =
@@ -13971,7 +17749,19 @@ Generated by MOD2GLSL v1.54
                     # nibble, capping at 8757 Hz; without this array, IT's
                     # inst 27 sinewave (c5=168000) plays 4 octaves too low.
                     # 0 = use the c4speeds[finetune] fallback (MOD/XM path).
-                    _c5_v = ', '.join(str(s.get('c5_speed', 0)) for s in _xm_samples)
+                    # S3M instruments store c2spd (= Hz at S3M C-4 / period 428)
+                    # instead of c5_speed.  The GLSL formula `freq = c5spd *
+                    # 428 / period` uses period 428 as its reference, which
+                    # matches S3M C-4 exactly → store c2spd directly.
+                    def _get_c5_speed(s):
+                        c5 = s.get('c5_speed', 0)
+                        if c5:
+                            return c5
+                        c2 = s.get('c2spd', 0)
+                        if c2:
+                            return c2
+                        return 0
+                    _c5_v = ', '.join(str(_get_c5_speed(s)) for s in _xm_samples)
                     # sampleNNA: New-Note-Action byte for each sample (0=cut,
                     # 1=continue, 2=note-off, 3=note-fade). The GLSL needs
                     # this to know when an old voice should fade through its
@@ -14191,6 +17981,7 @@ Generated by MOD2GLSL v1.54
                                  sample_bytes_data=sample_bytes,
                                  seek_table=seek_table, vec_dim=args.vec_dim,
                                  viz=args.viz,
+                                 timeline_glsl=_st_timeline_glsl,
                                  compat={
                                      'no_surround':   getattr(args, '_compat_no_surround', False),
                                      'no_fat':        getattr(args, '_compat_no_fat', False),
@@ -14211,6 +18002,7 @@ Generated by MOD2GLSL v1.54
                          sample_bytes_data=sample_bytes,
                          seek_table=seek_table, vec_dim=args.vec_dim,
                          viz=args.viz,
+                         timeline_glsl=_st_timeline_glsl,
                          compat={
                              'no_surround':   getattr(args, '_compat_no_surround', False),
                              'no_fat':        getattr(args, '_compat_no_fat', False),
@@ -14626,7 +18418,9 @@ float xmReleaseMul(int ch, Position pos, float curTime) {
                     '                if (_pIns2 >= 1 && _pIns2 <= 31) {\n'
                     '                    float _pTrigTime = float(fetchTick(patTickOffset[pTrigPat]+(pTrigRow-patStartRow[pTrigPat]))) / TICKS_PER_SEC;\n'
                     '                    float _curTrigTime = float(fetchTick(patTickOffset[trigPat]+(trigRow-patStartRow[trigPat]))) / TICKS_PER_SEC;\n'
-                    '                    float _koAge = max(0.0, time - _curTrigTime);\n'
+                    '                    // NNA=1 (continue): ghost stays in sustain — not key-offed\n'
+                    '                    // NNA=2/3 (noteoff/fade): key-offs at new trigger time\n'
+                    '                    float _koAge = (sampleNNA[_pIns2 - 1] == 1) ? 0.0 : max(0.0, time - _curTrigTime);\n'
                     '                    s_prev *= envValueAt(_pIns2 - 1, time - _pTrigTime, _koAge);\n'
                     '                }\n'
                     '                return s_curr + s_prev;\n'
