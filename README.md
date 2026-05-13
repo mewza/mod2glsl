@@ -1,8 +1,8 @@
 <div align="center">
 
-# 🎵 MOD2GLSL v1.54
+# 🎵 MOD2GLSL v1.55
 
-$${\Large\color{orange}\textsf{GLSL MOD Player v1.54 for ShaderToy}}$$
+$${\Large\color{orange}\textsf{GLSL MOD Player v1.55 for ShaderToy}}$$
 $${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
 
 ![Version](https://img.shields.io/badge/version-1.37-orange?style=flat-square)
@@ -18,7 +18,7 @@ $${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
 
 https://github.com/user-attachments/assets/4c7fe125-086c-410b-bcba-808fc7648984
 
-*BEYOND_MUSIC.MOD rendered through GLSL MOD Player v1.54*
+*BEYOND_MUSIC.MOD rendered through GLSL MOD Player v1.55*
 
 </div>
 
@@ -30,26 +30,26 @@ Examples: <br>
     
 ---
 
-## $${\color{limegreen}\textsf{✨ What's new in v1.54}}$$
+## $${\color{limegreen}\textsf{✨ What's new in v1.55}}$$
 
-$\color{limegreen}\textsf{+}$ &nbsp; **Impulse Tracker (IT) w/ NNA support**  <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Impulse Tracker (IT) w/ NNA support (reference precision)**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Fast Tracker II (XM) support**  <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **ScreamTracker 3.xx (S3M) support**<br>
-$\color{limegreen}\textsf{+}$ &nbsp; **Fixed some more bugs in IT playback**  <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Scream Tracker 3.xx (S3M) support**<br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Rewritten from scratch with individual format loaders to avoid a big mess**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Avanced micro-click removal**  <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **TRU 3D Surround** (new improved AllPass 3D Surround technique)<br>
-$\color{limegreen}\textsf{+}$ &nbsp; **Phat Bass — Hilbert applied to bass tracks or a mix**<br>
+$\color{limegreen}\textsf{+}$ &nbsp; **TRUE 3D Surround** (new improved AllPass 3D Surround technique)<br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Phat Bass — HAAS + allpass fx**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Velvet Reverb** <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **FAT 4X** (Fat curve compressor)<br>
-$\color{limegreen}\textsf{+}$ &nbsp; **W1 (Low latency) Limiter** <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **FAT4X** (Fat curve compressor)<br>
+$\color{limegreen}\textsf{+}$ &nbsp; **W1 Limiter** <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **RVQ sample compression** — 27.7 dB<br>
-$\color{limegreen}\textsf{+}$ &nbsp; **Mouse control to horizontal scroll between tracks**  <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Mouse control to horizontal scroll tracks**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Downsampling integrated with RVQ (--downsample 1, 2 or 4)**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Linear, B-Spline, and Lanczos3 resamplers**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Up to 32 tracks supported**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Data packing optimizations**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Loader optimizations**  <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **NEW visualizers** <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **8 Visualizers backdrop for ShaderToy builds** <br>
 $\color{limegreen}\textsf{+}$ &nbsp; Added `--help`   <br>
 $\color{limegreen}\textsf{+}$ &nbsp; Added `--use-png` — roll MOD into a PNG for a much faster load<br>
 $\color{limegreen}\textsf{+}$ &nbsp; Added `--viz 0` (no backdrop) plus visualizers `1`–`8`  <br>
