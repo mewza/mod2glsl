@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🎵 MOD2GLSL v1.62
+# 🎵 MOD2GLSL v1.63
 
 $${\Large\color{orange}\textsf{GLSL MOD Player v1.62 for ShaderToy}}$$
 $${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
@@ -18,7 +18,7 @@ $${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
 
 https://github.com/user-attachments/assets/4c7fe125-086c-410b-bcba-808fc7648984
 
-*BEYOND_MUSIC.MOD rendered through GLSL MOD Player v1.62*
+*BEYOND_MUSIC.MOD rendered through GLSL MOD Player v1.63*
 
 </div>
 
@@ -30,10 +30,10 @@ Examples: <br>
     
 ---
 
-## $${\color{limegreen}\textsf{✨ What's new in v1.62}}$$
+## $${\color{limegreen}\textsf{✨ What's new in v1.63}}$$
 
 $\color{limegreen}\textsf{+}$ &nbsp; **Impulse Tracker (IT) w/ NNA support (reference precision)**  <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **Fast Tracker II (XM) support is back!**  <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Fast Tracker II (XM) support is solid!**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Scream Tracker 3.xx (S3M) support**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Rewritten from scratch with individual format loaders to avoid a big mess**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Avanced micro-click removal**  <br>
