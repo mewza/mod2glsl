@@ -2428,7 +2428,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
 
     # Human-readable visualizer name (stamped into every tab header).
     _VIZ_NAMES = {
-        0: "None (black backdrop)",
+        0: "Sun Rays (cabbibo-style — warm/cool god-ray corona)",
         1: "Reactive 001 (PAEz fork — SDF circles + cosmic web)",
         2: "Fluxline Surfer (mrange — DR2 dodecahedron + glowtracer)",
         3: "Zuvuya (city/stars + audio-reactive curtain)",
@@ -2438,6 +2438,16 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
         7: "Sparkly 4D (Philip Bertani — 4D IFS volumetric raymarcher)",
         8: "Skywalker (orblivius — synchronized flying-curve terrain + star field + cloud)",
         9: "Music is in the DNA (jaszunio15/enbe fork — DNA helix + parallax dunes)",
+       10: "LED Band Spectro 3D (orblivious — pentagon LED tunnel + spectro history)",
+       11: "Telekenesis v1.1 (Orblivious — IFS fractal raymarcher + waveform strip)",
+       12: "Laser Patterns (0rblivius — Newton/IFS laser-grid fractal marcher)",
+       13: "Prismatic Fractals (Smull fork — IFS box raymarch + audio glow)",
+       14: "Interdimensional Folding Path (PAEz fork — spatial fold + sine warp)",
+       15: "Fractal Torus + IFS Fold Hypnosphere (ytt fork — torus march + Menger fold)",
+       16: "Unfound (diatribes fork — orbit-trap fold + sinusoidal orb march)",
+       17: "Everything is Temporary (diatribes/FabriceNeyret2 fork — noise terrain + orb volumetric march)",
+       18: "sm0g (diatribes/Shane fork — tri-planar textured SDF box corridors + bump map)",
+       19: "Spectro 3D Mist (Orblivius — 3D SDF bar spectrum + volumetric fog + reflective ground)",
     }
     viz_name = _VIZ_NAMES.get(viz, f"viz{viz}")
 
@@ -2575,8 +2585,10 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
             for ch in range(num_channels_tmp):
                 try:
                     note = mod.patterns[pi][row][ch]
-                    if note.get('effect', 0) == 0xB:
-                        param = note.get('param', 0)
+                    _is_b     = note.get('effect', 0) == 0xB   # MOD/XM/IT
+                    _is_s3m_b = note.get('command') == 2        # S3M Bxx
+                    if _is_b or _is_s3m_b:
+                        param = note.get('param', 0) if _is_b else note.get('info', 0)
                         if 0 < param < len(mod.song_positions):
                             loop_target_songpos = param
                 except: pass
@@ -2597,9 +2609,14 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
             for _ch in range(_num_ch):
                 try:
                     _n = mod.patterns[_pi][_ri][_ch]
-                    if _n.get('effect',0) == 0xD and _d_row is None:
+                    _is_d     = _n.get('effect', 0) == 0xD  # MOD/XM/IT Dxx (BCD param)
+                    _is_s3m_d = _n.get('command') == 3       # S3M Cxx (decimal info)
+                    if (_is_d or _is_s3m_d) and _d_row is None:
                         _d_row = _ri
-                        _d_param = ((_n['param']>>4)&0xF)*10 + (_n['param']&0xF)
+                        if _is_d:
+                            _d_param = ((_n['param']>>4)&0xF)*10 + (_n['param']&0xF)
+                        else:
+                            _d_param = _n.get('info', 0)  # S3M: info is target row directly
                 except: pass
         if _d_row is not None:
             _cumul += _d_row - _next_start + 1
@@ -2648,7 +2665,11 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
             for _ch in range(_num_ch):
                 try:
                     _n = _row[_ch]
-                    if _n.get('effect', 0) == 0xF and _n.get('param', 0) > 0:
+                    _cmd = _n.get('command')   # S3M: 1=Axx(speed), 20=Txx(tempo)
+                    _inf = _n.get('info', 0)
+                    if   _cmd == 1  and _inf > 0: _cur_speed = _inf
+                    elif _cmd == 20 and _inf > 0: _cur_tempo = _inf
+                    elif _n.get('effect', 0) == 0xF and _n.get('param', 0) > 0:
                         _p = _n['param']
                         if _p < 0x20: _cur_speed = _p
                         else:         _cur_tempo = _p
@@ -2662,13 +2683,19 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
     assert len(_row_start_times) == _total_song_rows + 1, (
         f"row time table length mismatch: {len(_row_start_times)} vs {_total_song_rows+1}")
     _actual_song_seconds = _row_start_times[-1]
+    def _has_tempo_fx(n):
+        if n is None: return False
+        if n.get('command') in (1, 20) and n.get('info', 0) > 0: return True   # S3M Axx/Txx
+        return n.get('effect', 0) == 0xF and n.get('param', 0) > 0             # MOD/XM/IT Fxx
     _f_effect_count = sum(1 for _si, _pi in enumerate(mod.song_positions)
                           for _ri in range(64)
                           for _ch in range(_num_ch)
-                          if (lambda n: n is not None and n.get('effect',0)==0xF and n.get('param',0)>0)
-                             ((mod.patterns[_pi][_ri][_ch] if _ri < len(mod.patterns[_pi]) and _ch < len(mod.patterns[_pi][_ri]) else None) if _pi < len(mod.patterns) else None))
+                          if _has_tempo_fx(
+                              (mod.patterns[_pi][_ri][_ch]
+                               if _ri < len(mod.patterns[_pi]) and _ch < len(mod.patterns[_pi][_ri])
+                               else None) if _pi < len(mod.patterns) else None))
     if _f_effect_count > 2:   # >2 since initial-speed-set typically uses 1-2 Fxx
-        print(f"   🎚️  {_f_effect_count} mid-song F effects detected → using per-row time table")
+        print(f"   🎚️  {_f_effect_count} mid-song speed/tempo effects detected → using per-row time table")
 
 
     # ── Estimate song duration vs Shadertoy's audio buffer cap (~180s) ──
@@ -2715,7 +2742,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
     # ========== COMMON TAB ==========
     # Instrument count: S3M/IT can exceed 31 (2ND_PM=54). Hardcoded 31
     # silenced instruments 32+ (voice/vocal samples) — feedback_s3m_
-    # instrument_cap, ported onto v1.61. Used by _gcoBody guard, isBass[],
+    # instrument_cap, ported onto v1.62. Used by _gcoBody guard, isBass[],
     # samples[] across Common+Sound; must be defined before common_glsl.
     # DYNAMIC instrument/sample count — sized to the actual file, never a
     # hardcoded cap. MOD naturally yields 31 (its fixed header), S3M/XM/IT
@@ -2729,7 +2756,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
                 len(getattr(mod, 'samples', []) or []))
     data_source_comment = "Embedded data (no PNG required)" if use_embedded else f"All data in 1024×1024 RGBA PNG: {png_file}"
     common_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.61 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.62 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    COMMON TAB
    Visualizer: {viz_name}
@@ -3426,7 +3453,7 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     _ap_p0_2, _ap_p1p2_2, _ap_delay_2 = _only3d_coeffs(_ONLY3D_FREQ2)
 
     sound_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.61 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.62 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    SOUND TAB
    Visualizer: {viz_name}
@@ -3594,7 +3621,7 @@ vec2 mainSound(int samp, float time) {{
     // NNA / DCT / DCA / fadeout into the VoiceSegment timeline; tlGetOutput
     // sums the active segments. The entire pattern-player dry/3D/PhatBass
     // path below is preprocessor-removed for IT (no double-mix, no wasted
-    // per-sample pattern walk). v1.61's downstream limiter/FAT/comb still
+    // per-sample pattern walk). v1.62's downstream limiter/FAT/comb still
     // apply to _out.
     vec2 _out = tlGetOutput(playbackTime);
 #else
@@ -3732,8 +3759,8 @@ vec2 mainSound(int samp, float time) {{
         _out = sign(_out) * (min(_ax, vec2(_T)) + _reduced);
     }}
 
-    // Hand off to v1.61's comb reverb + buffer-fade (kept active; mod_player.py
-    // has these disabled but removing v1.61's working tail is not requested).
+    // Hand off to v1.62's comb reverb + buffer-fade (kept active; mod_player.py
+    // has these disabled but removing v1.62's working tail is not requested).
     float outL = _out.x;
     float outR = _out.y;
 
@@ -3889,8 +3916,40 @@ vec2 mainSound(int samp, float time) {{
 
     # ── Viz scene functions: only the chosen viz's GLSL is emitted ──────────
     if viz == 0:
-        # No visualizer — empty scene block.  vec3 col = vec3(0.0) is set in setup.
-        viz_scene_block = "\n// === VIZ 0: None — black backdrop ===\n"
+        # Sun Rays — warm/cool god-ray corona (cabbibo-style).
+        viz_scene_block = r"""
+// === VIZ 0: Sun Rays (cabbibo-style — warm/cool god-ray corona) ===============
+// Two overlapping god-ray fans from off-screen upper-right, brightness-falloff.
+// Prefixed: _v0_*.
+
+float _v0_rayStrength(vec2 raySource, vec2 rayRefDir, vec2 coord,
+                      float seedA, float seedB, float speed) {
+    vec2 src2c = coord - raySource;
+    float cosA  = dot(normalize(src2c), rayRefDir);
+    return clamp(
+        (0.45 + 0.15 * sin( cosA * seedA + iTime * speed)) +
+        (0.30 + 0.20 * cos(-cosA * seedB + iTime * speed)),
+        0.0, 1.0) *
+        clamp((iResolution.x - length(src2c)) / iResolution.x, 0.5, 1.0);
+}
+
+vec3 _VizScene(vec2 C) {
+    // flip Y so coord origin matches fragCoord convention
+    vec2 coord  = vec2(C.x, iResolution.y - C.y);
+    vec2 rayPos = vec2(iResolution.x * 1.1, -0.5 * iResolution.y);
+
+    vec4 rays1 = vec4(1.0, 170.0/255.0, 110.0/255.0, 1.0) *
+        _v0_rayStrength(rayPos, normalize(vec2(1.0, 1.000)), coord, 36.2214,  21.11349, 1.0);
+    vec4 rays2 = vec4(150.0/255.0, 200.0/255.0, 255.0/255.0, 1.0) *
+        _v0_rayStrength(rayPos, normalize(vec2(1.0, 0.241)), coord, 22.39910, 18.02340, 0.2);
+
+    vec3 o = (rays1 * 0.2 + rays2 * 0.7).rgb;
+
+    // Inverse-square brightness falloff from light source
+    float dToLight = length(C - vec2(rayPos.x, iResolution.y - rayPos.y)) / iResolution.y;
+    return o * (0.4 / (dToLight * dToLight));
+}
+"""
     elif viz == 1:
         # Reactive 001 (PAEz fork) — SDF circles + cosmic web folding
         viz_scene_block = r"""
@@ -5421,7 +5480,7 @@ vec3 _VizScene(vec2 u) {
 }
 """
 
-    else:  # viz == 9 — Music is in the DNA (jaszunio15 / enbe fork)
+    elif viz == 9:  # Music is in the DNA (jaszunio15 / enbe fork)
         # Fork of enbe's fork of jaszunio15's "Music is in the DNA": a DNA
         # double-helix over a parallax dune background. ShaderToy's
         # iChannel0(music FFT)/iChannel1(mic) audio reads are collapsed to
@@ -5572,9 +5631,1077 @@ vec3 _VizScene(vec2 fragCoord) {
 }
 """
 
+    elif viz == 10:  # LED Band Spectro 3D (Orblivious, Merry Xmas '25)
+        # Pentagon LED tunnel with 5 walls and 4 bounce reflections.
+        # Audio reactivity via spectrum history stored in Buffer A rows
+        # WAVE_BASE..WAVE_BASE+31 (written by _wave_section, read via iChannel1).
+        # All identifiers prefixed _v10_; history macro _v10_getSpectrum reads
+        # row WAVE_BASE + histRow from iChannel1 (= Buffer A in Image tab).
+        viz_scene_block = r"""
+// === VIZ 10: LED Band Spectro 3D (Orblivious, CC — Merry Xmas '25) ==========
+// Pentagon LED tunnel. Based on https://www.shadertoy.com/view/wcVBRh
+// Spectrum history in Buffer A rows WAVE_BASE..WAVE_BASE+31, via iChannel1.
+// Prefixed: _v10_*.
+
+const int _v10_numWalls = 5;
+
+mat2 _v10_R2(float a) { return mat2(cos(a), -sin(a), sin(a), cos(a)); }
+
+vec3 _v10_spectrumColor(float t, float energy) {
+    vec3 a = vec3(0.5, 0.5, 0.5);
+    vec3 b = vec3(0.5, 0.5, 0.5);
+    vec3 c = vec3(1.0, 1.0, 1.0);
+    vec3 d = vec3(0.0, 0.33, 0.67);
+    vec3 col = a + b * cos(6.283 * (c * t + d));
+    return col * (1.0 + energy * 1.5);
+}
+
+float _v10_hitPlane(vec3 ro, vec3 rd, vec3 wallN, float dist) {
+    float denom = dot(rd, wallN);
+    if (denom < 0.0) {
+        float th = (-dist - dot(ro, wallN)) / denom;
+        if (th > 0.0) return th;
+    }
+    return 1e8;
+}
+
+// Read spectrum history from Buffer A WAVE rows via iChannel1.
+// freq: 0..1 (frequency band), histRow: 0..31 (0=newest frame).
+// WAVE_BASE=70, so reads row 70+histRow.  iResolution.x maps freq→pixel.
+#define _v10_getSpectrum(freq,hr) texelFetch(iChannel1,ivec2(clamp(int((freq)*float(iResolution.x)),0,int(iResolution.x)-1),70+(hr)),0).r
+
+vec3 _VizScene(vec2 C) {
+    float t       = iTime;
+    float bassHit = _v10_getSpectrum(0.08, 0);
+    vec3  col     = vec3(0.0);
+
+    // 8-sample MSAA jitter loop — smoother anti-aliasing on LED dot edges
+    for (int m = 0; m < 8; m++) {
+        vec2 offset = vec2(m % 3, m / 3) / 3.0 - 0.33;
+        vec2 uv     = (2.0 * (C + offset) - iResolution.xy) / iResolution.y;
+        float time  = t + float(m) * 0.015;
+        vec3  ro    = vec3(0.0, 0.0, time * 1.8);
+        vec3  rd    = normalize(vec3(uv, 1.0));
+        float alph  = 1.0;
+        float fogDt = 1.0;
+
+        // 4 reflections inside the pentagon tunnel
+        for (int i = 0; i < 4; i++) {
+            const float PI = 3.14159265;
+            float dt   = 1e8;
+            vec3  hitN = vec3(0.0);
+            vec3  p    = vec3(0.0);
+
+            for (int w = 0; w < _v10_numWalls; w++) {
+                float angle = float(w) * 2.0 * PI / float(_v10_numWalls)
+                              + ro.z * 0.25;  // spiral twist
+                vec3  wallN  = vec3(cos(angle), sin(angle), 0.0);
+                float dist   = _v10_hitPlane(ro, rd, wallN, 2.3 + bassHit * 0.5);
+                if (dist < dt) { dt = dist; hitN = wallN; p = ro + rd * dist; }
+            }
+            if (i == 0) fogDt = dt;
+
+            // Wall-local UV for LED grid
+            float wallAngle   = atan(hitN.y, hitN.x);
+            float spiralOff   = p.z * 0.25;
+            vec2  pRot = vec2(p.x * cos(-wallAngle) - p.y * sin(-wallAngle),
+                              p.x * sin(-wallAngle) + p.y * cos(-wallAngle));
+            vec2  tuv  = vec2(p.z, pRot.y + spiralOff);
+
+            float numBands  = 12.0;
+            float numLevels = 8.0;
+            vec2  gridUv    = tuv * vec2(numBands * 0.18, numLevels * 0.35);
+            vec2  cellId    = floor(gridUv);
+            vec2  cellUv    = fract(gridUv) - 0.5;
+
+            float bandIndex   = mod(cellId.x, numBands);
+            float freqBand    = bandIndex / numBands;
+            int   histIdx     = clamp(int(mod(p.z * 0.3, 31.0)), 0, 31);
+            float audioLevel  = _v10_getSpectrum(freqBand, histIdx);
+            float audioCur    = _v10_getSpectrum(freqBand, 0);
+            audioLevel = mix(audioCur, audioLevel, 0.5);
+
+            if ((i ^ m) % 2 == 0) audioLevel = 1.0 - min(audioLevel, 1.0);
+            audioLevel *= 1.0 + (1.0 - freqBand) * 0.6;
+            audioLevel *= audioLevel;
+
+            float wave         = sin(t * 3.0 - bandIndex * 0.15) * 0.5 + 0.5;
+            float wave2        = sin(t * 2.3  + bandIndex * 0.20) * 0.5 + 0.5;
+            float dynamicLevel = audioLevel * (0.6 + wave * 0.4) * (0.8 + wave2 * 0.2);
+
+            float levelPos      = mod(cellId.y, numLevels);
+            float centeredLevel = abs(levelPos / numLevels - 0.5) * 2.0;
+            float flutter       = sin(t * 8.0 + bandIndex * 0.5 + levelPos * 0.3) * 0.05;
+            float dotOn         = smoothstep(centeredLevel + flutter + 0.12,
+                                             centeredLevel + flutter - 0.08, dynamicLevel);
+
+            float peakPos  = dynamicLevel * numLevels * 0.5;
+            float distPeak = abs(levelPos - numLevels * 0.5) - peakPos;
+            float isPeak   = smoothstep(0.8, 0.0, abs(distPeak));
+            isPeak *= sin(t * 12.0 + bandIndex) * 0.3 + 0.7;
+
+            float dynamicRad = 0.28 * (sin(t * 6.0 + bandIndex * 0.4) * 0.1 + 0.9)
+                               * (1.0 + audioLevel * 0.4);
+            dynamicRad = dynamicRad * (0.8 + dotOn * 0.4) + isPeak * 0.1;
+
+            float sphere     = length(cellUv) - dynamicRad;
+            float sphereMask = smoothstep(0.06, -0.03, sphere);
+            float glowStr    = 1.0 + audioLevel * 3.0;
+            float glow       = exp(-sphere * glowStr) * (0.4 + audioLevel * 0.6);
+            glow += exp(-sphere * 2.0) * pow(bassHit, 2.0) * 2.0 * dotOn;
+
+            float colorShift = freqBand * 0.8 + t * 0.1;
+            vec3  bandColor  = _v10_spectrumColor(colorShift,       audioLevel);
+            vec3  peakColor  = _v10_spectrumColor(colorShift + 0.3, 1.0) * 2.0;
+            vec3  hotColor   = vec3(1.0, 0.95, 0.9);
+
+            if (dotOn > 0.01) {
+                float intensity = dotOn * (dynamicLevel * 3.0);
+                vec3 layerCol = bandColor * sphereMask * intensity;
+                layerCol = mix(layerCol, peakColor,          sphereMask * isPeak);
+                layerCol = mix(layerCol, hotColor * 3.0,
+                               sphereMask * intensity * audioLevel * 0.5);
+                layerCol += bandColor * glow * dotOn * 0.7;
+                layerCol += peakColor * glow * isPeak * 0.5;
+                layerCol += bandColor * exp(-sphere * 1.2) * dotOn * 0.15;
+                col += layerCol * alph;
+            }
+            alph *= 0.45;
+
+            rd    = reflect(rd, hitN);
+            rd.xy *= _v10_R2(float((i % 2 == 0) ? -1 : 1)
+                             * ro.z * 0.5 * (1.0 + float(i) * 0.5));
+            ro = p + hitN * 0.001;
+        }
+
+        float fog = 1.2 / (1.0 + fogDt * fogDt * (0.12 + bassHit * 0.08));
+        col *= fog;
+    }
+
+    col /= 6.5 / exp(0.5 * bassHit);
+    vec2 q = C / iResolution.xy;
+    col *= 0.5 + 0.5 * pow(16.0 * q.x * q.y * (1.0 - q.x) * (1.0 - q.y), 0.2);
+    col  = pow(max(col, vec3(0.0)), vec3(0.9));
+    col  = mix(vec3(dot(col, vec3(0.299, 0.587, 0.114))), col, 1.2);
+    return col;
+}
+"""
+
+    elif viz == 11:  # Telekenesis v1.1 Optimized (Orblivious)
+        # IFS fractal raymarcher + waveform strip. https://shadertoy.com/view/tffXWM
+        # File-scope globals for shared state between _v11_de / _v11_march.
+        # Audio from Buffer A row 1 DFT (iChannel1). Prefixed: _v11_*.
+        viz_scene_block = r"""
+// === VIZ 11: Telekenesis v1.1 Optimized (Orblivious) ========================
+// IFS fractal raymarcher + audio waveform strip.
+// https://shadertoy.com/view/tffXWM  License: Free for freeware.
+// Audio: Buffer A row 1 DFT via iChannel1. Prefixed: _v11_*.
+
+const float _v11_PI   = 3.1415926535;
+const float _v11_AMP  = 0.06;
+const float _v11_yMul = 8.88;
+const float _v11_sc   = 2.04;  // ifs_scale
+
+const vec3 _v11_d12[4] = vec3[4](
+    vec3( 1., 1., 1.), vec3(-1.,-1., 1.),
+    vec3( 1.,-1.,-1.), vec3(-1., 1.,-1.)
+);
+const float _v11_iP2[6] = float[6](0.0, 1.0, 4.0, 9.0, 16.0, 25.0);
+
+float _v11_val;       // per-march max amplitude (used for waveform strip)
+vec3  _v11_ic;        // ifs_color (set by _v11_de, read by _v11_march)
+vec3  _v11_col;       // color accumulator (set by _v11_march)
+
+// DFT bin from Buffer A row 1 (spectrum). u=0..1 → bin 0..FFT_N/2-1.
+#define _v11_aud(u) texelFetch(iChannel1,ivec2(clamp(int(clamp(float(u),0.,1.)*float(FFT_N/2)),0,FFT_N/2-1),1),0).r
+// Waveform sample from Buffer A row 0 (time domain, 0..1 centered at 0.5).
+#define _v11_wav(u) (texelFetch(iChannel1,ivec2(clamp(int(clamp(float(u),0.,1.)*float(FFT_N)),0,FFT_N-1),0),0).r - 0.5)
+
+float _v11_de(vec3 z) {
+    int n = 0;
+    float md, dtv;
+    vec3 mv;
+    const float dd = 0.1;
+    vec3 id = round(z / dd);
+    z.z -= dd * id.z;
+    _v11_ic = vec3(0.0);
+    float bs = 5.0 * (1.0 + _v11_aud(1.0));
+    for (int i = 0; i < 6; i++) {
+        mv = _v11_d12[0]; md = length(z - _v11_d12[0]);
+        for (int j = 0; j < 4; j++) {
+            dtv = length(z - _v11_d12[j]);
+            if (dtv < md) { mv = _v11_d12[j]; md = dtv; }
+        }
+        z = mv + _v11_sc * (z - mv);
+        n++;
+        float isq = _v11_iP2[i], ifl = float(i);
+        _v11_ic.x += 0.2 * isq * bs * cos(isq *  5.0 + id.z + iTime * 0.2);
+        float xv   = 0.25 * ifl * bs * sin(ifl *  2.0 + id.z + iTime * 2.0);
+        _v11_val   = max(_v11_val, xv);
+        _v11_ic.y += xv;
+        _v11_ic.z += 0.5 * ifl * bs * cos(isq * 10.0 + id.z - iTime);
+    }
+    _v11_ic /= float(n);
+    return length(z) / pow(_v11_sc, float(n));
+}
+
+float _v11_march(vec3 mro, vec3 rd, float mx) {
+    float t = 0.0;
+    _v11_val = 0.0;
+    _v11_col = vec3(0.0);
+    for (int i = 0; i < 50; i++) {
+        float d = _v11_de(mro + rd * t);
+        if (d < 1e-3 || t >= mx) break;
+        t += d * 0.35;
+        _v11_ic = cos(_v11_ic * vec3(1.3, 4.0, 1.0));
+        float ts = t * t;
+        _v11_col += 0.042 * _v11_ic * _v11_ic / (1.0 + ts/6.0 + ts*ts/72.0);
+    }
+    return t;
+}
+
+vec3 _VizScene(vec2 C) {
+    _v11_val = 0.0;
+    _v11_col = vec3(0.0);
+
+    vec2 p  = (2.0 * C - iResolution.xy) / iResolution.y * 1.5;
+    vec3 vro = vec3(-0.02, -0.03, iTime / 4.0);
+    _v11_march(vro, normalize(vec3(p, 1.5)), 20.0);
+
+    float tt = sin(iTime * 0.1);
+    // CenterUV then scale by 1/resolution for per-pixel waveform strip
+    vec2 uv  = (2.0*C - iResolution.xy) / min(iResolution.x, iResolution.y)
+               / iResolution.xy;
+    float x  = uv.x;
+    float xx = x * iResolution.x * 0.2;
+    float v  = _v11_val / 50.0;
+
+    float sineX = _v11_AMP * _v11_wav(clamp(xx * 2.0 + 0.5, 0.0, 1.0));
+    float y     = (uv.y / 0.0035 + _v11_AMP) * _v11_yMul;
+    x += tt;
+    float tm = iTime * tt;
+
+    float c   = 0.002 / max(abs(sineX * 20.0 - y), 1e-6);
+    float rx  = x * abs(cos(0.03 * tm));
+    float sv  = sin(rx), cv = cos(rx * 0.5);
+    float ir  = (xx > -v && xx < v) ? 1.0 : 0.0;
+    vec3  rgb = cos((2.0*v + clamp(xx,-v,v)) / max(v,1e-6) * 0.5 * _v11_PI)
+                * 2.0 * ir * vec3(sv+cv, clamp(cos(rx),0.,0.9), sv);
+
+    vec4 colo = 1.0 - clamp(1.0 + 1e-5 - vec4(c*rgb*rgb, 1.0), 0.0, 1.0);
+    vec3 c1   = _v11_col * _v11_col;
+    vec3 c1s  = c1 * c1;
+    return c1s * c1s * colo.a + colo.rgb;
+}
+"""
+
+    elif viz == 12:  # Laser Patterns (0rblivius)
+        # Newton iteration + complex IFS + laser-grid fractal marcher.
+        # Based on https://www.shadertoy.com/view/4tyfWy + glslsandbox sources.
+        # No direct audio reads in outerscope; inner snd from Buffer A FFT.
+        # Prefixed: _v12_*.
+        viz_scene_block = r"""
+// === VIZ 12: Laser Patterns (0rblivius) =====================================
+// Newton iteration + complex IFS + laser-grid marcher.
+// Source: https://www.shadertoy.com/view/4tyfWy + glslsandbox.com/e#60588.0
+// Audio: inner FFT snd via Buffer A row 1 (iChannel1). Prefixed: _v12_*.
+
+#define _v12_H(h) (cos((h)*6.3+vec3(0,23,21))*.5+.5)
+#define _v12_aud(u) texelFetch(iChannel1,ivec2(clamp(int((u)*float(FFT_N/2)),0,FFT_N/2-1),1),0).r
+
+vec2 _v12_cmul(vec2 a, vec2 b) {
+    return vec2(a.x*b.x-a.y*b.y, a.x*b.y+a.y*b.x);
+}
+vec2 _v12_cdiv(vec2 a, vec2 b) {
+    vec2 cj = vec2(b.x,-b.y);
+    return _v12_cmul(a,cj)/(length(b)*length(b));
+}
+vec2 _v12_ccos(vec2 z){return vec2(cos(z.x)*cosh(z.y),-sin(z.x)*sinh(z.y));}
+vec2 _v12_csin(vec2 z){return vec2(sin(z.x)*cosh(z.y), cos(z.x)*sinh(z.y));}
+vec2 _v12_newton(vec2 z){
+    return z-(1.35-0.35*sin(0.3*iTime))*_v12_cdiv(_v12_csin(z),_v12_ccos(z));
+}
+vec2 _v12_rv(vec2 z,float a){
+    return vec2(z.x*cos(a)-z.y*sin(a), z.y*cos(a)+z.x*sin(a));
+}
+
+float _v12_star(vec2 uv, float anim) {
+    uv = abs(uv);
+    vec2 pos = min(uv.xy/uv.yx, anim);
+    float p = 2.0 - pos.x - pos.y;
+    return (2.0+p*(p*p-1.5))/(uv.x+uv.y);
+}
+vec3 _v12_lerp3(vec3 a,vec3 b,float t){return a+(b-a)*t;}
+float _v12_cosE(float ang,float rez,float offs){
+    return 1.0-(0.5-(1.0+cos(ang*rez+offs*3.14159265))*0.5);
+}
+float _v12_defC(float ang,float def,float ph){
+    return _v12_cosE(ang,4.,ph)*def+1.-def;
+}
+vec3 _v12_hue(vec3 col,float sh){
+    vec3 m=vec3(cos(sh),-sin(sh)*0.57735,0.);
+    m=vec3(m.xy,-m.y)+(1.-m.x)*0.33333;
+    return mat3(m,m.zyx,m.yzx)*col;
+}
+vec2 _v12_ruv(vec2 uv,float angle){
+    float a=angle*6.2831853;
+    return mat2(cos(a),-sin(a),sin(a),cos(a))*uv;
+}
+
+vec3 _VizScene(vec2 C) {
+    vec4 O = vec4(0.0);
+    C.xy = _v12_ruv(C-0.5*iResolution.xy, cos(iTime*0.1)*sin(iTime*0.1))
+           +0.5*iResolution.xy;
+
+    vec2 uv = (C-0.5*iResolution.xy)/iResolution.y;
+    vec2 p  = uv*2.;
+
+    const float _v12_pi = 3.1415926;
+    float t12 = iTime+length(p)*cos(iTime/4.-0.04*length(p)*
+        cos(iTime*iTime/8.+0.0002*length(p)*cos(iTime*iTime*iTime/16.)));
+    vec3 col12 = vec3(0.000,0.302,0.502);
+    float snd12 = abs(sin(iTime));  // time-modulated (not FFT — original design)
+
+    float f12 = 0.0;
+    for (float i=0.; i<20.; i++) {
+        float s12=sin(t12+i*_v12_pi/10.)*2.*sin(iTime);
+        float c12=cos(t12+i*_v12_pi/10.)*2.*cos(iTime);
+        f12+=0.0002/(abs(p.x+c12/(1.+length(p)))*abs(p.y+s12/(1.+length(p))))
+             /(1.+length(p));
+    }
+
+    float ZOOM = 1.*(1.+snd12);
+    vec2  z12  = ZOOM*(C-0.5*iResolution.xy)/iResolution.y;
+    float t2   = iTime*.2+(.25+.05*sin(iTime*.1))/(length(z12)+.07)*2.2;
+    float si   = sin(t2), co = cos(t2);
+
+    vec3 colX = vec3(0.);
+    vec4 colours[8];
+    colours[0]=vec4(vec3(255.,155., 69.)/255.,0.5);
+    colours[1]=vec4(vec3(225.,214., 66.)/255.,1.0);
+    colours[2]=vec4(vec3( 63.,179.,163.)/255.,1.0);
+    colours[3]=vec4(vec3( 56.,127.,184.)/255.,1.0);
+    colours[4]=vec4(vec3( 37., 84.,163.)/255.,1.0);
+    colours[5]=vec4(vec3(101., 86.,163.)/255.,1.0);
+    colours[6]=vec4(vec3(178., 87.,159.)/255.,1.0);
+    colours[7]=vec4(vec3(238., 75., 93.)/255.,1.0);
+
+    vec2 pos12 = (C/min(iResolution.x,iResolution.y))*2.-1.;
+    pos12.x -= (iResolution.x/iResolution.y)*0.5;
+    pos12.x += 0.01;
+    float a3 = atan(pos12.x,pos12.y);
+    float r12 = length(pos12);
+    vec3  col3 = vec3(0.);
+    float edgeLim=0.8+abs(sin(iTime*0.3))*0.05, innerEdge=edgeLim-0.1;
+
+    for (int i=0; i<8; i++) {
+        edgeLim=0.;
+        float phase=iTime*float(i)*0.5;
+        vec3 rc = (i==7)
+            ? snd12*_v12_lerp3(colours[7].xyz,colours[0].xyz,abs(a3)/_v12_pi)
+            : snd12*_v12_lerp3(colours[i].xyz,colours[i+1].xyz,abs(a3)/_v12_pi);
+        float edge  =_v12_defC(a3,0.2,phase)*edgeLim;
+        float inEdge=_v12_defC(a3,0.1,phase)*innerEdge;
+        col3+=clamp(float(r12<edge)*smoothstep(r12,edge,edge-0.01),0.,1.)*rc;
+        col3-=clamp(float(r12<inEdge&&r12<edge)*smoothstep(r12,inEdge,inEdge-0.01),0.,1.)*rc;
+        edgeLim=innerEdge; innerEdge=edgeLim-0.1;
+    }
+
+    vec3 n1,q,r3=iResolution,
+         d=normalize(vec3((C*2.-r3.xy)/r3.y,1));
+
+    for(float i=0.,a,s,e,g=0.; ++i<50.;
+        O.xyz+=mix(vec3(1),_v12_H(g),.2)*1./e/5e3)
+    {
+        n1=g*d+col3;
+        float sndI=0.1*(_v12_aud(0.05)+_v12_aud(0.0501));
+        n1.z*=0.0;  // ceil(col.y) where col=vec3(0) → 0 always
+        a=30.;
+        n1=mod(n1-a,a*2.)-a+sndI*sndI;
+        s=3.;
+        for(int j=0;j<9;j++){
+            n1=.5+sndI-abs(n1);
+            if(n1.x<n1.z)n1=n1.zyx;
+            if(n1.z<n1.y)n1=n1.xzy;
+            s*=e=1.35-sndI;
+            n1=abs(n1)*e-vec3(
+                200.*(1.3-sndI)*abs(sin(320.-10.*mod(abs(sin(iTime)),1.))),
+                200.,0.1+2.*sndI);
+        }
+        g+=e=length(n1.yz)/s;
+    }
+
+    float anim12=sin(iTime*12.)*0.1+snd12;
+    O*=vec4(_v12_star(uv,anim12)*vec3(0.35,0.2,1.15)*15.,1.);
+    O+=vec4(_v12_hue(f12*col12+f12*col12*n1,iTime),1.);
+    O=tanh(O);
+    return O.rgb;
+}
+"""
+
+    elif viz == 13:  # Prismatic Fractals (Smull fork, Orblivius)
+        # IFS box raymarcher with audio-reactive glow + dynamic palette.
+        # Based on https://shadertoy.com/view/l3GBD1
+        # Prefixed: _v13_*.
+        viz_scene_block = r"""
+// === VIZ 13: Prismatic Fractals (Smull fork / Orblivius) ====================
+// IFS box raymarcher + audio glow. https://shadertoy.com/view/l3GBD1
+// Audio via Buffer A row 1 FFT (iChannel1). Prefixed: _v13_*.
+
+// DFT bin from Buffer A row 1.
+#define _v13_aud(u) texelFetch(iChannel1,ivec2(clamp(int(clamp(float(u),0.,1.)*float(FFT_N/2)),0,FFT_N/2-1),1),0).r
+
+vec3 _v13_palette(float t) {
+    vec3 a=vec3(0.5,0.3,0.8), b=vec3(0.8,0.5,0.5),
+         c=vec3(0.5,0.7,0.5), d=vec3(0.263,0.316,0.357);
+    return clamp(a+b*cos(6.28318*(c*t+d)),0.,1.);
+}
+mat2 _v13_rot(float a){ float c=cos(a),s=sin(a); return mat2(c,s,-s,c); }
+vec2 _v13_pmod(vec2 p, float r) {
+    const float pi = 3.14159265;
+    float a=atan(p.x,p.y)+pi/r, n=pi*2./r;
+    a=floor(a/n)*n;
+    return p*_v13_rot(-a);
+}
+float _v13_box(vec3 p, vec3 b) {
+    vec3 d=abs(p)-b;
+    return min(max(d.x,max(d.y,d.z)),0.)+length(max(d,0.));
+}
+float _v13_ifsBox(vec3 p, float det, float speed) {
+    for (int i=0; i<5; i++) {
+        p=abs(p)-det;
+        p.xy*=_v13_rot(iTime*0.3*speed);
+        p.xz*=_v13_rot(iTime*0.1*speed);
+    }
+    p.xz*=_v13_rot(iTime*speed);
+    return _v13_box(p,vec3(0.4,0.8,0.3));
+}
+float _v13_map(vec3 p, float symSegs) {
+    vec3 p1=p;
+    p1.x=mod(p1.x-5.,10.)-5.;
+    p1.y=mod(p1.y-5.,10.)-5.;
+    p1.z=mod(p1.z,16.)-8.;
+    p1.xy=_v13_pmod(p1.xy,symSegs);
+    return _v13_ifsBox(p1,1.0,1.0);
+}
+
+vec3 _VizScene(vec2 C) {
+    vec2 uv=(C*2.-iResolution.xy)/min(iResolution.x,iResolution.y);
+    uv*=1.+sin(iTime*0.35)*0.2;
+
+    vec3 cPos=vec3(0.,0.,-3.);
+    vec3 cDir=normalize(vec3(0.,0.,-1.));
+    vec3 cUp =vec3(sin(iTime),1.,0.);
+    vec3 cSid=cross(cDir,cUp);
+    vec3 ray =normalize(cSid*uv.x+cUp*uv.y+cDir);
+
+    vec3 finalColor=vec3(0.); float acc=0., t13=0.;
+    vec2 xy13=C/iResolution.xy;
+    float len13=2.*length(normalize(xy13));
+    float snd13=0.;
+
+    for (int i=0; i<60; i++) {
+        vec3 pos=cPos+ray*t13;
+        snd13=_v13_aud(clamp(len13-float(i)/50.,0.,1.));
+        pos.xy+=sin((.5+snd13*snd13)*pos.z*0.2+iTime)*0.1;
+        float dist=_v13_map(pos,6.);
+        dist=max(abs(dist),0.015);
+        vec3 dc=_v13_palette(snd13+iTime+length(pos)*0.5);
+        float glow=min(exp(-dist*3.),1.);
+        acc+=glow*0.25;
+        finalColor+=dc*glow*0.25;
+        t13+=dist*0.5;
+        if(t13>20.) break;
+    }
+
+    finalColor=clamp(finalColor/(1.+acc),0.,1.);
+    vec3 bg=_v13_palette(snd13+iTime*0.2);
+    return mix(bg,finalColor,smoothstep(0.2,1.,acc));
+}
+"""
+
+    elif viz == 14:  # Interdimensional Folding Path (PAEz fork)
+        # Spatial fold + layered sine warp march. No audio reads.
+        # Prefixed: _v14_* (none needed — all locals).
+        viz_scene_block = r"""
+// === VIZ 14: Interdimensional Folding Path (PAEz fork) =======================
+// Layered IFS spatial-fold + sine-perturbation volumetric march.
+// Outer loop accumulates colour/depth; inner loop warps the fold 7 times.
+// fade_dist=0 → fade factor is always 1; kept for original fidelity.
+
+vec3 _VizScene(vec2 C) {
+    vec3 r  = iResolution;
+    float t = iTime * 0.35 + 2266.0;   // phase-shifted, slowed
+    vec4  o = vec4(0.0);
+    vec3  FC = vec3(C, 1.0);
+
+    float z = 1.0, d = 0.0;
+
+    for (float ii = 0.0; z + ii < 30.0; ii += 1.0) {
+        vec3 p = abs(z * normalize(FC * 2.0 - r.xyy));
+        p.z += t * 4.0;
+
+        // sine perturbation layer
+        vec3 sp = abs(sin(p + p)) + 0.5 * cos(p * 0.1 + t * 0.3);
+        p += sp * 1.3;
+
+        // 7-iteration warp fold (two sub-steps per iteration)
+        for (int j = 2; j < 9; ++j) {
+            vec3 a = p * 0.71,  b = p.yzx * 0.64;
+            p += 0.05 * cos(a + t * 0.15) + 0.53 * sin(b + t * 0.25);
+            a  = p * 2.71;  b = p.yzx * -1.36;
+            p += 0.05 * sin(a + t * 3.15) + 0.53 * cos(b + t * 1.10);
+            p /= 1.01;
+        }
+
+        d  = 0.086 * sqrt(length(p.xxy * p.xyx));
+        z += d;
+        o += vec4(z * 1.9, 9.0, 31.0, 1.0) / d;
+    }
+
+    return clamp((o / 7000.0).rgb, 0.0, 1.0);
+}
+"""
+
+    elif viz == 15:  # Fractal Torus + IFS Fold Hypnosphere (ytt fork)
+        # Two-march: fractal torus with periodic symmetry + audio warp,
+        # overlaid with IFS fold march (Menger-style) with beat-sync rotation.
+        # rayImage() removed (commented-out dead code in original).
+        # Prefixed: _v15_*.
+        viz_scene_block = r"""
+// === VIZ 15: Fractal Torus + IFS Fold Hypnosphere (ytt fork) ==================
+// Dual volumetric march: periodic fractal torus (audio-driven warp) +
+// IFS Menger/Mandelbox fold march with beat-sync rotation.
+// Prefixed: _v15_*.
+
+#define _v15_aud(u) texelFetch(iChannel1,ivec2(clamp(int(clamp(float(u),0.,1.)*float(FFT_N/2)),0,FFT_N/2-1),1),0).r
+#define _v15_H(h)   (cos((h)*1.3+vec3(55.,23.,21.))*2.5+.5)
+
+mat2 _v15_rot(float a) {
+    float c=cos(a),s=sin(a); return mat2(c,s,-s,c);
+}
+
+// 2-fold periodic symmetry on xy plane (4 sectors)
+vec2 _v15_pmod(vec2 p, float res) {
+    const float pi=3.14159265, tau=6.28318530;
+    float angle=atan(p.y,p.x)+pi/res, delta=tau/res;
+    return p * _v15_rot(-(floor(angle/delta)*delta));
+}
+
+float _v15_tDist(vec3 p, vec3 sz) {
+    p=abs(p)-sz; return length(max(p,0.))+min(max(p.x,max(p.y,p.z)),0.);
+}
+
+// 5-iteration fractal torus (rotating slabs each iter)
+float _v15_fTorus(vec3 p, float aud) {
+    for(int i=0;i<5;i++){
+        p=abs(p)-1.;
+        p.xy*=_v15_rot(iTime*.5+aud*.4);
+        p.xz*=_v15_rot(iTime*.4);
+        p.yz*=_v15_rot(iTime*.2);
+    }
+    return _v15_tDist(p,vec3(.4));
+}
+
+// modular periodic domain → fractal torus SDF
+float _v15_sdf(vec3 p, float aud) {
+    p.x=mod(p.x+5.,10.)-5.; p.y=mod(p.y+5.,10.)-5.; p.z=mod(p.z,8.)-4.;
+    p.xy=_v15_pmod(p.xy,4.);
+    return _v15_fTorus(p,aud);
+}
+
+vec3 _v15_hue(vec3 col, float sh) {
+    vec3 m=vec3(cos(sh),-sin(sh)*.57735,0.);
+    m=vec3(m.xy,-m.y)+(1.-m.x)*.33333;
+    return mat3(m,m.zxy,m.yzx)*col;
+}
+
+vec3 _VizScene(vec2 C) {
+    vec4 O=vec4(0.);
+    float bd=fract(iTime);   // 0→1 per second (beat-detect pulse)
+    float aud=_v15_aud(clamp(-2.+length((1.+C.xy)/iResolution.x),0.,1.));
+    float snd=aud;
+
+    // ── Fractal torus march: camera flies forward, audio bends torus ──────
+    vec2 pp=(C*2.-iResolution.xy)/min(iResolution.x,iResolution.y);
+    vec3 cDir=normalize(vec3(0.,-.6,-1.));
+    vec3 cUp=vec3(sin(iTime*.3),1.,0.);
+    vec3 ro=vec3(0.,3.,-5.*iTime);
+    vec3 rd=normalize(cross(cDir,cUp)*pp.x+cUp*pp.y+cDir);
+    float tAcc=0.,hAcc=0.,tm=0.;
+    for(int i=0;i<50;i++){
+        vec3 pos=ro+rd*tm;
+        float dist=max(abs(_v15_sdf(pos,aud)),0.015);
+        float alpha=exp(-dist*(4.+aud*aud));
+        if(mod(length(pos)+3.*sin(iTime),10.)<2.) hAcc+=alpha;
+        tAcc+=alpha; tm+=dist*.75;
+    }
+    vec3 fC=mix(vec3(0.),
+        vec3(tAcc*.01, tAcc*.01+hAcc*.02, tAcc*.02+hAcc*.05),
+        abs(1.35-.7*aud));
+
+    // ── IFS fold march: Menger-style with audio-driven fold coefficients ──
+    vec3 d2=normalize(vec3((C*2.-iResolution.xy)/iResolution.y,1.));
+    for(float i=0.,a,s,e,g=0.;i<50.;i++){
+        vec3 p2=g*d2;
+        p2.xy*=_v15_rot(bd);
+        float iSnd=_v15_aud(.1+i/100.); iSnd*=iSnd;
+        p2.z+=bd*2.+iTime*5.;
+        a=10.; p2=mod(p2-a,a*2.)-a; s=6.;
+        for(int j=0;j<8;j++){
+            p2=.5-abs(p2);
+            if(p2.x<p2.z) p2=p2.zyx;   // conditional axis swap (Menger fold)
+            if(p2.z<p2.y) p2=p2.xzy;
+            if(p2.y<p2.x) p2=p2.zyx;
+            s*=e=1.61*(1.-.05*iSnd)+sin(iTime*.134)*.1;
+            p2=abs(p2)*e-vec3(
+                cos(max(iSnd*5.,iTime*.3+.5*fract(iTime*.5))),
+                120.-20.*iSnd,
+                20.+cos(iTime*.5));
+        }
+        g+=e=length(p2.yz)/s;
+        O.xyz+=_v15_H(g*.25*(1.+iSnd))/e*1e-4;
+    }
+
+    // ── Hue-shifted blend of both marches ────────────────────────────────
+    O.rgb+=_v15_hue(O.rgb,.5*iTime);
+    O+=vec4(_v15_hue(mix(fC*fC,O.rgb*O.rgb,1.-max(snd,bd)),-.5*iTime),1.);
+    return O.rgb;
+}
+"""
+
+    elif viz == 16:  # Unfound (diatribes fork) — orbit-trap march
+        # 5 sinusoidal orbiting spheres in a mirrored fractal domain.
+        # O macro reads p and T from _VizScene's local scope. No audio reads.
+        # Original for-loop body was a single comma-expression; rewritten as {} block.
+        viz_scene_block = r"""
+// === VIZ 16: Unfound (diatribes fork) =========================================
+// Volumetric orbit-trap march: 5 sinusoidally orbiting spheres in a
+// mirrored/fractional fold domain. Camera rotated by a cosine matrix.
+// Original: https://shadertoy.com/view/tXKcDw — no audio reads.
+
+// orb SDF — p and T resolved from _VizScene's local scope at text expansion
+#define _v16_O(Z,rc) (length(p-vec3(10.+sin(.4*T*(rc)*2.)*16.,sin(.5*T*(rc)*4.)*16.,T*4.+(Z)+20.+10.*cos(T*.6)))-(rc))
+
+vec3 _VizScene(vec2 C) {
+    float T = iTime;
+    vec3 res = iResolution;
+    vec2 u = (C + C - res.xy) / res.y;
+
+    bool  b = false;
+    float i=0., e=0., m=0., d=0., s=0.;
+    vec3  c = vec3(0.);
+
+    vec3 q, p = vec3(10., 0., T*4.),
+         D = vec3(mat2(cos(cos(T*.3)*.3 + vec4(0.,33.,11.,0.)))*u, 1.);
+
+    vec3 r = res;
+    for (; i++ < 100.;
+         d += s = min(e, (b ? .03 : 0.) + .6*max(abs(m), abs(.4+dot(sin(p/6.), cos(p.yzx/16.))))),
+         c += vec3(2., min(40./d, 4.), 3.)/s + 20.*vec3(0.,1.,30./d)/max(e, .1)
+    ) {
+        r = q = p += D * s;
+        e = max(min(_v16_O(1.,.1), min(_v16_O(2.,.2), min(_v16_O(3.,.3), min(_v16_O(4.,.4), _v16_O(5.,.5))))), .001);
+        q.y *= .6;
+        b = abs(q.y) > 10.;
+        p = abs(fract(q) - .5);
+        m = sin(.6*T + r.z*.1) > 0. ? min(p.x, p.y) : max(p.x, p.y);
+        p = q = r;
+    }
+
+    return tanh(min(c*c/1e7, 2.));
+}
+"""
+
+    elif viz == 18:  # sm0g (diatribes fork of Shane's "Offworld Storage Facility")
+        viz_scene_block = r"""
+// === VIZ 18: sm0g (diatribes / Shane fork) =======================================
+// Tri-planar textured SDF box corridors + bump-mapped normals.
+// iChannel3 (original stone tex) → iChannel2 (RGBA Noise Small, closest available).
+// Original: https://shadertoy.com/view/ffXSRs
+// Adaptations: macros → _v18_ fns; comma-exprs → {}-blocks; iChannel3→iChannel2;
+//   guard sqrt against negatives; explicit 0-init.
+
+vec3 _v18_tex3D(sampler2D tex, in vec3 p, in vec3 n) {
+    n = max(n*n - 0.2, 0.001);
+    n /= dot(n, vec3(1.0));
+    vec3 tx = texture(tex, p.yz).xyz;
+    vec3 ty = texture(tex, p.zx).xyz;
+    vec3 tz = texture(tex, p.xy).xyz;
+    return mat3(tx*tx, ty*ty, tz*tz)*n;
+}
+
+vec3 _v18_texBump(sampler2D tx, in vec3 p, in vec3 n, float bf) {
+    const vec2 e = vec2(0.001, 0.0);
+    mat3 m = mat3(_v18_tex3D(tx, p - e.xyy, n),
+                  _v18_tex3D(tx, p - e.yxy, n),
+                  _v18_tex3D(tx, p - e.yyx, n));
+    vec3 g = vec3(0.299, 0.587, 0.114)*m;
+    g = (g - dot(_v18_tex3D(tx, p, n), vec3(0.299, 0.587, 0.114))) / e.x;
+    g -= n*dot(n, g);
+    return normalize(n + g*bf);
+}
+
+mat2 _v18_R(float a) { return mat2(cos(a + vec4(0.,33.,11.,0.))); }
+
+float _v18_box(vec3 p, float i) {
+    p = abs(fract(p/i)*i - i*0.5) - i*0.06;
+    return min(p.x, min(p.y, p.z));
+}
+
+float _v18_plane(vec3 p, float h, float a, float r) {
+    p.y -= h;
+    p.xz *= _v18_R(a);
+    float d = -9e9, i = 1e1;
+    for (; i > 0.1; i *= 0.3) {
+        p.xz *= _v18_R(i);
+        d = max(d, _v18_box(p, i));
+    }
+    return max(abs(p.y) - r, d);
+}
+
+float _v18_map(vec3 p) {
+    return min(_v18_plane(p,   0.0, 0.0, 1e1),
+           min(_v18_plane(p, -2e1,  1.0, 6.0),
+               _v18_plane(p, -4e1,  2.0, 6.0)));
+}
+
+vec3 _VizScene(vec2 C) {
+    float T = iTime;
+    vec3 r = iResolution;
+    vec2 u = (C + C - r.xy) / r.y;
+    u.y -= 2.0;
+    u.x += cos(T / 4.0);
+    vec3 p = vec3(0.0), D = normalize(vec3(u, 2.0));
+
+    float s = 0.006, d = 0.0;
+    for (float ii = 0.0; ii < 80.0 && s > 0.005 && d < 4e1; ii++) {
+        p  = D*d;
+        p.y += 14.0;
+        p.z += T;
+        s = _v18_map(p);
+        d += s;
+    }
+
+    // tetrahedron normals
+    const float hn = 0.005;
+    const vec2  k  = vec2(1.0, -1.0);
+    vec3 n = normalize(k.xyy*_v18_map(p + k.xyy*hn) +
+                       k.yyx*_v18_map(p + k.yyx*hn) +
+                       k.yxy*_v18_map(p + k.yxy*hn) +
+                       k.xxx*_v18_map(p + k.xxx*hn));
+
+    // iChannel3 → iChannel2 (RGBA Noise Small)
+    vec3 q = _v18_texBump(iChannel2, p, n, 0.12);
+    vec4 o = vec4(0.0);
+    o.xyz = _v18_tex3D(iChannel2, p*0.25, n);
+    o *= o;
+
+    o /= max(abs(p.y/5e1 + p.x/3e1), 0.001);
+
+    vec3 ld   = normalize(vec3(0.3, 1.0, 0.2));
+    float spec = pow(max(dot(reflect(-ld, q), -D), 0.0), 2e1);
+    o *= max(dot(q, ld), 0.1);
+    o += spec*0.3;
+
+    float fog = min(1.0, d/18.0);
+    o = mix(o, vec4(0.15, 0.18, 0.25, 0.0), fog);
+    o = 2.0*sqrt(max(o, vec4(0.0)))*o;
+    return clamp(o.rgb, 0.0, 1.0);
+}
+"""
+
+    elif viz == 17:  # Everything is Temporary (diatribes / FabriceNeyret2 fork)
+        viz_scene_block = r"""
+// === VIZ 17: Everything is Temporary (diatribes fork, -24 chars by FabriceNeyret2) ===
+// Noise terrain + floating orb — volumetric ray march.
+// Original: https://shadertoy.com/view/w32BDD
+// Adaptations: comma-exprs in for init/update split to statements;
+//   .4+p-p → vec3(0.4); e=max() assignment-in-expr hoisted; cinema bars → early return.
+
+vec3 _VizScene(vec2 C) {
+    float d=0., a, e, s=0., t = iTime*0.5;
+    vec3  p = iResolution;
+
+    // normalise to [-aspect..+aspect] × [-1..+1]
+    vec2 u = (C + C - p.xy) / p.y;
+
+    // cinema bars
+    if (abs(u.y) > 0.8) return vec3(0.0);
+
+    vec2 v = u.yx*0.7 + vec2(1.2, 0.1);
+    float l1 = 2.0/length(u + v),
+          l2 = 2.0/length(u - v);
+
+    // camera drift
+    u += cos(t*vec2(0.4, 0.8)) * vec2(0.3, 0.1);
+
+    vec4 o = vec4(0.0);
+    for (float ii = 0.0; ii < 100.0; ii++) {
+        // march ray: set position, compute noise terrain SDF
+        p = vec3(u*d, d+t);
+        s = 5.0 + p.y + cos(p.x*0.1)*4.0;
+        for (a = 0.01; a < 3.0; a += a)
+            // .4+p-p == vec3(0.4) (p cancels)
+            s -= abs(dot(sin(0.2*p.z + 0.6*t + p/a), vec3(0.4))) * a;
+
+        // orb entity SDF, clamp, step ray, accumulate colour
+        e = length(p - vec3(
+            sin(sin(t*0.2)+t*0.4)*2.0,
+            1.0 + sin(sin(t*1.3)+t*0.2)*1.23,
+            12.0 + t + cos(t*0.5)*8.0)) - 0.1;
+        e = max(0.8*e, 0.01);
+        s = min(0.01 + 0.4*abs(s), e);
+        d += s;
+        o += 1e2/(s + e*4.0) + l1 + l2;
+    }
+
+    // per-channel tint (5,2,1) + cubic brightness + clamp
+    o = vec4(5.0, 2.0, 1.0, 0.0) * o*o*o / 1e9;
+    return clamp(o.rgb, 0.0, 1.0);
+}
+"""
+
+    elif viz == 19:  # Spectro 3D Mist (Orblivius)
+        # 3D SDF bar spectrum + volumetric fog + reflective ground.
+        # Persistence rows (iChannel0 self-read) replaced with direct FFT reads
+        # from iChannel1 (Buffer A row 1). Prefixed: _v19_*.
+        viz_scene_block = r"""
+// === VIZ 19: Spectro 3D Mist (Orblivius) =====================================
+// 3D SDF bar spectrum + volumetric fog + reflective ground.
+// (c) 2026 Orblivius. All rights reserved.
+// Persistence replaced with direct FFT reads from Buffer A row 1 (iChannel1).
+// Prefixed: _v19_*.
+
+const int   _V19_NB        = 20;
+const float _V19_NB_F      = 20.0;
+const float _V19_BAR_W     = 0.27;
+const float _V19_BAR_D     = 0.36;
+const float _V19_BAR_STEP  = 0.40;
+const float _V19_MAX_H     = 4.0;
+const float _V19_CAP_H     = 0.07;
+const float _V19_START_X   = -3.8;         // NB_F*BAR_STEP*-0.5 + BAR_STEP*0.5
+const float _V19_TRANSLUCENCY = 3e-5;
+const float _V19_INV_NB1      = 1.0/19.0;  // 1/(NB_F-1)
+const float _V19_INV_BAR_STEP = 2.5;        // 1/BAR_STEP
+const float _V19_OPACITY   = 0.08;
+
+float _v19_bands[20];
+float _v19_tops[20];
+
+mat3 _v19_mRotX(float a){float c=cos(a),s=sin(a);return mat3(1,0,0,0,c,-s,0,s,c);}
+mat3 _v19_mRotY(float a){float c=cos(a),s=sin(a);return mat3(c,0,s,0,1,0,-s,0,c);}
+
+vec3 _v19_B2(vec3 x){
+    vec3 t=3.0*x;
+    vec3 b0=step(0.0,t)*step(0.0,1.0-t);
+    vec3 b1=step(0.0,t-1.0)*step(0.0,2.0-t);
+    vec3 b2=step(0.0,t-2.0)*step(0.0,3.0-t);
+    return 0.5*(b0*t*t+b1*(-2.0*t*t+6.0*t-3.0)+b2*(3.0-t)*(3.0-t));
+}
+
+vec3 _v19_specColor(float fn,float bv){
+    vec3 args=fract(vec3(fn*1.2-0.6)+vec3(1.0,-1.0/3.0,-2.0/3.0));
+    vec3 sp=_v19_B2(args);
+    float c=fn*0.5-0.5;
+    vec3 bc=pow(max(vec3(1.0)-abs(c)*sp,0.0),vec3(1.4));
+    float mn=min(min(bc.r,bc.g),bc.b),mx=max(max(bc.r,bc.g),bc.b);
+    bc=(bc-mn)/max(mx-mn,0.001);
+    return bc*(1.0+bv*2.5);
+}
+
+float _v19_tri(float x){return abs(fract(x)-0.5);}
+vec3  _v19_tri3(vec3 p){return abs(fract(p.zzy+abs(fract(p.yxx)-0.5))-0.5);}
+
+float _v19_triNoise3D(in vec3 p,float spd){
+    float z=1.4,rz=0.0;
+    vec3 bp=p;
+    for(float ii=0.0;ii<=3.0;ii++){
+        vec3 dg=_v19_tri3(bp*2.0);
+        p+=dg+iTime*0.3*spd;
+        bp*=1.8;z*=1.5;p*=1.2;
+        rz+=_v19_tri(p.z+_v19_tri(p.x+_v19_tri(p.y)))/z;
+        bp+=0.14;
+    }
+    return rz;
+}
+
+float _v19_barSDF(vec3 p,float bx,float bh){
+    vec3 q=abs(p-vec3(bx,bh*0.5,0.0))-vec3(_V19_BAR_W*0.5,bh*0.5,_V19_BAR_D*0.5);
+    return length(max(q,q.yzx*_V19_OPACITY));
+}
+
+float _v19_sceneDist(vec3 p,out float bestFn,out float bestVal){
+    float d=1e9;
+    bestFn=0.0;bestVal=0.0;
+    int jCenter=clamp(int((p.x-_V19_START_X)*_V19_INV_BAR_STEP+0.5),3,_V19_NB-4);
+    for(int dj=-2;dj<2;dj++){
+        int j=jCenter+dj;
+        if(j<0||j>=_V19_NB) continue;
+        float fj=float(j),fn=fj*_V19_INV_NB1;
+        float bv=_v19_bands[j],tv=_v19_tops[j];
+        float bh=max(bv*_V19_MAX_H,0.02),bx=_V19_START_X+fj*_V19_BAR_STEP;
+        if(bv>=0.0){float db=_v19_barSDF(p,bx,bh);if(db<d){d=db;bestFn=fn;bestVal=bv;}}
+        if(tv>=0.02){
+            float th=tv*_V19_MAX_H;
+            vec3 q=abs(p-vec3(bx,th+_V19_CAP_H*0.5,0.0))
+                  -vec3(_V19_BAR_W*0.5,_V19_CAP_H*0.5,_V19_BAR_D*0.5);
+            float dc=length(max(q,0.0))+min(max(q.x,max(q.y,q.z)),0.0);
+            if(dc<d){d=dc;bestFn=fn;bestVal=bv;}
+        }
+    }
+    return d;
+}
+
+vec3 _v19_sky(vec3 rd){
+    const vec3 C1=vec3(0.02,0.08,0.12),C2=vec3(0.0,0.01,0.06);
+    float y=rd.y+0.2*_v19_triNoise3D(rd*2.0,1.0);
+    vec3 c=mix(C1,C2,smoothstep(-0.35,0.0,y));
+    float disp=_v19_triNoise3D(rd*0.9,0.08);
+    c+=vec3(1.0)*(pow(disp,5.0)*3.47);
+    float h=dot(rd-0.08*_v19_triNoise3D(rd*0.3,0.0),vec3(0.02,1.0,-0.01));
+    return mix(c,vec3(0.02,0.04,0.08),smoothstep(0.15,-0.1,h));
+}
+
+vec3 _v19_marchBars(vec3 ro,vec3 rd,float tMax,float st,float lm,float STEPS,out vec3 fogOut){
+    float t=0.001;
+    vec3 col=vec3(0.0),fogAccum=vec3(0.0);
+    float transmittance=1.0;
+    int maxI=int(lm/st);
+    for(int i=0;i<maxI;i++){
+        vec3 p=ro+t*rd;
+        if(t>tMax) break;
+        float fn,val;
+        float d=_v19_sceneDist(p,fn,val);
+        if(d<0.00001){col+=_v19_specColor(fn,1.0)*40.0;break;}
+        t+=max(0.002,d);
+        float density=1.0/max(d,0.001);
+        col+=transmittance*_v19_specColor(fn,val)*density*st;
+        transmittance*=exp(-density*st*(_V19_TRANSLUCENCY/(1.0-val*0.99)));
+        float fogD=_v19_triNoise3D(p*0.015,0.2)*0.25;
+        fogD*=exp(-max(d-0.3,0.0)*3.0);
+        fogAccum+=(vec3(0.05,0.08,0.2)+_v19_specColor(fn,val)*max(val-0.02,0.0)*0.8)*fogD*st;
+        if(transmittance<0.01) break;
+    }
+    fogOut=fogAccum;
+    return 1.0-exp(-col/STEPS*_V19_TRANSLUCENCY);
+}
+
+vec3 _VizScene(vec2 C){
+    // Load bands directly from FFT (iChannel1 row 1 = frequency spectrum)
+    for(int i=0;i<_V19_NB;i++){
+        float fn=float(i)/float(_V19_NB);
+        int bin=clamp(int(fn*float(FFT_N/2)),0,FFT_N/2-1);
+        _v19_bands[i]=texelFetch(iChannel1,ivec2(bin,1),0).r;
+        _v19_tops[i] =_v19_bands[i];
+    }
+
+    vec2 uv=(C-iResolution.xy*0.5)/iResolution.y;
+    vec3 ro=vec3(0.0,1.0,13.0);
+    vec3 rd=normalize(vec3(uv*1.35,-2.8));
+    rd=normalize(mix(rd,normalize(-ro),0.05));
+
+    mat3 cam;
+    float clickX=abs(iMouse.z);
+    bool mouseHeld=iMouse.z>0.0;
+    bool inCorner=mouseHeld&&(clickX<80.0||clickX>iResolution.x-80.0);
+    bool inMiddle=mouseHeld&&!inCorner;
+    float pitch=(iMouse.y>0.0)?clamp(-(iMouse.y/iResolution.y-0.5)*2.2,-1.57,1.57):0.2;
+    float autoSpeed=0.23;
+    if(inCorner){
+        if(clickX<80.0){float tC=1.0-clickX/80.0;autoSpeed=tC*0.4;}
+        else{float tC=1.0-(iResolution.x-clickX)/80.0;autoSpeed=-(tC*0.4);}
+    }
+    if(inMiddle){
+        float yaw=(iMouse.x/iResolution.x-0.5)*6.28;
+        cam=_v19_mRotY(yaw)*_v19_mRotX(pitch);
+    }else if(inCorner){
+        cam=_v19_mRotY(iTime*autoSpeed)*_v19_mRotX(pitch);
+    }else{
+        bool lastMid=abs(iMouse.z)>80.0&&abs(iMouse.z)<iResolution.x-80.0;
+        if(lastMid&&iMouse.x>0.0){float yaw=(iMouse.x/iResolution.x-0.5)*6.28;cam=_v19_mRotY(yaw)*_v19_mRotX(pitch);}
+        else{cam=_v19_mRotY(iTime*0.23)*_v19_mRotX(pitch);}
+    }
+    ro=cam*ro;rd=cam*rd;
+    rd=normalize(mix(rd,normalize(-ro),0.15));
+
+    float tGnd=(rd.y<-0.0001)?max(-ro.y/rd.y,0.001):1e9;
+    if(tGnd>20.0) tGnd=1e9;
+
+    float st=0.1,lm=15.0,STEPS=st/3.0;
+    vec3 fogMain,fogRefl;
+    vec3 col=_v19_marchBars(ro,rd,25.0,st,lm,STEPS,fogMain);
+
+    vec3 ground=_v19_sky(rd);
+    if(tGnd<1e8){
+        vec3 gp=ro+rd*tGnd;
+        vec3 gBase=vec3(0.04,0.07,0.12);
+        vec2 gv=abs(fract(gp.xz*0.5+0.5)-0.5)*2.0;
+        gBase+=(1.0-smoothstep(0.87,0.97,max(gv.x,gv.y)))*vec3(0.015,0.020,0.06);
+        vec3 reflRd=vec3(rd.x,-rd.y,rd.z);
+        float fresnel=0.06+0.94*pow(1.0-abs(rd.y),5.0);
+        vec3 reflCol=_v19_marchBars(gp,reflRd,8.0,st,lm,STEPS,fogRefl)+_v19_sky(reflRd);
+        ground=mix(gBase,reflCol,clamp(fresnel*3.0*exp(-tGnd*0.04),0.0,0.5));
+        int gCenter=clamp(int((gp.x-_V19_START_X)*_V19_INV_BAR_STEP+0.5),0,_V19_NB-1);
+        for(int dj=-5;dj<=5;dj++){
+            int gi=gCenter+dj;
+            if(gi<0||gi>=_V19_NB) continue;
+            float fi=float(gi),bv=_v19_bands[gi];
+            float bx=_V19_START_X+fi*_V19_BAR_STEP;
+            float dx=gp.x-bx,dz=gp.z;
+            ground+=_v19_specColor(fi*_V19_INV_NB1,bv)*bv*bv*0.14/(1.0+(dx*dx+dz*dz)*2.0);
+        }
+        float groundFade=exp(-tGnd*0.08);
+        vec3 horizonColor=_v19_sky(normalize(vec3(rd.x,0.0,rd.z)));
+        ground=mix(horizonColor,ground,groundFade);
+    }
+
+    vec3 finalCol=ground+col;
+    finalCol=sqrt(finalCol);
+    finalCol=finalCol*finalCol*1.7;
+    finalCol+=fogMain*4.0;
+
+    // Volumetric colored ground fog
+    vec3 fdir2=normalize(vec3(10.0,0.0,-7.0));
+    float fog=0.0,vis=1.0;
+    vec3 fogColorAccum=vec3(0.0);
+    for(float ft=0.5;ft<20.0;ft+=0.8){
+        vec3 fp=ro+rd*ft;
+        vec3 np=fp*0.05+fdir2*iTime*0.05;
+        float f=clamp(1.0-0.25*abs(fp.y),0.0,1.0);
+        float n=_v19_triNoise3D(np,0.2)*f;
+        float dd=pow(max(n-0.2,0.0),1.5)*3.0;
+        if(dd>0.001){
+            vec3 stepColor=vec3(0.15,0.18,0.35);
+            int jc=clamp(int((fp.x-_V19_START_X)*_V19_INV_BAR_STEP+0.5),0,_V19_NB-1);
+            for(int dj=-2;dj<2;dj++){
+                int j=jc+dj;
+                if(j<0||j>=_V19_NB) continue;
+                float bv=_v19_bands[j],bx=_V19_START_X+float(j)*_V19_BAR_STEP;
+                float dx=fp.x-bx,dzz=fp.z;
+                float w=bv*f/(0.5+dx*dx+dzz*dzz*0.5);
+                stepColor+=_v19_specColor(float(j)*_V19_INV_NB1,bv)*w*1.5;
+            }
+            fogColorAccum+=vis*stepColor*dd*0.6;
+        }
+        vis*=pow(1.2,-dd*dd);
+        if(vis<0.01) break;
+    }
+    fog=1.0-vis;
+    vec3 fogFinal=fogColorAccum/max(fog,0.001);
+    float fogLum=dot(fogFinal,vec3(0.299,0.587,0.114));
+    fogFinal=mix(fogFinal,vec3(fogLum),0.3);
+    finalCol=mix(finalCol,fogFinal,clamp(fog*0.8,0.0,0.5));
+    return clamp(finalCol,0.0,1.0);
+}
+"""
+
+    else:
+        viz_scene_block = "\n// viz not recognized — black backdrop\n"
+
 
     image_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.61 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.62 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    IMAGE TAB — iChannel0: alphabet texture (shadertoy.com/view/4sf3RB)
                 iChannel1: Buffer A (audio + FFT + smoothed bands)
@@ -5662,7 +6789,7 @@ vec3 _VizScene(vec2 fragCoord) {
 #define _Z 90,
 
 #define print_char(i) \\
-    texture(FONT_TEXTURE, u + vec2(float(i)-float(x)/SPACING+SPACING/8.,15-(i)/16)/16.).r
+    smoothstep(0.1, 0.5, texture(FONT_TEXTURE, u + vec2(float(i)-float(x)/SPACING+SPACING/8.,15-(i)/16)/16.).r)
 
 #define makeStr(fn) \\
     float fn(vec2 u) {{ \\
@@ -5682,7 +6809,7 @@ makeStr(printBPMVal) {bpm_val_chars} _end
 makeStr(printSpdVal) {spd_val_chars} _end
 
 // ---- Static label strings ----
-makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _6 _1 _ _NUM _NUM _NUM _end
+makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _6 _2 _ _NUM _NUM _NUM _end
 makeStr(printCredit) _COPY _2 _0 _2 _6 _ _O _R _B _L _I _V _I _U _S _end
 makeStr(printLoad)   _L _O _A _D _I _N _G _DOT _DOT _DOT _end
 makeStr(printSpec)   _S _P _E _C _T _R _U _M _end
@@ -5696,7 +6823,7 @@ makeStr(printTrk1)  _T _R _A _C _K _ _NUM _1 _end
 makeStr(printTrk2)  _T _R _A _C _K _ _NUM _2 _end
 makeStr(printTrk3)  _T _R _A _C _K _ _NUM _3 _end
 makeStr(printTrk4)  _T _R _A _C _K _ _NUM _4 _end
-makeStr(printTracks) _T _R _X _COL _end
+makeStr(printTracks) _T _R _A _C _K _S _COL _end
 makeStr(printTrack)  _T _R _A _C _K _ _NUM _end
 
 // ============================================================
@@ -5732,7 +6859,9 @@ float drawCh(int c, vec2 fp, float x, float y, float cw, float ch) {{
     float r = textureGrad(iChannel0, uv, dx, dy).r;
     r = max(r, textureGrad(iChannel0, vec2(min(uv.x + texel, u_hi), uv.y), dx, dy).r);
     r = max(r, textureGrad(iChannel0, vec2(max(uv.x - texel, u_lo), uv.y), dx, dy).r);
-    return min(r * 1.6, 1.0);
+    // Threshold out atlas cell-background leakage (non-zero .r in dark areas)
+    // before amplification so it never contributes to trkA and dims the backdrop.
+    return min(max(r - 0.10, 0.0) * 1.78, 1.0);
 }}
 
 // ---- drawNum: render decimal integer, rightmost digit at (x,y) ----
@@ -5880,7 +7009,7 @@ void mainImage(out vec4 O, vec2 C) {{
     const vec3 TC2    = vec3(1.00,0.45,0.90);
     const vec3 TC3    = vec3(1.00,0.55,0.10);
 
-    const float CH=28., CW=25., ML=10.;
+    const float CH=30., CW=25., ML=10.;
     // 90 frames @ 60Hz = 1.5s — long enough that the loading dialog is
     // actually readable. Anything under ~30 frames flashes by too fast to
     // register; over ~150 starts to feel like the page is broken.
@@ -5899,7 +7028,7 @@ void mainImage(out vec4 O, vec2 C) {{
 
         // Header
         col += vec3(0.45, 0.70, 1.20) * printHdr   (pUV(fp, ML, 6., CH));
-        col += WHITE  * printCredit(pUV(fp, res.x - ML - 234., 6., CH*0.75));
+        col += WHITE  * printCredit(pUV(fp, res.x - ML - 15.0*CH*0.75/(0.06*16.0*SPACING), 6., CH*0.75));
         col += YELLOW * printTitle (pUV(fp, ML, CH+9., CH));
         col += WHITE  * printFormat(pUV(fp, ML + float({title_len}) * CW, CH+9., CH));
 
@@ -5929,7 +7058,7 @@ void mainImage(out vec4 O, vec2 C) {{
     // Accumulate tracker UI into separate buffer so it overlays pure (no curtain tint)
     vec3 trk = vec3(0.0);
     trk += vec3(0.45, 0.70, 1.20) * printHdr   (pUV(fp, ML,  6., CH));
-    trk += WHITE  * printCredit(pUV(fp, iResolution.x - ML - 234., 6., CH*0.75));
+    trk += WHITE  * printCredit(pUV(fp, iResolution.x - ML - 15.0*CH*0.75/(0.06*16.0*SPACING), 6., CH*0.75));
     trk += YELLOW * printTitle (pUV(fp, ML, CH+9., CH));
     trk += WHITE  * printFormat(pUV(fp, ML + float({title_len}) * CW, CH+9., CH));
     // hlines extended to frame edges (3px inset from canvas) so they
@@ -5940,7 +7069,10 @@ void mainImage(out vec4 O, vec2 C) {{
     // ============ INFO BAR ============
     float iy  = CH*2.+20.;
     float iy2 = iy + CH + 4.;
-    float rx  = iResolution.x*0.52;
+    // Center ROW/SPEED block in the gap between PATTERN and TRACKS:
+    // pattEnd=ML+14*CW, trxStart=res.x-ML-10*CW, rowW≈9*CW
+    // balanced rx = (pattEnd + trxStart - rowW) / 2 = res.x*0.5 - 2.5*CW
+    float rx  = iResolution.x*0.5 - 2.5*CW;
 
     trk += BLUE   * printPatt(pUV(fp, ML, iy, CH));
     trk += WHITE  * drawNum(pos.songPos, 2, ML+10.*CW, iy, CW,CH,fp);
@@ -5952,12 +7084,12 @@ void mainImage(out vec4 O, vec2 C) {{
     trk += BLUE   * drawCh(47,fp, rx+6.*CW, iy, CW,CH);
     trk += YELLOW * drawCh(54,fp, rx+7.*CW, iy, CW,CH);
     trk += YELLOW * drawCh(52,fp, rx+8.*CW, iy, CW,CH);
+    // TRACKS: N — flush right on same row as ROW/PATTERN info
+    trk += BLUE   * printTracks(pUV(fp, iResolution.x - ML - 10.*CW, iy, CH));
+    trk += YELLOW * drawNum(NUM_CHANNELS, 2, iResolution.x - ML - 2.*CW, iy, CW, CH, fp);
 
     trk += BLUE   * printBPM(pUV(fp, ML,  iy2, CH));
     trk += YELLOW * printBPMVal(pUV(fp, ML+5.*CW, iy2, CH));
-    // TRX: N — channel count, between BPM value and SPEED label (fits at 800px+)
-    trk += BLUE   * printTracks(pUV(fp, ML+9.*CW, iy2, CH));
-    trk += YELLOW * drawNum(NUM_CHANNELS, 2, ML+14.*CW, iy2, CW, CH, fp);
     trk += BLUE   * printSpd(pUV(fp, rx,  iy2, CH));
     trk += YELLOW * printSpdVal(pUV(fp, rx+7.*CW, iy2, CH));
 
@@ -5968,7 +7100,7 @@ void mainImage(out vec4 O, vec2 C) {{
     float TW   = 9.*CW+6.;    // 9 chars per cell + 6px gap
     float rNW  = 2.*CW;
     float txOff= ML+rNW+8. + _scrollX;  // scroll offset applied to all tracks
-    const int HVR = 4;  // 9 visible rows → more room for oscilloscope
+    const int HVR = 4;  // 9 visible rows, CH=34 stretches each row — oscillo shrinks
 
     // Track headers — dynamic loop over all channels, colored by tc%4,
     // scrolled with _scrollX so wide songs scroll horizontally.
@@ -5982,7 +7114,12 @@ void mainImage(out vec4 O, vec2 C) {{
             if(tx > ML+rNW+8.-TW && tx < iResolution.x - ML) {{
                 int digits = (tc+1 >= 10) ? 2 : 1;
                 float numCW = CW * 0.65;
-                float rightmostX = 6.6*CW + float(digits-1)*numCW;
+                // One makeStr character's pixel width at this CH:
+                // x = int(u.x * 16*SPACING), u.x = (fp.x-sx)*0.06/CH
+                // → pitch = CH / (0.06*16*SPACING)
+                float labelCW = CH / (0.06 * 16.0 * SPACING);
+                // Digit(s) start flush after the 7th char ('#') of "TRACK #"
+                float rightmostX = 7.0 * labelCW + float(digits-1) * numCW;
                 float textW = rightmostX + numCW;
                 float xCenter = tx + (TW - textW) * 0.5;
                 trk += tCol * printTrack(pUV(fp, xCenter, ty, CH));
@@ -6027,10 +7164,12 @@ void mainImage(out vec4 O, vec2 C) {{
         int ri_z = int((fp.y-tTop)/CH);
         float _rowY0 = tTop + float(ri_z)*CH + _inset;
         float _rowY1 = tTop + float(ri_z+1)*CH - _inset;
-        if(ri_z == frameRow && fp.y>=_rowY0 && fp.y<_rowY1 && fp.x>=_hX0 && fp.x<_hX1) {{
-            col = vec3(0.12, 0.38, 0.72);            // solid blue inset highlight
-        }} else if((ri_z & 1) == 0) {{
-            col = mix(col, vec3(0.0), 0.38);         // zebra darker rows
+        if(fp.x >= ML+rNW+8.) {{                         // gutter = plain background
+            if(ri_z == frameRow && fp.y>=_rowY0 && fp.y<_rowY1 && fp.x>=_hX0 && fp.x<_hX1) {{
+                col = vec3(0.12, 0.38, 0.72);        // solid blue inset highlight
+            }} else if((ri_z & 1) == 0) {{
+                col = mix(col, vec3(0.0), 0.38);     // zebra darker rows
+            }}
         }}
     }}
 
@@ -6047,9 +7186,6 @@ void mainImage(out vec4 O, vec2 C) {{
             vec3 rnc = ri_abs==frameRow ? WHITE : (on4 ? YELLOW*0.7 : TC3*0.7);
             trk += rnc * drawNum(rn, 2, ML+rNW-CW*1.2, tTop+float(ri_abs)*CH, CW*0.75,CH,fp);
         }}
-
-        // BLACK MASK: hide track content that scrolled under the row-number gutter
-        if(fp.x < ML+rNW+8.) col = vec3(0.0);
 
         // Per-track note data
         float xInT=fp.x-txOff;
@@ -6403,13 +7539,95 @@ void mainImage(out vec4 O, vec2 C) {{
 """
 
 
+    # ── WAVE section for Buffer A: conditional on viz ──────────────────────────
+    # viz 10 (LED Band Spectro 3D): rows WAVE_BASE..WAVE_BASE+31 store per-band
+    # DFT magnitude with fast-attack/slow-release smoothing (row 70) and 10%
+    # spatial-decay history (rows 71-101).  Image reads via iChannel1.
+    # All other vizzes: rows 70-133 store Zuvuya raw-bipolar waveform scroll.
+    # NOTE: _wave_section uses single {/} (inserted verbatim into f-string).
+    if viz == 10:
+        _wave_section = (
+            "    } else if (py == WAVE_BASE && px < int(iResolution.x)) {\n"
+            "        // ── Row 70: LED Spectro current-frame band (viz 10) ─────\n"
+            "        float u         = float(px) / float(iResolution.x);\n"
+            "        float numBands  = 32.0;\n"
+            "        float bandIdx   = floor(u * numBands);\n"
+            "        float bandStart = bandIdx / numBands;\n"
+            "        float spec = 0.0;\n"
+            "        for (int s = 0; s < 8; s++) {\n"
+            "            float su   = bandStart + (float(s) + 0.5) / 8.0 / numBands;\n"
+            "            int   binI = clamp(int(su * float(FFT_N / 2)), 0, FFT_N / 2 - 1);\n"
+            "            spec += texelFetch(iChannel0, ivec2(binI, 1), 0).r;\n"
+            "        }\n"
+            "        spec /= 8.0;\n"
+            "        spec  = pow(spec, 0.6) * 2.5;\n"
+            "        float prev    = texelFetch(iChannel0, ivec2(px, WAVE_BASE), 0).r;\n"
+            "        float newSpec = (spec > prev) ? mix(prev, spec, 0.5) : max(spec, prev * 0.1);\n"
+            "        O = vec4(newSpec, 0.0, 0.0, 1.0);\n"
+            "\n"
+            "    } else if (py > WAVE_BASE && py < WAVE_BASE + 32) {\n"
+            "        // ── Rows 71-101: spectro history — 10% spatial decay ────\n"
+            "        O = vec4(texelFetch(iChannel0, ivec2(px, py - 1), 0).r * 0.1, 0.0, 0.0, 1.0);\n"
+            "    }"
+        )
+    else:
+        _wave_section = (
+            "    } else if (py == WAVE_BASE) {\n"
+            "        // ── Row 70: newest row — RAW BIPOLAR audio (Zuvuya scroll) ──\n"
+            "        float u  = float(px) / float(iResolution.x);\n"
+            "        float mu = 1.0 - abs(u * 2.0 - 1.0);\n"
+            "        float t  = iTime - mu * 0.5;\n"
+            "        float ticksPerSec = float(BPM) * 2.0 / 5.0;\n"
+            "        float rowTime = float(SPEED) / ticksPerSec;\n"
+            "        Position pos = getPosition(t);\n"
+            "        float s = 0.0;\n"
+            "        // Note-synth fallback (no VQ access in this tab) — see _synthWave.\n"
+            "        for (int ch = 0; ch < NUM_CHANNELS; ch++) {\n"
+            "            Note tn = getNote(pos.songPos, pos.row, ch);\n"
+            "            int trow = pos.row, tpat = pos.songPos;\n"
+            "            if (tn.instrument <= 0 || tn.period <= 0) {\n"
+            "                int sr = pos.row, sp2 = pos.songPos;\n"
+            "                for (int lb = 1; lb < 48; lb++) {\n"
+            "                    sr--;\n"
+            "                    if (sr < 0) { if (sp2>0) {sp2--; sr=63;} else break; }\n"
+            "                    Note pn = getNote(sp2, sr, ch);\n"
+            "                    if (pn.instrument > 0 && pn.period > 0) {\n"
+            "                        tn = pn; trow = sr; tpat = sp2; break;\n"
+            "                    }\n"
+            "                }\n"
+            "            }\n"
+            "            if (tn.period <= 0) continue;\n"
+            "            float f = periodToFreq(tn.period);\n"
+            "            SampleInfo si = samples[tn.instrument - 1];\n"
+            "            int vol = si.volume;\n"
+            "            Note cr = getNote(pos.songPos, pos.row, ch);\n"
+            "            if (cr.effect == 0xC) vol = min(cr.param, 64);\n"
+            "            else if (tn.effect == 0xC) vol = min(tn.param, 64);\n"
+            "            float amp = float(vol) / 64.0;\n"
+            "            int trigSgr = patTickOffset[tpat] + (trow - patStartRow[tpat]);\n"
+            "            float trigT = float(fetchTick(trigSgr)) / TICKS_PER_SEC;\n"
+            "            float age   = max(0.0, t - trigT);\n"
+            "            float env   = exp(-age * 3.5);\n"
+            "            int wt = waveType[tn.instrument - 1];\n"
+            "            s += amp * env * _synthWave(wt, f, t);\n"
+            "        }\n"
+            "        s /= float(NUM_CHANNELS);\n"
+            "        // Raw bipolar waveform row. tanh soft-clip: bias 0.5, range ±0.4.\n"
+            "        O = vec4(0.0, 0.0, 0.0, 0.5 + tanh(s * 1.5) * 0.4);\n"
+            "\n"
+            "    } else if (py > WAVE_BASE && py < WAVE_BASE + WAVE_ROWS) {\n"
+            "        // ── Rows 71-133: scroll — copy row above (one frame younger) ──\n"
+            "        O = texelFetch(iChannel0, ivec2(px, py - 1), 0);\n"
+            "    }"
+        )
+
     # ========== BUFFER A TAB — FFT Spectrum Analyzer ==========
     # Row 0 (y=0): FFT_N audio samples collected via getChannelOutput
     # Row 1 (y=1): FFT_N/2 DFT magnitude bins (phasor-rotation, reads row 0 prev frame)
     # Setup: Buffer A iChannel0 = Buffer A (self-ref)
     #        Image   iChannel1 = Buffer A output
     buffer_a_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.61 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.62 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    Contact: subband@gmail.com or
             subband@protonmail.com
@@ -6705,56 +7923,7 @@ void mainImage(out vec4 O, vec2 C) {{
             O = texelFetch(iChannel0, ivec2(px, py - 1), 0);
         }}
 
-    }} else if (py == WAVE_BASE) {{
-        // ── Row 70: newest row — RAW BIPOLAR audio, no abs, no envelope ──────
-        float u  = float(px) / float(iResolution.x);
-        float mu = 1.0 - abs(u * 2.0 - 1.0);
-        float t  = iTime - mu * 0.5;
-        float ticksPerSec = float(BPM) * 2.0 / 5.0;
-        float rowTime = float(SPEED) / ticksPerSec;
-        Position pos = getPosition(t);
-        float s = 0.0;
-        // Note-synth fallback (no VQ access in this tab) — see _synthWave.
-        for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
-            Note tn = getNote(pos.songPos, pos.row, ch);
-            int trow = pos.row, tpat = pos.songPos;
-            if (tn.instrument <= 0 || tn.period <= 0) {{
-                int sr = pos.row, sp2 = pos.songPos;
-                for (int lb = 1; lb < 48; lb++) {{
-                    sr--;
-                    if (sr < 0) {{ if (sp2>0) {{sp2--; sr=63;}} else break; }}
-                    Note pn = getNote(sp2, sr, ch);
-                    if (pn.instrument > 0 && pn.period > 0) {{
-                        tn = pn; trow = sr; tpat = sp2; break;
-                    }}
-                }}
-            }}
-            if (tn.period <= 0) continue;
-            float f = periodToFreq(tn.period);
-            SampleInfo si = samples[tn.instrument - 1];
-            int vol = si.volume;
-            Note cr = getNote(pos.songPos, pos.row, ch);
-            if (cr.effect == 0xC) vol = min(cr.param, 64);
-            else if (tn.effect == 0xC) vol = min(tn.param, 64);
-            float amp = float(vol) / 64.0;
-            int trigSgr = patTickOffset[tpat] + (trow - patStartRow[tpat]);
-            float trigT = float(fetchTick(trigSgr)) / TICKS_PER_SEC;
-            float age   = max(0.0, t - trigT);
-            float env   = exp(-age * 3.5);
-            int wt = waveType[tn.instrument - 1];
-            s += amp * env * _synthWave(wt, f, t);
-        }}
-        s /= float(NUM_CHANNELS);
-        // Raw bipolar waveform row. tanh soft-clip prevents the alpha from
-        // pinning to 0 or 1 when multi-channel saw/square stacks would have
-        // pushed clamp(s*1.5+0.5) to its limits. Bias 0.5 = mid-gray when
-        // silent; tanh range maps ±1.5 amplitude into ~±0.4 around mid.
-        O = vec4(0.0, 0.0, 0.0, 0.5 + tanh(s * 1.5) * 0.4);
-
-    }} else if (py > WAVE_BASE && py < WAVE_BASE + WAVE_ROWS) {{
-        // ── Rows 71-133: scroll — copy row above (one frame younger) ────────
-        O = texelFetch(iChannel0, ivec2(px, py - 1), 0);
-    }}
+    {_wave_section}
 }}
 """
     # Write Buffer A file
@@ -9738,13 +10907,13 @@ def main():
             iv = int(v)
         except (TypeError, ValueError):
             iv = None
-        if iv is None or not (0 <= iv <= 9):
+        if iv is None or not (0 <= iv <= 19):
             raise argparse.ArgumentTypeError(
-                "invalid choice: %r (choose from [0..9], 0=no backdrop viz)" % v)
+                "invalid choice: %r (choose from [0..19], 0=sun rays backdrop)" % v)
         return iv
-    parser.add_argument('--viz', type=_viz_arg, default=6, metavar='[0..9]',
-                        help='Image-tab visualizer (choose from [0..9]):\n'
-                             '  0 = no backdrop viz  (black backdrop, fastest compile)\n'
+    parser.add_argument('--viz', type=_viz_arg, default=6, metavar='[0..19]',
+                        help='Image-tab visualizer (choose from [0..19]):\n'
+                             '  0 = Sun Rays          (cabbibo-style — warm/cool god-ray corona)\n'
                              '  1 = Reactive 001     (PAEz fork — SDF circles + cosmic web)  ← default\n'
                              '  2 = Fluxline Surfer  (mrange — DR2 dodecahedron + glowtracer)\n'
                              '  3 = Zuvuya           (city/stars + audio-reactive curtain)\n'
@@ -9753,7 +10922,17 @@ def main():
                              '  6 = Disco Combined   (smoke spotlights + lasers/clouds, time-driven)\n'
                              '  7 = Sparkly 4D       (Philip Bertani — 4D IFS volumetric raymarcher)\n'
                              '  8 = Skywalker        (orblivius — flying-curve terrain + sync stars)\n'
-                             '  9 = Music in the DNA  (jaszunio15/enbe fork — DNA helix + parallax dunes)')
+                             '  9 = Music in the DNA (jaszunio15/enbe fork — DNA helix + parallax dunes)\n'
+                             ' 10 = LED Band Spectro (Orblivious — pentagon LED tunnel + spectrum history)\n'
+                             ' 11 = Telekenesis v1.1 (Orblivious — IFS fractal raymarcher + waveform strip)\n'
+                             ' 12 = Laser Patterns   (0rblivius — Newton/IFS laser-grid fractal marcher)\n'
+                             ' 13 = Prismatic Frac.  (Smull fork — IFS box raymarch + audio glow)\n'
+                             ' 14 = Interdiml. Fold  (PAEz fork — spatial fold + sine warp march)\n'
+                             ' 15 = Fractal Torus    (ytt fork — periodic torus march + Menger IFS fold)\n'
+                             ' 16 = Unfound          (diatribes fork — orbit-trap fold + sinusoidal orb march)\n'
+                             ' 17 = Evrthing Temp.   (diatribes/FabriceNeyret2 — noise terrain + orb march)\n'
+                             ' 18 = sm0g             (diatribes/Shane — tri-planar SDF box corridors + bump)\n'
+                             ' 19 = Spectro 3D Mist  (Orblivius — 3D SDF bar spectrum + volumetric fog + reflective ground)')
     parser.add_argument('--samples', action='store_true', default=False,
                         help='Extract each sample (instrument) from the module as a separate '
                              'WAV file (named like 1-samplename.wav, 2-anothername.wav). '
@@ -9915,7 +11094,7 @@ def main():
     parser.add_argument('--no-dsp', dest='no_dsp', action='store_true', default=False,
                         help="MASTER SWITCH: disable ALL DSP effect processing in the output "
                              "shaders (3D surround, FAT4X exciter, PhatBass; velvet/comb reverb "
-                             "are already off in v1.61). Forces ENABLE_3D/FAT/PHATBASS/"
+                             "are already off in v1.62). Forces ENABLE_3D/FAT/PHATBASS/"
                              "VELVETREVERB/COMBREVERB = 0 and WINS over any individual "
                              "--surround/--phatbass/--fat4x passed alongside it. This is the "
                              "lightest Sound-tab path (no DSP private-vars) → best chance of "
@@ -9928,7 +11107,7 @@ def main():
                              "resolution but slower compile. Default: 1024 (or 128 if "
                              "--max-compat without override).")
     parser.add_argument('--max-compat', action='store_true', default=False,
-                        help='[NO-OP — max-compat is now the DEFAULT in v1.40+ (current: v1.61)] '
+                        help='[NO-OP — max-compat is now the DEFAULT in v1.40+ (current: v1.62)] '
                              'This flag previously enabled compatibility mode '
                              'for problematic GPUs/drivers (Windows + Firefox + '
                              'NVIDIA, etc.). The compat preset (--resampler '
@@ -11129,13 +12308,28 @@ Generated by MOD2GLSL
                 cumF = 0.0
                 rowStartTickF = [0.0]
                 bpm_changes = False
+                # ── Stride detection ───────────────────────────────────────────
+                # _XMITtoVQAdapter packs cells as 5 bytes (4 MOD bytes + vol_col);
+                # _S3MtoVQAdapter and native MODFile use 4 bytes.  The cell-read
+                # loop below must use the actual stride or it reads the wrong
+                # bytes for channels 1+ (e.g. effect byte of ch 1 at offset 7
+                # in 5-byte layout, but offset 6 with 4-byte stride → reads
+                # period-low of ch 1, not its effect).  Misaligned reads cause
+                # false 0xD/0xB nibble hits → truncated row count and garbage
+                # tick accumulation → rowStartTick 2× too large → GLSL binary-
+                # search returns rows at half the correct speed.
+                _stride = 4
+                if _mod.patterns:
+                    expected_5 = 64 * _mod.num_channels * 5
+                    if len(_mod.patterns[0]) == expected_5:
+                        _stride = 5   # XM / IT adapter (5-byte cells)
                 for _pos in range(_mod.song_length):
                     pat_idx = _mod.pattern_order[_pos]
                     pdata = _mod.patterns[pat_idx]
                     broke = False
                     for row in range(64):
                         for ch in range(_mod.num_channels):
-                            base = row * _mod.num_channels * 4 + ch * 4
+                            base = row * _mod.num_channels * _stride + ch * _stride
                             b0, b1, b2, b3 = pdata[base:base+4]
                             effect = b2 & 0x0F
                             param  = b3
@@ -11148,8 +12342,18 @@ Generated by MOD2GLSL
                             elif effect == 0xD or effect == 0xB:
                                 broke = True
                         rowSpeed.append(speed)
-                        # Scale: ticks-equivalent at BPM=125 so time = ticks/50
-                        cumF += speed * 125.0 / max(bpm, 1)
+                        # Raw tick accumulation — consistent with the GLSL
+                        # TICKS_PER_SEC = SR/((125*SR)//(50*BPM)) patch which
+                        # already encodes the true per-BPM tick rate.  The old
+                        # "× 125/bpm" BPM-normalisation targeted TICKS_PER_SEC=50
+                        # but the GLSL override sets it to the real TPS (~56 for
+                        # BPM=140), so the two were in conflict for any BPM≠125
+                        # — rowStartTick ended up scaled by 125/BPM while GLSL
+                        # divided by BPM's true TPS, making the binary-search
+                        # return rows 12% off at BPM=140.  Raw ticks + real TPS
+                        # agree at any constant BPM (variable-BPM is a known
+                        # limitation: TICKS_PER_SEC would need to vary per row).
+                        cumF += speed
                         rowStartTickF.append(cumF)
                         if broke:
                             break
@@ -11324,7 +12528,7 @@ Generated by MOD2GLSL
                         # hardcoded 31 — 2ND_PM has 54 instruments and the
                         # 31-cap silenced its voice/vocal samples (instr
                         # 32-54 were never encoded). See feedback_s3m_
-                        # instrument_cap; this is that fix ported onto v1.61.
+                        # instrument_cap; this is that fix ported onto v1.62.
                         self.samples_info = []
                         self.sample_bytes = []
                         _n_smp = max(31, len(m.samples))
@@ -11645,7 +12849,7 @@ Generated by MOD2GLSL
             # Stamp visualizer name into the b64-emitted Common header so it
             # matches the other 3 tabs.
             _viz_names = {
-                0: "None (black backdrop)",
+                0: "Sun Rays (cabbibo-style — warm/cool god-ray corona)",
                 1: "Reactive 001 (PAEz fork — SDF circles + cosmic web)",
                 2: "Fluxline Surfer (mrange — DR2 dodecahedron + glowtracer)",
                 3: "Zuvuya (city/stars + audio-reactive curtain)",
@@ -11675,7 +12879,7 @@ Generated by MOD2GLSL
                 # glsl_state_dump.py / sound_exec.py inject it themselves.
                 _ct = _ct.replace(
                     "GLSL (The Last) MOD Player v1.42 (c) 2026 Orblivius",
-                    "GLSL (The Last) MOD Player v1.61 (c) 2026 Orblivius", 1)
+                    "GLSL (The Last) MOD Player v1.62 (c) 2026 Orblivius", 1)
                 _ct = _ct.replace("   COMMON TAB\n", f"   COMMON TAB\n   Visualizer: {_vname}\n", 1)
 
                 # Inject visualizer note-synth helpers (waveType[] + _synthWave).
@@ -12924,7 +14128,7 @@ Generated by MOD2GLSL
                 # mikit_engine.py:560-575 — a cell carrying an INSTRUMENT
                 # number unconditionally resets channel volume to that
                 # sample's default volume (porta or kick), THEN a volume
-                # column / Cxx on the same cell overrides.  v1.61's volume
+                # column / Cxx on the same cell overrides.  v1.62's volume
                 # forward-scan never did the inst→sample-default reset, so on
                 # tone-porta leads (inst25: note+G every ~2 rows, volcol=20
                 # on the off-rows) the volcol value froze and never returned
@@ -13139,7 +14343,7 @@ Generated by MOD2GLSL
                 # ── IT instrument resonant filter (it2play 2-pole LPF) ────
                 # Recovered algorithm (it2play it2drivers/hq.c, captured in
                 # session a3158c73): coeffs from cutoff/res, mixrate-dependent
-                # (filterStep=24). The IIR is recursive; v1.61's Sound shader
+                # (filterStep=24). The IIR is recursive; v1.62's Sound shader
                 # is stateless per sample, so realize it as a truncated
                 # impulse-response FIR: h[k] = the 2-pole's response (run its
                 # a/b/c K steps), convolved with the voice's dry source read
@@ -14281,7 +15485,7 @@ Generated by MOD2GLSL
             _IN_PNG = {"channel": 0, "type": "texture", "id": "dataPNG0",
                        "filepath": base_name + "_player_data.png", "sampler": _SMP_DATA}
             _st_name = (mod.title.strip() or base_name)[:64]
-            _st_desc = f"{_st_name} — MOD2GLSL v1.61"
+            _st_desc = f"{_st_name} — MOD2GLSL v1.62"
             # Image is placed first so ShaderToy's new-shader first-tab reset only
             # wipes Image code (user re-pastes from *_shadertoy_image.glsl).
             # Image inputs ARE included: channels survive the reset so they are
