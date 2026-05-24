@@ -992,7 +992,7 @@ body{{background:var(--bg0);color:var(--text);font-family:var(--font);display:fl
   overflow:hidden; font-size:13px;
 }}
 .trk-header {{
-  display:flex; background:var(--bg2); border-bottom:1px solid var(--border); padding:3px 0;
+  display:flex; background:var(--bg0); border-bottom:1px solid var(--border); padding:3px 0;
 }}
 .trk-col-hdr {{
   font-size:10px; letter-spacing:2px; color:var(--dim); text-transform:uppercase;
@@ -1003,8 +1003,8 @@ body{{background:var(--bg0);color:var(--text);font-family:var(--font);display:fl
 .trk-row.current {{
   background:rgba(255,255,255,0.07) !important; border-left:3px solid var(--accent);
 }}
-.trk-row:nth-child(even) {{ background:#0d0d14; }}
-.trk-row:nth-child(odd)  {{ background:#101018; }}
+.trk-row:nth-child(even) {{ background:#0b0b11; }}
+.trk-row:nth-child(odd)  {{ background:#0d0d12; }}
 .trk-rownum {{
   flex:0 0 44px; color:var(--dim); font-size:11px;
   padding:3px 8px; align-self:center;
@@ -1022,9 +1022,9 @@ body{{background:var(--bg0);color:var(--text);font-family:var(--font);display:fl
 /* Tracks area click-to-scroll: left half scrolls back, right half scrolls
    forward. Hidden when nc <= TRACKS_PER_VIEW (nothing to scroll). */
 #tracker.scrollable {{ cursor:ew-resize; user-select:none; }}
-#tracker.scrollable .trk-row:hover {{ background:#181828 !important; }}
+#tracker.scrollable .trk-row:hover {{ background:#13131e !important; }}
 .trk-scroll-hint {{
-  display:none; padding:4px 12px; background:var(--bg2);
+  display:none; padding:4px 12px; background:var(--bg1);
   color:var(--accent2); font-size:10px; letter-spacing:2px;
   border-top:1px solid var(--border); border-bottom:1px solid var(--border);
   text-align:center; white-space:nowrap; user-select:none;
@@ -2742,7 +2742,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
     # ========== COMMON TAB ==========
     # Instrument count: S3M/IT can exceed 31 (2ND_PM=54). Hardcoded 31
     # silenced instruments 32+ (voice/vocal samples) — feedback_s3m_
-    # instrument_cap, ported onto v1.62. Used by _gcoBody guard, isBass[],
+    # instrument_cap, ported onto v1.63. Used by _gcoBody guard, isBass[],
     # samples[] across Common+Sound; must be defined before common_glsl.
     # DYNAMIC instrument/sample count — sized to the actual file, never a
     # hardcoded cap. MOD naturally yields 31 (its fixed header), S3M/XM/IT
@@ -2756,7 +2756,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
                 len(getattr(mod, 'samples', []) or []))
     data_source_comment = "Embedded data (no PNG required)" if use_embedded else f"All data in 1024×1024 RGBA PNG: {png_file}"
     common_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.62 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.63 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    COMMON TAB
    Visualizer: {viz_name}
@@ -3453,7 +3453,7 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     _ap_p0_2, _ap_p1p2_2, _ap_delay_2 = _only3d_coeffs(_ONLY3D_FREQ2)
 
     sound_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.62 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.63 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    SOUND TAB
    Visualizer: {viz_name}
@@ -3621,7 +3621,7 @@ vec2 mainSound(int samp, float time) {{
     // NNA / DCT / DCA / fadeout into the VoiceSegment timeline; tlGetOutput
     // sums the active segments. The entire pattern-player dry/3D/PhatBass
     // path below is preprocessor-removed for IT (no double-mix, no wasted
-    // per-sample pattern walk). v1.62's downstream limiter/FAT/comb still
+    // per-sample pattern walk). v1.63's downstream limiter/FAT/comb still
     // apply to _out.
     vec2 _out = tlGetOutput(playbackTime);
 #else
@@ -3759,8 +3759,8 @@ vec2 mainSound(int samp, float time) {{
         _out = sign(_out) * (min(_ax, vec2(_T)) + _reduced);
     }}
 
-    // Hand off to v1.62's comb reverb + buffer-fade (kept active; mod_player.py
-    // has these disabled but removing v1.62's working tail is not requested).
+    // Hand off to v1.63's comb reverb + buffer-fade (kept active; mod_player.py
+    // has these disabled but removing v1.63's working tail is not requested).
     float outL = _out.x;
     float outR = _out.y;
 
@@ -5868,30 +5868,27 @@ vec3 _VizScene(vec2 C) {
     vec3 vro = vec3(-0.02, -0.03, iTime / 4.0);
     _v11_march(vro, normalize(vec3(p, 1.5)), 20.0);
 
-    float tt = sin(iTime * 0.1);
-    // CenterUV then scale by 1/resolution for per-pixel waveform strip
+    // Normalised screen coords — y=0 at diamond/screen centre
     vec2 uv  = (2.0*C - iResolution.xy) / min(iResolution.x, iResolution.y)
                / iResolution.xy;
-    float x  = uv.x;
-    float xx = x * iResolution.x * 0.2;
-    float v  = _v11_val / 50.0;
+    float xx = uv.x * iResolution.x * 0.2;
 
+    // Waveform sample centred at y=0 (removed the +_v11_AMP vertical bias)
     float sineX = _v11_AMP * _v11_wav(clamp(xx * 2.0 + 0.5, 0.0, 1.0));
-    float y     = (uv.y / 0.0035 + _v11_AMP) * _v11_yMul;
-    x += tt;
-    float tm = iTime * tt;
+    float y     = (uv.y / 0.0035) * _v11_yMul;   // no offset → centred
 
-    float c   = 0.002 / max(abs(sineX * 20.0 - y), 1e-6);
-    float rx  = x * abs(cos(0.03 * tm));
-    float sv  = sin(rx), cv = cos(rx * 0.5);
-    float ir  = (xx > -v && xx < v) ? 1.0 : 0.0;
-    vec3  rgb = cos((2.0*v + clamp(xx,-v,v)) / max(v,1e-6) * 0.5 * _v11_PI)
-                * 2.0 * ir * vec3(sv+cv, clamp(cos(rx),0.,0.9), sv);
-
-    vec4 colo = 1.0 - clamp(1.0 + 1e-5 - vec4(c*rgb*rgb, 1.0), 0.0, 1.0);
-    vec3 c1   = _v11_col * _v11_col;
-    vec3 c1s  = c1 * c1;
-    return c1s * c1s * colo.a + colo.rgb;
+    // Darken background near the waveform line instead of drawing bright colour
+    float c    = 0.002 / max(abs(sineX * 20.0 - y), 1e-6);
+    // First: darkening (groove) — visible where IFS has colour
+    float dark = 1.0 - clamp(c * 0.55, 0.0, 0.92);
+    // Then: lightening (ridge just above) — additive so visible everywhere, even in dark IFS
+    float c2   = 0.012 / max(abs(sineX * 20.0 - y + 0.05), 1e-6);
+    float lite  = clamp(c2 * 0.22, 0.0, 0.85);
+    vec3 c1  = _v11_col * _v11_col;
+    vec3 c1s = c1 * c1;
+    vec3 base = c1s * c1s * dark;
+    base = min(vec3(1.0), base + vec3(lite * 0.35, lite * 0.55, lite * 1.0));
+    return base;
 }
 """
 
@@ -6701,7 +6698,7 @@ vec3 _VizScene(vec2 C){
 
 
     image_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.62 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.63 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    IMAGE TAB — iChannel0: alphabet texture (shadertoy.com/view/4sf3RB)
                 iChannel1: Buffer A (audio + FFT + smoothed bands)
@@ -6809,7 +6806,7 @@ makeStr(printBPMVal) {bpm_val_chars} _end
 makeStr(printSpdVal) {spd_val_chars} _end
 
 // ---- Static label strings ----
-makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _6 _2 _ _NUM _NUM _NUM _end
+makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _6 _3 _ _NUM _NUM _NUM _end
 makeStr(printCredit) _COPY _2 _0 _2 _6 _ _O _R _B _L _I _V _I _U _S _end
 makeStr(printLoad)   _L _O _A _D _I _N _G _DOT _DOT _DOT _end
 makeStr(printSpec)   _S _P _E _C _T _R _U _M _end
@@ -6824,7 +6821,7 @@ makeStr(printTrk2)  _T _R _A _C _K _ _NUM _2 _end
 makeStr(printTrk3)  _T _R _A _C _K _ _NUM _3 _end
 makeStr(printTrk4)  _T _R _A _C _K _ _NUM _4 _end
 makeStr(printTracks) _T _R _A _C _K _S _COL _end
-makeStr(printTrack)  _T _R _A _C _K _ _NUM _end
+makeStr(printTrack)  _T _R _A _C _K _ _end
 
 // ============================================================
 // pUV — pixel coords (y from TOP) → makeStr font UV
@@ -7009,7 +7006,7 @@ void mainImage(out vec4 O, vec2 C) {{
     const vec3 TC2    = vec3(1.00,0.45,0.90);
     const vec3 TC3    = vec3(1.00,0.55,0.10);
 
-    const float CH=30., CW=25., ML=10.;
+    const float CH=31., CW=25., ML=10.;
     // 90 frames @ 60Hz = 1.5s — long enough that the loading dialog is
     // actually readable. Anything under ~30 frames flashes by too fast to
     // register; over ~150 starts to feel like the page is broken.
@@ -7057,14 +7054,14 @@ void mainImage(out vec4 O, vec2 C) {{
     Position pos = getPosition(iTime);
     // Accumulate tracker UI into separate buffer so it overlays pure (no curtain tint)
     vec3 trk = vec3(0.0);
+    col *= 1.0 - 0.50 * printHdr   (pUV(fp, ML+1.,  7., CH));
     trk += vec3(0.45, 0.70, 1.20) * printHdr   (pUV(fp, ML,  6., CH));
+    col *= 1.0 - 0.45 * printCredit(pUV(fp, iResolution.x - ML - 15.0*CH*0.75/(0.06*16.0*SPACING) + 1., 7., CH*0.75));
     trk += WHITE  * printCredit(pUV(fp, iResolution.x - ML - 15.0*CH*0.75/(0.06*16.0*SPACING), 6., CH*0.75));
+    col *= 1.0 - 0.50 * printTitle (pUV(fp, ML+1., CH+10., CH));
     trk += YELLOW * printTitle (pUV(fp, ML, CH+9., CH));
+    col *= 1.0 - 0.45 * printFormat(pUV(fp, ML + float({title_len}) * CW + 1., CH+10., CH));
     trk += WHITE  * printFormat(pUV(fp, ML + float({title_len}) * CW, CH+9., CH));
-    // hlines extended to frame edges (3px inset from canvas) so they
-    // visually CONNECT with the left and right vertical frame borders.
-    // Was [ML, iResolution.x-ML] which left ~7px gaps on each side.
-    trk += BLUE * 0.55 * hline(fp, CH*2.+13., 1., iResolution.x-1.);
 
     // ============ INFO BAR ============
     float iy  = CH*2.+20.;
@@ -7074,33 +7071,48 @@ void mainImage(out vec4 O, vec2 C) {{
     // balanced rx = (pattEnd + trxStart - rowW) / 2 = res.x*0.5 - 2.5*CW
     float rx  = iResolution.x*0.5 - 2.5*CW;
 
+    col *= 1.0 - 0.45 * printPatt(pUV(fp, ML+1., iy+1., CH));
     trk += BLUE   * printPatt(pUV(fp, ML, iy, CH));
+    col *= 1.0 - 0.45 * drawNum(pos.songPos, 2, ML+10.*CW+1., iy+1., CW,CH,fp);
     trk += WHITE  * drawNum(pos.songPos, 2, ML+10.*CW, iy, CW,CH,fp);
+    col *= 1.0 - 0.45 * drawCh(47,fp, ML+11.*CW+1., iy+1., CW,CH);
     trk += BLUE   * drawCh(47,fp, ML+11.*CW, iy, CW,CH);
+    col *= 1.0 - 0.45 * drawNum({mod.num_patterns-1}, 2, ML+13.*CW+1., iy+1., CW,CH,fp);
     trk += YELLOW * drawNum({mod.num_patterns-1}, 2, ML+13.*CW, iy, CW,CH,fp);
 
+    col *= 1.0 - 0.45 * printRow(pUV(fp, rx+1., iy+1., CH));
     trk += BLUE   * printRow(pUV(fp, rx, iy, CH));
+    col *= 1.0 - 0.45 * drawNum(pos.row, 2, rx+5.*CW+1., iy+1., CW,CH,fp);
     trk += WHITE  * drawNum(pos.row, 2, rx+5.*CW, iy, CW,CH,fp);
+    col *= 1.0 - 0.45 * drawCh(47,fp, rx+6.*CW+1., iy+1., CW,CH);
     trk += BLUE   * drawCh(47,fp, rx+6.*CW, iy, CW,CH);
+    col *= 1.0 - 0.45 * drawCh(54,fp, rx+7.*CW+1., iy+1., CW,CH);
     trk += YELLOW * drawCh(54,fp, rx+7.*CW, iy, CW,CH);
+    col *= 1.0 - 0.45 * drawCh(52,fp, rx+8.*CW+1., iy+1., CW,CH);
     trk += YELLOW * drawCh(52,fp, rx+8.*CW, iy, CW,CH);
-    // TRACKS: N — flush right on same row as ROW/PATTERN info
-    trk += BLUE   * printTracks(pUV(fp, iResolution.x - ML - 10.*CW, iy, CH));
-    trk += YELLOW * drawNum(NUM_CHANNELS, 2, iResolution.x - ML - 2.*CW, iy, CW, CH, fp);
+    // TRACKS: N — flush right, aligned with right edge of the frame
+    col *= 1.0 - 0.45 * printTracks(pUV(fp, iResolution.x - 10.*CW + 2., iy+1., CH));
+    trk += BLUE   * printTracks(pUV(fp, iResolution.x - 10.*CW + 1., iy, CH));
+    col *= 1.0 - 0.45 * drawNum(NUM_CHANNELS, 2, iResolution.x - 2.*CW + 2., iy+1., CW, CH, fp);
+    trk += YELLOW * drawNum(NUM_CHANNELS, 2, iResolution.x - 2.*CW + 1., iy, CW, CH, fp);
 
-    trk += BLUE   * printBPM(pUV(fp, ML,  iy2, CH));
+    col *= 1.0 - 0.45 * printBPM(pUV(fp, ML+1.,  iy2+1., CH));
+    trk += BLUE   * printBPM(pUV(fp, ML, iy2, CH));
+    col *= 1.0 - 0.45 * printBPMVal(pUV(fp, ML+5.*CW+1., iy2+1., CH));
     trk += YELLOW * printBPMVal(pUV(fp, ML+5.*CW, iy2, CH));
-    trk += BLUE   * printSpd(pUV(fp, rx,  iy2, CH));
+    col *= 1.0 - 0.45 * printSpd(pUV(fp, rx+1.,  iy2+1., CH));
+    trk += BLUE   * printSpd(pUV(fp, rx, iy2, CH));
+    col *= 1.0 - 0.45 * printSpdVal(pUV(fp, rx+7.*CW+1., iy2+1., CH));
     trk += YELLOW * printSpdVal(pUV(fp, rx+7.*CW, iy2, CH));
 
-    trk += BLUE * 0.55 * hline(fp, iy2+CH+4., 1., iResolution.x-1.);
 
     // ============ TRACKER ============
     float ty   = iy2+CH+10.;
-    float TW   = 9.*CW+6.;    // 9 chars per cell + 6px gap
+    float TCW  = 18.;          // tracker column char width (narrower than info-bar CW=25)
+    float TW   = 9.*TCW+6.;   // 9 chars per cell + 6px gap = 168px
     float rNW  = 2.*CW;
     float txOff= ML+rNW+8. + _scrollX;  // scroll offset applied to all tracks
-    const int HVR = 4;  // 9 visible rows, CH=34 stretches each row — oscillo shrinks
+    const int HVR = 5;  // 11 visible rows; oscillo shrinks to give tracker more space
 
     // Track headers — dynamic loop over all channels, colored by tc%4,
     // scrolled with _scrollX so wide songs scroll horizontally.
@@ -7113,35 +7125,29 @@ void mainImage(out vec4 O, vec2 C) {{
             // Only render headers inside the visible area (skip off-screen left/right)
             if(tx > ML+rNW+8.-TW && tx < iResolution.x - ML) {{
                 int digits = (tc+1 >= 10) ? 2 : 1;
-                float numCW = CW * 0.65;
-                // One makeStr character's pixel width at this CH:
-                // x = int(u.x * 16*SPACING), u.x = (fp.x-sx)*0.06/CH
-                // → pitch = CH / (0.06*16*SPACING)
-                float labelCW = CH / (0.06 * 16.0 * SPACING);
-                // Digit(s) start flush after the 7th char ('#') of "TRACK #"
-                float rightmostX = 7.0 * labelCW + float(digits-1) * numCW;
+                // Label font: 65% of CH; digit font: 85% of CH (taller+wider for readability)
+                float _tHdr   = CH * 0.65;
+                float _dHdr   = CH * 0.85;  // digit height — larger than label
+                float _tyHdr  = ty + (CH + 3.0 - _tHdr) * 0.5;
+                float _dyHdr  = ty + (CH + 3.0 - _dHdr) * 0.5;
+                float numCW   = TCW * 0.95;  // digit cell width
+                float labelCW = _tHdr / (0.06 * 16.0 * SPACING);
+                // Digit(s) start flush after the 6th char of "TRACK "
+                float rightmostX = 6.0 * labelCW + float(digits-1) * numCW;
                 float textW = rightmostX + numCW;
                 float xCenter = tx + (TW - textW) * 0.5;
-                trk += tCol * printTrack(pUV(fp, xCenter, ty, CH));
-                trk += tCol * drawNum(tc+1, digits, xCenter + rightmostX, ty, numCW, CH, fp);
+                col *= 1.0 - 0.45 * printTrack(pUV(fp, xCenter+1., _tyHdr+1., _tHdr));
+                trk += tCol * printTrack(pUV(fp, xCenter, _tyHdr, _tHdr));
+                col *= 1.0 - 0.45 * drawNum(tc+1, digits, xCenter + rightmostX + 1., _dyHdr + 1., numCW, _dHdr, fp);
+                trk += tCol * drawNum(tc+1, digits, xCenter + rightmostX, _dyHdr, numCW, _dHdr, fp);
             }}
         }}
     }}
 
     // Vertical separators — bounded to end at the bottom hline (tBot+3),
     // not extending below into the spectrum/oscilloscope area.
-    // Math: tBot = ty + CH+3 + (2*HVR+1)*CH = ty + (2*HVR+2)*CH + 3
-    //       tBot + 3 = ty + (2*HVR+2)*CH + 6
-    for(int tc=1;tc<NUM_CHANNELS;tc++)
-        // Verticals stop 1px short of the bottom hline (tBot+3) so the
-        // T-junctions don't have a double-bright dot from additive trk
-        // accumulation overlapping vline + hline at the same pixel.
-        // Vline starts at ty+CH+1 (just BELOW the "TRACK #N" header so the
-        // line doesn't cut through the title text — that was creating the
-        // "boxes around text" artifacts the user noticed) and ends at
-        // tBot+4 (1px short of the bottom hline at tBot+5 to avoid bright-
-        // dot doubling at the T-junction).
-        trk += BLUE*0.55*vline(fp, txOff+float(tc)*TW-4., ty+CH+1., ty+float(2*HVR+2)*CH+7.);
+    // Vertical column separators are now col-based darkening (see divider
+    // lines section below), not trk-overlay blue lines.
 
     float tTop = ty+CH+3.;
     float tBot = tTop+float(2*HVR+1)*CH;
@@ -7152,25 +7158,76 @@ void mainImage(out vec4 O, vec2 C) {{
     int pageStart = (pos.row / pageSize) * pageSize;    // first row of current page
     int frameRow  = pos.row - pageStart;                // frame position within page (0..pageSize-1)
 
-    // ── Tracker background: highlight row = solid blue (inset 2px), others = zebra ─
-    float _inset = 2.0;
-    float _hX0 = ML - _inset;
-    float _hX1 = iResolution.x - ML + _inset;
+    // ── Tracker background: 3D raised-bevel per cell ──────────────────────
+    // Base row color first, then 2px highlight on top+left edges and
+    // 2px shadow on bottom+right edges — classic raised-button 3D effect.
     if(fp.y>=tTop && fp.y<tBot) {{
-        // V7 stays at full intensity across the tracker — only the zebra
-        // rows do the darkening (alternating "even" rows get mix(col,
-        // black, 0.38)). The previous col*=0.45 was too aggressive and
-        // made the area look cut off from the rest of the player.
         int ri_z = int((fp.y-tTop)/CH);
-        float _rowY0 = tTop + float(ri_z)*CH + _inset;
-        float _rowY1 = tTop + float(ri_z+1)*CH - _inset;
-        if(fp.x >= ML+rNW+8.) {{                         // gutter = plain background
-            if(ri_z == frameRow && fp.y>=_rowY0 && fp.y<_rowY1 && fp.x>=_hX0 && fp.x<_hX1) {{
-                col = vec3(0.12, 0.38, 0.72);        // solid blue inset highlight
-            }} else if((ri_z & 1) == 0) {{
-                col = mix(col, vec3(0.0), 0.38);     // zebra darker rows
-            }}
+        float _rowFrac = mod(fp.y - tTop, CH);
+        float _xInT    = fp.x - txOff;
+        float _colFrac = _xInT >= 0.0 ? mod(_xInT, TW) : -1.0;
+        // Base row color
+        if(ri_z == frameRow) {{
+            col = vec3(0.12, 0.38, 0.72);
+        }} else if((ri_z & 1) == 0) {{
+            col *= 0.55;
         }}
+        // 3D bevel: 2px highlight (top + left), 2px shadow (bottom + right)
+        bool _hiH = _rowFrac < 2.0;
+        bool _shH = _rowFrac >= CH - 2.0;
+        bool _hiV = _xInT >= 0.0 && _colFrac < 1.0;
+        bool _shV = _xInT >= 0.0 && _colFrac >= TW - 1.0;
+        if(_hiH || _hiV) {{
+            col = min(vec3(1.0), col + vec3(0.22, 0.22, 0.32));
+        }} else if(_shH || _shV) {{
+            col = max(col * 0.20, vec3(0.05, 0.02, 0.02));
+        }}
+    }}
+
+    // ── Panel bevels: 3D raised border on every major UI strip ─────────────
+    // Header strip, info strip, and TRACK-header row all get the same
+    // highlight-top / shadow-bottom treatment (light from top-left).
+    // TRACK-header also gets per-column left/right bevel like tracker rows.
+    {{
+        float _hL1 = CH*2.+13.;        // hline y between header and info
+        float _hL2 = iy2+CH+4.;        // hline y between info and tracker
+        // Header strip — title / version / credit line
+        if(fp.y < _hL1) {{
+            if(fp.y < 2.0)
+                col = min(vec3(1.0), col + vec3(0.22, 0.22, 0.32));
+            else if(fp.y > _hL1 - 2.0)
+                col = max(col * 0.20, vec3(0.05, 0.02, 0.02));
+        }}
+        // Info strip — PATTERN / ROW / BPM / SPEED
+        else if(fp.y < _hL2) {{
+            if(fp.y < _hL1 + 2.0)
+                col = min(vec3(1.0), col + vec3(0.22, 0.22, 0.32));
+            else if(fp.y > _hL2 - 2.0)
+                col = max(col * 0.20, vec3(0.05, 0.02, 0.02));
+        }}
+        // TRACK #N header row — horizontal bevel + per-column left/right bevel
+        else if(fp.y >= ty && fp.y < tTop) {{
+            float _xH  = fp.x - txOff;
+            float _cFH = _xH >= 0.0 ? mod(_xH, TW) : -1.0;
+            bool _hHi  = fp.y < ty + 2.0 || (_xH >= 0.0 && _cFH < 2.0);
+            bool _hSh  = fp.y > tTop - 2.0 || (_xH >= 0.0 && _cFH >= TW - 2.0);
+            if(_hHi)      col = min(vec3(1.0), col + vec3(0.22, 0.22, 0.32));
+            else if(_hSh) col = max(col * 0.20, vec3(0.05, 0.02, 0.02));
+            else          col = min(vec3(1.0), col * 1.20);  // brighten interior
+        }}
+    }}
+
+    // ── Divider lines: darken the background scene (no blue color) ─────────
+    // Horizontal panel separators at their exact y pixel.
+    {{
+        float _dH1 = CH*2.+13., _dH2 = iy2+CH+4., _dHB = tBot+5.;
+        if((fp.y >= _dH1 && fp.y < _dH1+1.) ||
+           (fp.y >= _dH2 && fp.y < _dH2+1.) ||
+           (fp.y >= _dHB && fp.y < _dHB+1.))
+            col *= 0.15;
+        // Vertical column separators: handled by per-cell bevel
+        // (shadow at colFrac=TW-1 immediately adjacent to highlight at colFrac=0)
+        // No extra divider line needed — it caused a visible gap between dark and light.
     }}
 
     if(fp.y>=tTop && fp.y<tBot) {{
@@ -7184,6 +7241,7 @@ void mainImage(out vec4 O, vec2 C) {{
             if(rn>=64) rn-=64;
             bool on4 = (rn%4)==0;
             vec3 rnc = ri_abs==frameRow ? WHITE : (on4 ? YELLOW*0.7 : TC3*0.7);
+            col *= 1.0 - 0.45 * drawNum(rn, 2, ML+rNW-CW*1.2+1., tTop+float(ri_abs)*CH+1., CW*0.75,CH,fp);
             trk += rnc * drawNum(rn, 2, ML+rNW-CW*1.2, tTop+float(ri_abs)*CH, CW*0.75,CH,fp);
         }}
 
@@ -7191,7 +7249,7 @@ void mainImage(out vec4 O, vec2 C) {{
         float xInT=fp.x-txOff;
         if(xInT>=0.&&xInT<float(NUM_CHANNELS)*TW && fp.x >= ML+rNW+8.) {{
             int tc =int(xInT/TW);
-            int ci =int((xInT-float(tc)*TW)/CW);
+            int ci =int((xInT-float(tc)*TW)/TCW);
             if(ci<9) {{
                 int rn = pageStart + ri_abs;
                 int sp = pos.songPos;
@@ -7199,22 +7257,24 @@ void mainImage(out vec4 O, vec2 C) {{
                 if(rn>=64){{ rn-=64; sp=min(SONG_LENGTH-1,sp+1); }}
                 Note n=getNote(sp,rn,tc);
                 int c=nCell(n.period,n.instrument,n.effect,n.param,ci);
-                float g=drawCh(c, fp,
-                    txOff+float(tc)*TW+float(ci)*CW,
-                    tTop+float(ri_abs)*CH, CW,CH);
+                float _sx = txOff+float(tc)*TW+float(ci)*TCW;
+                float _sy = tTop+float(ri_abs)*CH;
+                col *= 1.0 - 0.45 * drawCh(c, fp, _sx+1., _sy+1., TCW,CH);
+                float g=drawCh(c, fp, _sx, _sy, TCW,CH);
                 bool isEmpty=(n.period==0&&n.instrument==0&&n.effect==0);
-                float fade=max(0.25,1.0-float(abs(ri))*0.1);
-                // Per-track color, dimmed by distance from current row
                 const vec3 TCols[4]=vec3[](TC0,TC1,TC2,TC3);
                 vec3 nc;
-                if(isEmpty) nc = DIM*fade*1.6;     // empty "0 0 0 0" — boosted 60% so rows are readable
-                else        nc = (ri==0 ? TCols[tc] : TCols[tc]*fade);
+                if(ri_abs == frameRow) {{
+                    nc = isEmpty ? WHITE*0.55 : WHITE;  // white text on blue highlight row
+                }} else if(isEmpty) {{
+                    nc = DIM*1.6;
+                }} else {{
+                    nc = TCols[tc];
+                }}
                 trk += nc*g;
             }}
         }}
     }}
-    trk += BLUE * 0.55 * hline(fp, tBot+5., 1., iResolution.x-1.);
-
     // ── Composite: PREMULTIPLIED ALPHA-OVER ────────────────────────────────
     // The previous `col = mix(col, trk, trkA)` was squaring the glyph value:
     // for a YELLOW glyph at AA opacity 0.85, trk was YELLOW*0.85 (already
@@ -7518,21 +7578,41 @@ void mainImage(out vec4 O, vec2 C) {{
         // SPECTRUM (8 chars), OSCILLOSCOPE (12 chars) — text width =
         // n*CW at full CH size; right-align with 8px margin to frame.
         if (fp.y > oy + 4. && fp.y < oy + 4. + CH) {{
-            if (specMode)
-                col += DIM * 0.6 * printSpec(pUV(fp, iResolution.x - 8.*CW - 2., oy+4., CH));
-            else
-                col += DIM * 0.6 * printOsci(pUV(fp, iResolution.x - 12.*CW - 2., oy+4., CH));
+            if (specMode) {{
+                col *= 1.0 - 0.35 * printSpec(pUV(fp, iResolution.x - 8.*CW - 2., oy+4., CH));
+                col += DIM * 0.6 * printSpec(pUV(fp, iResolution.x - 8.*CW - 3., oy+3., CH));
+            }} else {{
+                col *= 1.0 - 0.35 * printOsci(pUV(fp, iResolution.x - 12.*CW - 2., oy+4., CH));
+                col += DIM * 0.6 * printOsci(pUV(fp, iResolution.x - 12.*CW - 3., oy+3., CH));
+            }}
+        }}
+        // 3D raised-bevel border around the entire strip:
+        // top+left 1px = highlight, bottom+right 1px = shadow
+        bool _sTop = fp.y < oy + 1.5;
+        bool _sBot = fp.y > by1 - 1.5;
+        bool _sLft = fp.x < 3.5;
+        bool _sRgt = fp.x > iResolution.x - 3.5;
+        if(_sTop || _sLft) {{
+            col = min(vec3(1.0), col + vec3(0.22, 0.22, 0.32));
+        }} else if(_sBot || _sRgt) {{
+            col = max(col * 0.20, vec3(0.05, 0.02, 0.02));
         }}
     }}
 
 
     // ── Rounded-corner frame + content clipping mask (anti-aliased) ───────
-    // Reuses the SDF computed earlier (_sdf_pre) — no need to re-derive.
-    vec3 frameCol = BLUE * 0.55;
+    // Frame border: darken background scene instead of blue overlay.
     float _outside = smoothstep(-0.5, 0.5, _sdf_pre);
     float _frame   = smoothstep(-2.5, -1.5, _sdf_pre) * (1.0 - _outside);
-    col = mix(col, frameCol, _frame);
-    col = mix(col, vec3(0.0), _outside);
+    // Directional frame bevel: use SDF gradient as surface normal, light from top-left.
+    // This correctly follows the rounded corner arc instead of creating hard pixel seams.
+    vec2 _sdfGrad  = vec2(dFdx(_sdf_pre), dFdy(_sdf_pre));
+    float _bevelDir = dot(_sdfGrad, vec2(-1.0, -1.0)) * 0.707;
+    float _bvHi    = clamp(_bevelDir * 4.0, 0.0, 1.0);
+    float _bvLo    = clamp(-_bevelDir * 4.0, 0.0, 1.0);
+    col = min(vec3(1.0), col + vec3(0.22, 0.22, 0.32) * _frame * _bvHi);
+    col = max(col * (1.0 - _frame * 0.80 * _bvLo), vec3(0.05, 0.02, 0.02));
+    col = mix(col, vec3(0.0), _outside); // clip outside rounded rect
 
     O = vec4(col, 1.0);
 }}
@@ -7627,7 +7707,7 @@ void mainImage(out vec4 O, vec2 C) {{
     # Setup: Buffer A iChannel0 = Buffer A (self-ref)
     #        Image   iChannel1 = Buffer A output
     buffer_a_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.62 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.63 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    Contact: subband@gmail.com or
             subband@protonmail.com
@@ -7772,20 +7852,24 @@ void mainImage(out vec4 O, vec2 C) {{
         // attack (visible beat onsets) and slow release (no flicker between
         // beats).
         if (px == 0) {{
-            float prevMode  = texelFetch(iChannel0, ivec2(0, 2), 0).r;
-            float prevMouse = texelFetch(iChannel0, ivec2(1, 2), 0).r;
-            // Toggle ONLY when the click STARTED inside the oscilloscope/spectrum
-            // strip (fp.y > ~430px from top). iMouse.w = Y where button went down.
-            // Prevents dragging the track scroll bar from toggling the spectrum mode.
-            bool inOscArea = iMouse.z > 0.0 && (iResolution.y - iMouse.w) > 430.0;
-            float currMouse = inOscArea ? 1.0 : 0.0;
-            bool  newClick  = (currMouse > 0.5 && prevMouse < 0.5);
-            O = vec4(newClick ? 1.0 - prevMode : prevMode, 0., 0., 1.);
+            float prevMode    = texelFetch(iChannel0, ivec2(0, 2), 0).r;
+            float prevPressed = texelFetch(iChannel0, ivec2(7, 2), 0).r;
+            // Toggle on rising edge ONLY when click is confirmed in the oscilloscope
+            // strip by TWO independent checks:
+            //   iMouse.y  = current position (bottom-relative, updates this frame)
+            //   iMouse.w  = click origin y   (set when button goes down; abs() for release)
+            // Both must be < iResolution.y-475 (= oscilloscope area from bottom).
+            // Guard iMouse.y > 0.5 so an uninitialised y=0 never triggers.
+            // This prevents tracker drags from ever toggling the view.
+            bool pressed    = iMouse.z > 0.0;
+            bool newClick   = pressed && (prevPressed < 0.5);
+            float _oy       = iResolution.y - 475.0;
+            bool inOscArea  = iMouse.y > 0.5 && iMouse.y < _oy
+                           && abs(iMouse.w) > 0.5 && abs(iMouse.w) < _oy;
+            O = vec4((newClick && inOscArea) ? 1.0 - prevMode : prevMode, 0., 0., 1.);
         }} else if (px == 1) {{
-            // Track the same filtered press state used by px=0 so edge detection works.
-            bool inOscArea = iMouse.z > 0.0 && (iResolution.y - iMouse.w) > 430.0;
-            float currMouse = inOscArea ? 1.0 : 0.0;
-            O = vec4(currMouse, 0., 0., 1.);
+            // Unused — toggle now uses px7 (prevPressed) for edge detection.
+            O = texelFetch(iChannel0, ivec2(1, 2), 0);
         }} else if (px == 2 || px == 3 || px == 4) {{
             // ── Smoothed audio bands (px 2=low, 3=mid, 4=high) ───────────
             // Average bins within a band, then asymmetric IIR-smooth:
@@ -7828,16 +7912,17 @@ void mainImage(out vec4 O, vec2 C) {{
         }} else if (px == 5) {{
             // ── Horizontal track scroll offset (drag in tracker area) ──────────
             // Stored as a negative pixel offset applied to txOff in Image tab.
-            // Drag 1:1 with mouse X while pressed inside tracker (Y 0.18-0.82).
-            // Out-of-bounds press kills drag; release leaves offset where it was.
+            // Drag only active while cursor is inside the tracker rows/header.
+            // Uses PIXEL bounds (not fraction) so the oscilloscope strip below
+            // (oy=475px from top → iMouse.y < res-471 from bottom) is excluded.
             float scrollOffset = texelFetch(iChannel0, ivec2(5, 2), 0).r;
             float scrollAnchor = texelFetch(iChannel0, ivec2(6, 2), 0).r;
             float prevPressed  = texelFetch(iChannel0, ivec2(7, 2), 0).r;
             float currPressed  = iMouse.z > 0.0 ? 1.0 : 0.0;
-            float mouseY = iMouse.y / iResolution.y;
-            bool inBounds = mouseY > 0.18 && mouseY < 0.82;
+            // Tracker pixel range (bottom-relative): tBot=471 → (res-471), header top=65
+            bool inBounds = iMouse.y > iResolution.y - 471.0 && iMouse.y < iResolution.y - 65.0;
             // Track width in pixels (9 chars * CW=25 + 6 gap = 231px)
-            float TW_PX = 9.0 * 25.0 + 6.0;
+            float TW_PX = 9.0 * 18.0 + 6.0;  // TCW=18, matches Image tab tracker column width
             float visWidth = iResolution.x - 68.0;
             float totalWidth = float(NUM_CHANNELS) * TW_PX;
             float MAX_SCROLL = max(0.0, ceil((totalWidth - visWidth) / TW_PX) * TW_PX);
@@ -7867,8 +7952,7 @@ void mainImage(out vec4 O, vec2 C) {{
             float dragDead    = texelFetch(iChannel0, ivec2(8, 2), 0).r;
             float prevPressed = texelFetch(iChannel0, ivec2(7, 2), 0).r;
             float currPressed = iMouse.z > 0.0 ? 1.0 : 0.0;
-            float mouseY      = iMouse.y / iResolution.y;
-            bool inBounds     = mouseY > 0.18 && mouseY < 0.82;
+            bool inBounds     = iMouse.y > iResolution.y - 471.0 && iMouse.y < iResolution.y - 65.0;
             if (currPressed > 0.5 && prevPressed < 0.5) dragDead = 0.0;
             if (currPressed > 0.5 && !inBounds) dragDead = 1.0;
             if (currPressed < 0.5) dragDead = 0.0;
@@ -11094,7 +11178,7 @@ def main():
     parser.add_argument('--no-dsp', dest='no_dsp', action='store_true', default=False,
                         help="MASTER SWITCH: disable ALL DSP effect processing in the output "
                              "shaders (3D surround, FAT4X exciter, PhatBass; velvet/comb reverb "
-                             "are already off in v1.62). Forces ENABLE_3D/FAT/PHATBASS/"
+                             "are already off in v1.63). Forces ENABLE_3D/FAT/PHATBASS/"
                              "VELVETREVERB/COMBREVERB = 0 and WINS over any individual "
                              "--surround/--phatbass/--fat4x passed alongside it. This is the "
                              "lightest Sound-tab path (no DSP private-vars) → best chance of "
@@ -11107,7 +11191,7 @@ def main():
                              "resolution but slower compile. Default: 1024 (or 128 if "
                              "--max-compat without override).")
     parser.add_argument('--max-compat', action='store_true', default=False,
-                        help='[NO-OP — max-compat is now the DEFAULT in v1.40+ (current: v1.62)] '
+                        help='[NO-OP — max-compat is now the DEFAULT in v1.40+ (current: v1.63)] '
                              'This flag previously enabled compatibility mode '
                              'for problematic GPUs/drivers (Windows + Firefox + '
                              'NVIDIA, etc.). The compat preset (--resampler '
@@ -12528,7 +12612,7 @@ Generated by MOD2GLSL
                         # hardcoded 31 — 2ND_PM has 54 instruments and the
                         # 31-cap silenced its voice/vocal samples (instr
                         # 32-54 were never encoded). See feedback_s3m_
-                        # instrument_cap; this is that fix ported onto v1.62.
+                        # instrument_cap; this is that fix ported onto v1.63.
                         self.samples_info = []
                         self.sample_bytes = []
                         _n_smp = max(31, len(m.samples))
@@ -12879,7 +12963,7 @@ Generated by MOD2GLSL
                 # glsl_state_dump.py / sound_exec.py inject it themselves.
                 _ct = _ct.replace(
                     "GLSL (The Last) MOD Player v1.42 (c) 2026 Orblivius",
-                    "GLSL (The Last) MOD Player v1.62 (c) 2026 Orblivius", 1)
+                    "GLSL (The Last) MOD Player v1.63 (c) 2026 Orblivius", 1)
                 _ct = _ct.replace("   COMMON TAB\n", f"   COMMON TAB\n   Visualizer: {_vname}\n", 1)
 
                 # Inject visualizer note-synth helpers (waveType[] + _synthWave).
@@ -13131,6 +13215,7 @@ Generated by MOD2GLSL
                     _n_c2 = 0
                     _n_filt = 0
                     _env_pts_all = []   # flat packed (tick<<7|val0..64)
+                    _xmFade_arr  = []   # raw XM fadeout per instrument (0=none)
                     _n_env = 0
                     for _si_idx, _e in enumerate(_si_entries):
                         _nums = _re_ft.findall(r'-?\d+', _e)
@@ -13206,6 +13291,7 @@ Generated by MOD2GLSL
                             # = ITFile env_pts [tick,val0..64] packed
                             # tick<<7|val. This is the IT-over-MOD feature
                             # the HTML player has and the timeline lost.
+                            _efade = 0  # raw XM fadeout (2*fade per tick after key-off)
                             try:
                                 _esmp = (mod.samples[_si_idx]
                                          if (_si_idx < len(mod.samples)
@@ -13227,8 +13313,14 @@ Generated by MOD2GLSL
                                     _elp = -1
                                 if _en > 0:
                                     _n_env += 1
+                                # XM fadeout: JS engine uses `volFade -= 2*fo` per
+                                # tick after key-off (mikIT/openMPT convention).
+                                # Raw value 0..65535 direct from XM header field.
+                                # Non-XM files have fadeout=0 → _fadeMul=1 (inert).
+                                _efade = max(0, int(_esmp.get('fadeout', 0) or 0))
                             except Exception:
                                 _eoff, _en, _esus, _elp = 0, 0, -1, -1
+                            _xmFade_arr.append(_efade)
                             _v.append(_eoff); _v.append(_en)
                             _v.append(_esus); _v.append(_elp)
                             # 15: nna — IT-ONLY. S3M/MOD/XM gets no extra
@@ -14125,10 +14217,11 @@ Generated by MOD2GLSL
                               f"(anchors {_xf_na}/{_xf_nb}, expected 1/1)")
 
                 # ── MikIT note-on volume reset (inst25 frozen-accent fix) ───
+                # S3M-only: uses _vsGet/_volSide which is only injected for S3M.
                 # mikit_engine.py:560-575 — a cell carrying an INSTRUMENT
                 # number unconditionally resets channel volume to that
                 # sample's default volume (porta or kick), THEN a volume
-                # column / Cxx on the same cell overrides.  v1.62's volume
+                # column / Cxx on the same cell overrides.  v1.63's volume
                 # forward-scan never did the inst→sample-default reset, so on
                 # tone-porta leads (inst25: note+G every ~2 rows, volcol=20
                 # on the off-rows) the volcol value froze and never returned
@@ -14215,7 +14308,9 @@ Generated by MOD2GLSL
                     print(f"   ✓ MikIT inst-vol reset: vcol-priority (no-click) "
                           f"applied at fwd-scan + trigger(VOL_INIT) + "
                           f"trig→current + current-row")
-                else:
+                elif getattr(mod, 'is_s3m', False):
+                    # Only warn for S3M — _vsGet/_volSide is S3M-only, so XM/MOD
+                    # will always have count=0 here (not a bug, just not applicable).
                     print(f"   ✗ WARNING: inst-vol-reset targets "
                           f"fwd×{_miv_n} trig×{_miv_tn} cont×{_miv_cn} "
                           f"cur×{_miv_pn} (expected 1,1,1,1) — frozen")
@@ -14343,7 +14438,7 @@ Generated by MOD2GLSL
                 # ── IT instrument resonant filter (it2play 2-pole LPF) ────
                 # Recovered algorithm (it2play it2drivers/hq.c, captured in
                 # session a3158c73): coeffs from cutoff/res, mixrate-dependent
-                # (filterStep=24). The IIR is recursive; v1.62's Sound shader
+                # (filterStep=24). The IIR is recursive; v1.63's Sound shader
                 # is stateless per sample, so realize it as a truncated
                 # impulse-response FIR: h[k] = the 2-pole's response (run its
                 # a/b/c K steps), convolved with the voice's dry source read
@@ -14430,15 +14525,55 @@ Generated by MOD2GLSL
                 # right before its only caller _gcoBody.
                 _ve_sig  = "float _gcoBody("
                 _ve_old  = "return s * (_effVol / 64.0) * declick * endFade;"
+                # _xmFade[]: raw XM fadeout per instrument (0 = no fade/non-XM).
+                # JS engine: `state.volFade -= 2*fo` per tick after key-off,
+                # so fadeMul = max(0, 1 - N*2*fade/65536) for N ticks since
+                # key-off. Non-XM files have all-zero array → fadeMul=1 inert.
+                _xmFd_n = max(1, len(_xmFade_arr) if _xmFade_arr else 1)
+                _xmFd_s = ','.join(str(f) for f in (_xmFade_arr or [0]))
                 _ve_fn   = (
-                    "float _itVolEnv(SampleInfo smp, float etick){\n"
+                    f"const int _xmFade[{_xmFd_n}] = int[]({_xmFd_s});\n"
+                    # keyOffEtick: ticks from note trigger to the key-off row start.
+                    # < 0 means note is still held (no key-off found in fwd scan).
+                    # XM key-off (note=97, bit7 of sample byte) is detected in the
+                    # forward scan below and stored in the local keyOffEtick var;
+                    # this function receives it as a parameter.
+                    "float _itVolEnv(SampleInfo smp, float etick, float keyOffEtick){\n"
                     "  int n = smp.eN;\n"
                     "  if (n <= 0) return 1.0;\n"
                     "  int o = smp.eOff;\n"
+                    # keyOn: true while note is held (etick < key-off tick), or if
+                    # no key-off was detected (keyOffEtick<0 = note still held).
+                    "  bool keyOn = keyOffEtick < 0.0 || etick < keyOffEtick;\n"
                     "  if (smp.eSus >= 0 && smp.eSus < n){\n"
-                    "    float st = float(_itEPt[o+smp.eSus] >> 7);\n"
-                    "    if (etick > st) etick = st;\n"
+                    "    float st = float(_itEPt[o+smp.eSus] >> 7); // sustain tick\n"
+                    "    if (keyOn){\n"
+                    # While key-on: apply sustain clamp (and sustain-zone loop if any).
+                    "      if (smp.eLp >= 0){\n"
+                    "        int ls=(smp.eLp>>8)&255, le=smp.eLp&255;\n"
+                    "        if (le>ls && le<n){\n"
+                    "          float ta=float(_itEPt[o+ls]>>7), tb=float(_itEPt[o+le]>>7);\n"
+                    # XM: loop inside sustain zone (ta<=st) → oscillate while held.
+                    # Loop after sustain (ta>st) → clamp at sustain while held.
+                    "          if (ta<=st && tb>ta){\n"
+                    "            if (etick>tb) etick = ta + mod(etick-ta, tb-ta);\n"
+                    "          } else if (etick>st) etick=st;\n"
+                    "        } else if (etick>st) etick=st;\n"
+                    "      } else if (etick>st) etick=st;\n"
+                    "    } else {\n"
+                    # After key-off: no sustain clamp → envelope continues into release.
+                    # Apply release loop if it is a post-sustain loop (ta > st).
+                    "      if (smp.eLp >= 0){\n"
+                    "        int ls=(smp.eLp>>8)&255, le=smp.eLp&255;\n"
+                    "        if (le>ls && le<n){\n"
+                    "          float ta=float(_itEPt[o+ls]>>7), tb=float(_itEPt[o+le]>>7);\n"
+                    "          if (ta>st && tb>ta && etick>tb)\n"
+                    "            etick = ta + mod(etick-ta, tb-ta);\n"
+                    "        }\n"
+                    "      }\n"
+                    "    }\n"
                     "  } else if (smp.eLp >= 0){\n"
+                    # No sustain: loop always active (key-on or key-off).
                     "    int ls=(smp.eLp>>8)&255, le=smp.eLp&255;\n"
                     "    if (le>ls && le<n){\n"
                     "      float ta=float(_itEPt[o+ls]>>7), tb=float(_itEPt[o+le]>>7);\n"
@@ -14461,8 +14596,20 @@ Generated by MOD2GLSL
                 # elapsed (sec since trigger) × TICKS_PER_SEC (Common
                 # #define, BPM-derived player ticks/sec) = elapsed player
                 # ticks — exactly the unit ITFile env_pts ticks are in.
-                _ve_new  = ("return s * (_effVol / 64.0) * declick * endFade "
-                            "* _itVolEnv(smp, elapsed * TICKS_PER_SEC);")
+                # keyOffEtick is declared locally in _gcoBody (patch below).
+                # _fadeMul: XM linear fadeout after key-off — JS engine uses
+                # `volFade -= 2*fo` per tick (mikIT/openMPT XM convention);
+                # volFade starts at 65536 → fadeMul = max(0, 1-N*2*fo/65536).
+                _ve_new  = (
+                    "float _envMul = _itVolEnv(smp, elapsed * TICKS_PER_SEC, keyOffEtick);\n"
+                    "    float _fadeN = keyOffEtick >= 0.0 ?\n"
+                    "        float(max(0, int(elapsed * TICKS_PER_SEC - keyOffEtick)))\n"
+                    "        : 0.0;\n"
+                    "    float _fadeMul = clamp(1.0 - _fadeN * 2.0\n"
+                    "        * float(_xmFade[trigNote.instrument - 1]) / 65536.0,\n"
+                    "        0.0, 1.0);\n"
+                    "    return s * (_effVol / 64.0) * declick * endFade"
+                    " * _envMul * _fadeMul;")
                 # SKIP for IT: the NNA envelope-follower port (below)
                 # multiplies s_curr by envValueAt() in getChannelOutput.
                 # Applying _itVolEnv to _gcoBody's return TOO double-
@@ -14491,6 +14638,99 @@ Generated by MOD2GLSL
                           f"{_sound_src.count(_ve_sig)} ret×"
                           f"{_sound_src.count(_ve_old)}; expected ≥1,1) — "
                           f"envelopes not applied")
+
+                # ── XM key-off detection (note=97 → bit7 of instrument byte) ──
+                # Three patches needed so _itVolEnv receives keyOffEtick:
+                #   1. Declare `float keyOffEtick = -1.0;` in _gcoBody
+                #   2. Forward scan: detect key-off rows, record the tick offset
+                #   3. Current row: detect key-off on _pcr before vol processing
+                # Gated _ve_ok so it only fires for XM/MOD (same files that get
+                # _itVolEnv; IT skips _itVolEnv and this patch both).
+                if _ve_ok:
+                    # 1. Declare keyOffEtick at the very start of _gcoBody
+                    # (before any executable statement) so GLSL ES 1.00 strict
+                    # compilers (ShaderToy / some WebGL1 paths) don't reject it
+                    # as a "declaration after statement".
+                    _ko_decl_old = ("               int trigPat, int trigRow,"
+                                    " Note trigNote, int toneSlideTarget) {\n"
+                                    "    if (trigNote.instrument")
+                    _ko_decl_new = ("               int trigPat, int trigRow,"
+                                    " Note trigNote, int toneSlideTarget) {\n"
+                                    "    float keyOffEtick = -1.0;"
+                                    " // -1=held; >=0=ticks until key-off\n"
+                                    "    if (trigNote.instrument")
+                    if _sound_src.count(_ko_decl_old) == 1:
+                        _sound_src = _sound_src.replace(_ko_decl_old, _ko_decl_new, 1)
+                        print("   ✓ keyOffEtick declared in _gcoBody")
+                    else:
+                        print(f"   ⚠ keyOffEtick decl anchor ×"
+                              f"{_sound_src.count(_ko_decl_old)} — skipped")
+
+                    # 2. Forward scan key-off detection (before _fnIsToneTrig bools)
+                    _ko_scan_old = ("            Note _fn = getNote(_fp, _fr, ch);\n"
+                                    "            // ANY row with period > 0")
+                    _ko_scan_new = (
+                        "            Note _fn = getNote(_fp, _fr, ch);\n"
+                        "            // XM key-off row (note=97 → bit7 of instrument byte)\n"
+                        "            if ((_fn.instrument & 0x80) != 0 && _fn.period <= 0) {\n"
+                        "                if (keyOffEtick < 0.0) {\n"
+                        "                    int _koSgr = patTickOffset[_fp]"
+                        " + (_fr - patStartRow[_fp]);\n"
+                        "                    int _tgSgr = patTickOffset[trigPat]"
+                        " + (trigRow - patStartRow[trigPat]);\n"
+                        "                    keyOffEtick = float(fetchTick(_koSgr)"
+                        " - fetchTick(_tgSgr));\n"
+                        "                }\n"
+                        "                _fr++;\n"
+                        "                if (_fr >= patStartRow[_fp]"
+                        " + (patRowOffset[_fp+1] - patRowOffset[_fp]))\n"
+                        "                    { _fp++;"
+                        " _fr = (_fp < SONG_LENGTH) ? patStartRow[_fp] : 0; }\n"
+                        "                continue;\n"
+                        "            }\n"
+                        "            // ANY row with period > 0")
+                    if _sound_src.count(_ko_scan_old) == 1:
+                        _sound_src = _sound_src.replace(_ko_scan_old, _ko_scan_new, 1)
+                        print("   ✓ forward-scan key-off detection injected")
+                    else:
+                        print(f"   ⚠ fwd-scan key-off anchor ×"
+                              f"{_sound_src.count(_ko_scan_old)} — skipped")
+
+                    # 3. Current row key-off (fires when pos.row IS the OFF row;
+                    #    forward scan doesn't cover rows from trigRow+1 to pos.row
+                    #    when they are adjacent). Inserted before the existing
+                    #    current-row partial vol block.
+                    _ko_cur_old = (
+                        "        // Current row partial (non-trigger row only"
+                        " — trigger handled above).\n"
+                        "        // Instrument-only rows (inst>0, period=0) also enter:"
+                        " ProTracker resets\n"
+                        "        // vol to sample default before applying the row's effects.\n"
+                        "        if (_pcr.period <= 0) {")
+                    _ko_cur_new = (
+                        "        // XM key-off on current row"
+                        " (note=97 → bit7 of instrument byte)\n"
+                        "        if (keyOffEtick < 0.0"
+                        " && (_pcr.instrument & 0x80) != 0 && _pcr.period <= 0) {\n"
+                        "            int _koSgr2 = patTickOffset[pos.songPos]"
+                        " + (pos.row - patStartRow[pos.songPos]);\n"
+                        "            int _tgSgr2 = patTickOffset[trigPat]"
+                        " + (trigRow - patStartRow[trigPat]);\n"
+                        "            keyOffEtick = float(fetchTick(_koSgr2)"
+                        " - fetchTick(_tgSgr2));\n"
+                        "        }\n"
+                        "        // Current row partial (non-trigger row only"
+                        " — trigger handled above).\n"
+                        "        // Instrument-only rows (inst>0, period=0) also enter:"
+                        " ProTracker resets\n"
+                        "        // vol to sample default before applying the row's effects.\n"
+                        "        if (_pcr.period <= 0) {")
+                    if _sound_src.count(_ko_cur_old) == 1:
+                        _sound_src = _sound_src.replace(_ko_cur_old, _ko_cur_new, 1)
+                        print("   ✓ current-row key-off detection injected")
+                    else:
+                        print(f"   ⚠ cur-row key-off anchor ×"
+                              f"{_sound_src.count(_ko_cur_old)} — skipped")
 
                 # ── Full NNA envelope-follower port from mod_player.py ───
                 # Ports envValueAt() + parallel aux arrays (sampleNNA,
@@ -15485,7 +15725,7 @@ Generated by MOD2GLSL
             _IN_PNG = {"channel": 0, "type": "texture", "id": "dataPNG0",
                        "filepath": base_name + "_player_data.png", "sampler": _SMP_DATA}
             _st_name = (mod.title.strip() or base_name)[:64]
-            _st_desc = f"{_st_name} — MOD2GLSL v1.62"
+            _st_desc = f"{_st_name} — MOD2GLSL v1.63"
             # Image is placed first so ShaderToy's new-shader first-tab reset only
             # wipes Image code (user re-pastes from *_shadertoy_image.glsl).
             # Image inputs ARE included: channels survive the reset so they are
