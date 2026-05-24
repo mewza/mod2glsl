@@ -37,7 +37,7 @@ $\color{limegreen}\textsf{+}$ &nbsp; **Fast Tracker II (XM) support is back!**  
 $\color{limegreen}\textsf{+}$ &nbsp; **Scream Tracker 3.xx (S3M) support**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Rewritten from scratch with individual format loaders to avoid a big mess**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Avanced micro-click removal**  <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **TRUE 3D Surround** (new improved AllPass 3D Surround technique)<br>
+$\color{limegreen}\textsf{+}$ &nbsp; **3D Surround** (new improved AllPass 3D Surround technique)<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Phat Bass — HAAS + allpass fx**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Velvet Reverb** <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **FAT4X** (Fat curve compressor)<br>
