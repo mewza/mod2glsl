@@ -101,81 +101,99 @@ The 64K stack-space limit. As shader local-variable usage approaches that ceilin
 ### Command-line reference
 
 ```text
-$ python mod_player.py --help
-usage: mod_player.py [-h] [--downsample DOWNSAMPLE] [--bitrate {lo,med,hi,ultra}]
-                     [--vec-dim {2,4,8}] [--resampler {linear,bspline,lanczos3}]
-                     [--no-split] [--split] [--viz {0,1,2,3,4,5}] [--no-rvq2]
-                     [--use-png]
+MOD2GLSL % python mod_player.py --help
+usage: mod_player.py [-h] [--downsample DOWNSAMPLE] [--bitrate {lo,med,hi,ultra}] [--vec-dim {2,4,8}]
+                     [--resampler {linear,bspline,lanczos3}] [--aa] [--no-json] [--viz [0..19]]
+                     [--samples] [--samples-dir SAMPLES_DIR] [--solo CH] [--positions A-B]
+                     [--intro-silence SEC] [--mp3] [--mp3-secs SEC] [--xfade SAMPLES] [--start POS]
+                     [--no-rvq2] [--preserve PRESERVE] [--raw-perc] [--no-raw-perc]
+                     [--raw-perc-budget BYTES] [--png] [--reverb-size {full,small}]
+                     [--surround | --no-surround] [--phatbass | --no-phatbass]
+                     [--phatbass-mode {auto,sample,mix}] [--fat4x | --no-fat4x] [--no-dsp]
+                     [--fft-n {64,128,256,512,1024,2048}] [--max-compat]
                      modfile
 
-MOD/S3M Player — Generates HTML player + ShaderToy GLSL + PNG samples
+MOD/S3M/IT → HTML player + ShaderToy GLSL (+ optional PNG samples).
 
 positional arguments:
-  modfile               MOD or S3M file to play
+  modfile               MOD/S3M/IT file to play
 
 options:
   -h, --help            show this help message and exit
-
   --downsample DOWNSAMPLE
-                        Sample decimation factor: 1=full-rate, 2=22kHz, 4=11kHz.
-                        HF percussion (cymbals/rides) gets max(1, DS//2) to keep
-                        shimmer. (default: 1)
-
+                        Sample decimation factor: 1=full-rate, 2=22kHz, 4=11kHz. (DEFAULT 2.) HF percussion (cymbals/rides) gets max(1,DS//2) to keep shimmer. (default: 2)
   --bitrate {lo,med,hi,ultra}
-                        RVQ codebook size (mp3-style quality knob).
-                          lo    = K(128, 64)   13b/pair  smallest + grainy
-                          med   = K(256, 128)  15b/pair  balanced
-                          hi    = K(512, 256)  17b/pair  sharper
-                          ultra = K(1024, 512) 19b/pair  near-transparent
-                        (default: med)
-
-  --vec-dim {2,4,8}     RVQ vector dimensionality.
-                          8 = smallest         (~2.1 bits/sample)
-                          4 = medium           (4.25 bits/sample)
-                          2 = highest fidelity (8.5 bits/sample)
-                        (default: 8)
-
+                        RVQ codebook size (mp3-style quality knob). lo=K(128,64) 13b/pair smallest+grainy, med=K(256,128) 15b/pair balanced, hi=K(512,256) 17b/pair sharper, ultra=K(1024,512) 19b/pair near-transparent. (default: hi)
+  --vec-dim {2,4,8}     RVQ vector dimensionality. 8=smallest (~2.1 bits/sample), 4=medium (4.25 bits/sample), 2=highest fidelity (8.5 bits/sample). (default: 8)
   --resampler {linear,bspline,lanczos3}
-                        Sample resampler.
-                          linear   = 2-tap (cheapest, ProTracker-style)
-                          bspline  = 4-tap cubic (smooth/soft)
-                          lanczos3 = 6-tap sinc (sharpest, ~50% more cost)
-                        (default: lanczos3)
-
-  --no-split            Keep VQ arrays + decoders in the Common tab. Required
-                        for oscilloscope/spectrum/Buffer A visualizers to
-                        decode actual audio via getChannelOutput. Default ON.
-                        (default: True)
-
-  --split               Split VQ arrays into the Sound tab — fast Common
-                        compile, but breaks audio-driven visualizers
-                        (no getChannelOutput in Image/BufferA). (default: True)
-
-  --viz {0,1,2,3,4,5}   Image-tab visualizer:
-                          0 = None             (black backdrop, fastest compile)
+                        Sample resampler. linear=2-tap (cheapest, ProTracker-style), bspline=4-tap cubic (smooth, slightly softer HF), lanczos3=6-tap sinc (sharpest/brightest — DEFAULT). Use --resampler bspline for a softer sound or to save GPU headroom. Default: lanczos3. (default: None)
+  --aa                  Enable the gated ratio anti-aliasing (stateless box integrator around getSampleF: averages K sub-taps across the per-output-sample step, K tracks the resample ratio; notes not pitched up are bit-identical / zero cost). Suppresses alias whine on high/pitched-up notes — most audible on full-rate --raw-perc drums. NOTE: this is a deliberate "cleaner than the oracle" divergence — real Impulse Tracker / MikIT use plain 2-tap linear with NO anti-aliasing, so --aa is NOT more 1:1, just nicer-sounding. Off by default; emits #define AA_RESAMPLE 1 when set. (default: False)
+  --no-json             Skip generating the {base}_shadertoy.json import file (JSON is generated by default). (default: True)
+  --viz [0..19]         Image-tab visualizer (choose from [0..19]):
+                          0 = Sun Rays          (cabbibo-style — warm/cool god-ray corona)
                           1 = Reactive 001     (PAEz fork — SDF circles + cosmic web)  ← default
                           2 = Fluxline Surfer  (mrange — DR2 dodecahedron + glowtracer)
                           3 = Zuvuya           (city/stars + audio-reactive curtain)
                           4 = Maya             (raymarched fractal tunnel-warp)
                           5 = Dodecahedron     (Philip Bertani — DR2 IFS fractal raymarcher)
-                        (default: 1)
+                          6 = Disco Combined   (smoke spotlights + lasers/clouds, time-driven)
+                          7 = Sparkly 4D       (Philip Bertani — 4D IFS volumetric raymarcher)
+                          8 = Skywalker        (orblivius — flying-curve terrain + sync stars)
+                          9 = Music in the DNA (jaszunio15/enbe fork — DNA helix + parallax dunes)
+                         10 = LED Band Spectro (Orblivious — pentagon LED tunnel + spectrum history)
+                         11 = Telekenesis v1.1 (Orblivious — IFS fractal raymarcher + waveform strip)
+                         12 = Laser Patterns   (0rblivius — Newton/IFS laser-grid fractal marcher)
+                         13 = Prismatic Frac.  (Smull fork — IFS box raymarch + audio glow)
+                         14 = Interdiml. Fold  (PAEz fork — spatial fold + sine warp march)
+                         15 = Fractal Torus    (ytt fork — periodic torus march + Menger IFS fold)
+                         16 = Unfound          (diatribes fork — orbit-trap fold + sinusoidal orb march)
+                         17 = Evrthing Temp.   (diatribes/FabriceNeyret2 — noise terrain + orb march)
+                         18 = sm0g             (diatribes/Shane — tri-planar SDF box corridors + bump)
+                         19 = Spectro 3D Mist  (Orblivius — 3D SDF bar spectrum + volumetric fog + reflective ground) (default: 6)
+  --samples             Extract each sample (instrument) from the module as a separate WAV file (named like 1-samplename.wav, 2-anothername.wav). Skips GLSL/HTML generation. Saves to current directory unless --samples-dir is also given. Useful for diagnosing per-sample playback issues (which sample is wrong/buzzy/missing). (default: False)
+  --samples-dir SAMPLES_DIR
+                        Output directory for --samples WAV files (default: current dir). (default: None)
+  --solo CH             Solo a single channel: mute every other channel by clearing their cells before encoding. CH is 1-based (so --solo 1 keeps channel 1, mutes 2..N). Useful for diagnosing per-channel issues (which channel has the wrong sample, missing notes, wrong panning, etc.). Pipeline runs normally — sample selection, effects, panning, FX all apply — only the soloed channel produces output. (default: None)
+  --positions A-B       Render only order positions A..B (0-based, as shown on the Image tab), e.g. --positions 35-36 or --positions 35. The build plays JUST that slice, but the running speed/tempo are first computed by walking positions 0..A-1 break-aware, so the slice plays at the SAME speed it would inside the full song — never the file-header default. Use for isolating/auditioning a section (e.g. the inst-25 porta lead) without hand-trimming a .S3M. (default: None)
+  --intro-silence SEC   Seconds of silence before the song starts (Sound tab holds, then plays from row 0; the Image/BufferA visualizer is offset to stay in sync). Default 0.0 = music starts immediately. Use e.g. --intro-silence 10 to let an Image-tab loading splash render before the audio kicks in. (default: 0.0)
+  --mp3                 After generating the GLSL, render an .mp3 of the actual ShaderToy Sound tab on CPU (glslang -> spirv-cross -> clang -> WAV -> mp3 via sound_exec.py). This is the SAME audio ShaderToy plays — handy for quick listening/sharing without opening the site. Needs the glslang+spirv-cross+clang toolchain and ffmpeg/lame; if missing, prints how to install it instead of failing. (default: False)
+  --mp3-secs SEC        Duration to render for --mp3 (default 180 = the full ShaderToy cap). CPU render is ~real-time-ish, so lower this (e.g. 30) for a quick preview. (default: 180.0)
+  --xfade SAMPLES       Retrigger/note-on declick crossfade length in samples (default 64 = 1.45ms). On a same-channel sample restart the OLD voice ramps down and the NEW ramps up over this window. If you still hear clicks on busy leads, raise it (e.g. 256 = 5.8ms, 512 = 11.6ms) and re-check by ear (--mp3). Costs no extra GPU private-vars, just a longer blend region. (default: 64)
+  --start POS           Force a manual 2-way split at order position POS instead of the automatic split: emit exactly TWO bundles — SONG_shadertoy_part1_* = positions 0..POS-1, and SONG_shadertoy_part2_* = positions POS..end. Lets you pick the split point at a musical boundary. Carries speed/tempo over so each part plays at its true in-song speed. POS is an order position (the Image-tab numbering), 1..(numPositions-1). (default: None)
+  --no-rvq2             Skip RVQ stage 2 (residual quantization).  Drops ~40% of sample-data const arrays from Sound tab → faster compile. Quality cost: ~4 dB SNR (sounds noisier but pitch is unchanged). IMPORTANT: when re-pasting into ShaderToy, paste BOTH the new Common AND new Sound — otherwise mismatched RVQ_BITS produces high-pitch garbage from a stale Common reading 15-bit-packed codes that were actually written at 8 bits. (default: False)
+  --preserve PRESERVE   Comma-separated 1-based instrument numbers stored UNCOMPRESSED (raw int8, no VQ quantization) for perfect quality — e.g. --preserve 28,25 keeps the lead/voice samples pristine while the rest stay VQ-compressed small. getSample() intercepts those instruments' index ranges and reads the raw array instead of VQ-decoding (resampled to the same rate as the VQ stream). (default: )
+  --raw-perc            Auto-store percussion (kick/snare/hat/clap/cymbal — samples the waveform classifier tags NOISE) UNCOMPRESSED, exactly like --preserve but auto-detected. Percussion transients/noise are the worst-hit by RVQ, so this keeps drums crisp and matching the HTML player. Percussion samples are short → small size cost. Default ON. (default: True)
+  --no-raw-perc         Disable --raw-perc (let percussion be VQ-compressed too). (default: True)
+  --raw-perc-budget BYTES
+                        Max total raw (un-VQ) percussion bytes kept by --raw-perc (shortest-first; the rest fall back to VQ). Default 28672. The raw PCM becomes a big const array (_presvPCM) in the Sound tab — on a tight GPU that const-register/private-var load can push the shader over ANGLE's limit (e.g. jeff.it: full raw-perc = +42KB Sound = does not fit). LOWER this to keep only the smallest kick/hat pristine and still fit (e.g. 8192 ≈ one short drum); 0 ≈ effectively --no-raw-perc. Quality-vs-fit dial when full raw-perc overflows. (default: 28672)
+  --png                 Use the PNG-loaded data path (samples/patterns read via texelFetch from iChannel0 = a 1024×1024 RGBA PNG = 4 MB) instead of VQ-encoded const arrays, AND write SONG_player_data.png. DEFAULT OFF: normally NO PNG is written and the build is embedded. Because one PNG holds the WHOLE song, a --png build is a SINGLE bundle (one set of .glsl + one .png) — it is NOT auto-split into parts and the song is NOT trimmed to 180s. Smaller Common source = faster compile, but raw 8-bit samples (no RVQ) so quality differs. ShaderToy setup: Image/Common iChannel0 = SONG_player_data.png via the Unofficial Plugin "Custom Textures". (default: False)
+  --reverb-size {full,small}
+                        Reverb dimensions. full = 4 combs × 3 iters (default), small = 2 combs × 2 iters (--max-compat default). Reduces compile cost and stereo width. (default: None)
+  --surround, --no-surround
+                        3D surround widening on outer LRRL pair. Default: ON (or OFF if --max-compat without override). (default: None)
+  --phatbass, --no-phatbass
+                        PhatBass Hilbert allpass enhancement on bass instruments. Default: ON (or OFF if --max-compat without override). (default: None)
+  --phatbass-mode {auto,sample,mix}
+                        PhatBass routing. 'sample' (default) forces per-sample via isBass[] flags — cleanest, leaves leads/pads alone. 'auto' uses per-sample when bass instruments were detected, else mix-wide. 'mix' forces mix-wide (applies Hilbert cross-pan to the entire mixdown — wider stereo + bass enhancement on everything, can smear mid/high transients slightly). (default: sample)
+  --fat4x, --no-fat4x   FAT4X harmonic exciter on master output. Default: ON (kept ON even under --max-compat — it's cheap). (default: None)
+  --no-dsp              MASTER SWITCH: disable ALL DSP effect processing in the output shaders (3D surround, FAT4X exciter, PhatBass; velvet/comb reverb are already off in v1.63). Forces ENABLE_3D/FAT/PHATBASS/VELVETREVERB/COMBREVERB = 0 and WINS over any individual --surround/--phatbass/--fat4x passed alongside it. This is the lightest Sound-tab path (no DSP private-vars) → best chance of fitting ANGLE's per-GPU private-variable ceiling. Note: AA is a resampler option, NOT part of the DSP chain — control it with --aa (default off). (default: False)
+  --fft-n {64,128,256,512,1024,2048}
+                        FFT size for Buffer A spectrum. Larger = more frequency resolution but slower compile. Default: 1024 (or 128 if --max-compat without override). (default: None)
+  --max-compat          [NO-OP — max-compat is now the DEFAULT in v1.40+ (current: v1.63)] This flag previously enabled compatibility mode for problematic GPUs/drivers (Windows + Firefox + NVIDIA, etc.). The compat preset (--resampler lanczos3, --reverb-size small, --no-surround, --phatbass, --fft-n 512, FAT4X on, extra HLSL pragmas) is now applied by default since most consumer setups need it and the quality difference is small. To opt OUT of any compat setting, pass the inverse individual flag — e.g. --reverb-size full, --surround. The flag is kept for backward compatibility with old command lines but does nothing. (default: False)
 
-  --no-rvq2             Skip RVQ stage 2 (residual quantization). Drops ~40% of
-                        sample-data const arrays from Sound tab → faster compile.
-                        Quality cost: ~4 dB SNR (noisier but pitch is unchanged).
-                        IMPORTANT: when re-pasting into ShaderToy, paste BOTH
-                        the new Common AND the new Sound — otherwise mismatched
-                        RVQ_BITS produces high-pitch garbage from a stale Common
-                        reading 15-bit-packed codes that were actually written
-                        at 8 bits. (default: False)
+Examples:
+  # Standard ShaderToy build — embedded, no DSP, fits most GPUs:
+  python3 mod_player.py SONG.S3M --no-dsp --downsample 2
 
-  --use-png             Use legacy PNG-loaded Common (samples read via
-                        texelFetch from iChannel0=PNG) instead of VQ-encoded
-                        const arrays. Smaller Common source = faster compile,
-                        but raw 8-bit samples (no RVQ) so quality differs.
-                        ShaderToy setup: Image/Common iChannel0 =
-                        GSLINGER_player_data.png via Unofficial Plugin
-                        "Custom Textures". Implies --no-split. (default: False)
+  # Full-rate, highest quality (may exceed a tight GPU's limit):
+  python3 mod_player.py SONG.S3M --no-dsp --bitrate hi
+
+  # Audition only order positions 35-36 (speed carried over from earlier):
+  python3 mod_player.py SONG.S3M --positions 35-36 --no-dsp
+
+Input formats: .mod  .s3m  .it   (.xm not yet implemented)
+Outputs:       SONG_player.html, SONG_shadertoy_{common,sound,bufferA,image}.glsl,
+               SONG_shadertoy.json (one-click ShaderToy import)
 ```
 
 ---
