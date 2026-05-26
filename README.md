@@ -33,8 +33,9 @@ Examples: <br>
 ## $${\color{limegreen}\textsf{✨ What's new in v1.666}}$$
 
 $\color{limegreen}\textsf{+}$ &nbsp; **Impulse Tracker (IT) w/ NNA support (reference precision)**  <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **Fast Tracker II (XM) support is solid!**  <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **Scream Tracker 3.xx (S3M) support**<br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Fast Tracker II (XM) support is working, but not solid!**  <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Scream Tracker 3.xx (S3M) support is solid!**<br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Amiga ProTracker (MOD) support is solid**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Rewritten from scratch with individual format loaders to avoid a big mess**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Avanced micro-click removal**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **3D Surround, Velvet Reverb, Phat Bass, Soft Limiter, FAT4X**<br>
