@@ -1,8 +1,8 @@
 <div align="center">
 
-# 🎵 MOD2GLSL v1.63
+# 🎵 MOD2GLSL v1.666
 
-$${\Large\color{orange}\textsf{GLSL MOD Player v1.62 for ShaderToy}}$$
+$${\Large\color{orange}\textsf{GLSL MOD Player v1.666 for ShaderToy}}$$
 $${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
 
 ![Version](https://img.shields.io/badge/version-1.37-orange?style=flat-square)
@@ -18,7 +18,7 @@ $${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
 
 https://github.com/user-attachments/assets/4c7fe125-086c-410b-bcba-808fc7648984
 
-*BEYOND_MUSIC.MOD rendered through GLSL MOD Player v1.63*
+*BEYOND_MUSIC.MOD rendered through GLSL MOD Player v1.666*
 
 </div>
 
@@ -30,18 +30,15 @@ Examples: <br>
     
 ---
 
-## $${\color{limegreen}\textsf{✨ What's new in v1.63}}$$
+## $${\color{limegreen}\textsf{✨ What's new in v1.666}}$$
 
 $\color{limegreen}\textsf{+}$ &nbsp; **Impulse Tracker (IT) w/ NNA support (reference precision)**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Fast Tracker II (XM) support is solid!**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Scream Tracker 3.xx (S3M) support**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Rewritten from scratch with individual format loaders to avoid a big mess**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Avanced micro-click removal**  <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **3D Surround** (new improved AllPass 3D Surround technique)<br>
-$\color{limegreen}\textsf{+}$ &nbsp; **Phat Bass — HAAS + allpass fx**<br>
-$\color{limegreen}\textsf{+}$ &nbsp; **Velvet Reverb** <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **FAT4X** (Fat curve compressor)<br>
-$\color{limegreen}\textsf{+}$ &nbsp; **W1 Limiter** <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **3D Surround, Velvet Reverb, Phat Bass, Soft Limiter, FAT4X**<br>
+$\color{limegreen}\textsf{+}$ &nbsp; **PNG loader is wokring, and tested! (--png) loads from JSON too!**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **RVQ sample compression** — 27.7 dB<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Mouse control to horizontal scroll tracks**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Downsampling integrated with RVQ (--downsample 1, 2 or 4)**<br>
