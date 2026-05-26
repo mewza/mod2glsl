@@ -2,7 +2,7 @@
 
 # 🎵 MOD2GLSL v1.666
 
-$${\Large\color{orange}\textsf{GLSL MOD Player v1.666 for ShaderToy}}$$
+$${\Large\color{orange}\textsf{GLSL MOD Player v1.666 for ShaderToy and standalone HTML embedded page}}$$
 $${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
 
 ![Version](https://img.shields.io/badge/version-1.37-orange?style=flat-square)
