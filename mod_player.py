@@ -743,21 +743,50 @@ def create_fixed_player_html(mod, output_file, downsample=1, compress=False, vec
             return 0
         return s3m_note_to_period[idx]
 
+    # S3M command → MOD/ProTracker effect remapping.
+    # S3M command O (Sample Offset, code 15=0xF) would otherwise fire the JS
+    # "Set Speed/Tempo" handler, collapsing speed to 0-1 → song plays 3-50× too fast.
+    def _s3m_cmd_to_mod_eff(cmd, info):
+        if cmd == 0:  return (0x0, 0)
+        if cmd == 1:  return (0xF, info)                                   # A: Set speed
+        if cmd == 2:  return (0xB, info)                                   # B: Position jump
+        if cmd == 3:  return (0xD, ((info >> 4) * 10 + (info & 0xF)) & 0x3F)  # C: Pattern break (BCD)
+        if cmd == 4:  return (0xA, info)                                   # D: Volume slide
+        if cmd == 5:  return (0x2, info)                                   # E: Slide down
+        if cmd == 6:  return (0x1, info)                                   # F: Slide up
+        if cmd == 7:  return (0x3, info)                                   # G: Tone portamento
+        if cmd == 8:  return (0x4, info)                                   # H: Vibrato
+        if cmd == 9:  return (0x0, 0)                                      # I: Tremor (skip)
+        if cmd == 10: return (0x0, info)                                   # J: Arpeggio
+        if cmd == 11: return (0x6, info)                                   # K: Vibrato + vol slide
+        if cmd == 12: return (0x5, info)                                   # L: Tone porta + vol slide
+        if cmd == 13: return (0x0, 0)                                      # M: Channel vol (skip)
+        if cmd == 14: return (0x0, 0)                                      # N: Chan vol slide (skip)
+        if cmd == 15: return (0x9, info)                                   # O: Sample offset → MOD 9xx
+        if cmd == 16: return (0x0, 0)                                      # P: Pan slide (skip)
+        if cmd == 17: return (0x0, 0)                                      # Q: Retrigger (skip)
+        if cmd == 18: return (0x7, info)                                   # R: Tremolo
+        if cmd == 19: return (0xE, info)                                   # S: Special → extended
+        if cmd == 20: return (0xF, info)                                   # T: Set tempo
+        if cmd == 21: return (0x4, info)                                   # U: Fine vibrato (approx)
+        if cmd == 22: return (0x0, 0)                                      # V: Global vol (skip)
+        return (0x0, 0)
+
     pattern_data = []
     is_s3m = hasattr(mod, 'is_s3m') and mod.is_s3m
     num_channels = mod.num_channels if hasattr(mod, 'num_channels') else 4
-    
+
     for pattern in mod.patterns:
         for row in pattern:
             for ch_idx in range(num_channels):
                 ch = row[ch_idx] if ch_idx < len(row) else {}
-                
+
                 # Convert S3M to MOD format if needed
                 if is_s3m:
                     sample = ch.get('instrument', 0)
                     period = s3m_note_to_mod_period(ch.get('note', 255))
-                    effect = ch.get('command', 0)
-                    param = ch.get('info', 0)
+                    effect, param = _s3m_cmd_to_mod_eff(
+                        ch.get('command', 0), ch.get('info', 0))
                 else:
                     sample = ch.get('sample', 0)
                     period = ch.get('period', 0)
@@ -2353,7 +2382,7 @@ def _classify_mod_waveforms_for(mod, slots=31, verbose=True):
             if nm and mod.samples[i]['length'] > 0:
                 diag.append(f"#{i+1} '{nm}' → {_MOD_WAVE_NAMES[wave_types[i]]}")
         if diag:
-            print(f"   🎹 Visualizer: {len(diag)} sample waveforms classified")
+            _q(f"   🎹 Visualizer: {len(diag)} sample waveforms classified")
     return wave_types
 
 def _emit_visualizer_synth_glsl(wave_types):
@@ -2448,6 +2477,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
        17: "Everything is Temporary (diatribes/FabriceNeyret2 fork — noise terrain + orb volumetric march)",
        18: "sm0g (diatribes/Shane fork — tri-planar textured SDF box corridors + bump map)",
        19: "Spectro 3D Mist (Orblivius — 3D SDF bar spectrum + volumetric fog + reflective ground)",
+       20: "Nebula flight II (Orblivius — star tunnel + spiral-noise nebula + audio-reactive terrain)",
     }
     viz_name = _VIZ_NAMES.get(viz, f"viz{viz}")
 
@@ -2523,7 +2553,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
         _extra = sum(len(mod.samples[_i]['data']) -
                      (len(mod.samples[_i]['data']) // _f)
                      for _i, _f in _loop_fr)
-        print(f"   ✓ loop-fullrate: {len(_loop_fr)} looped sample(s) kept "
+        _q(f"   ✓ loop-fullrate: {len(_loop_fr)} looped sample(s) kept "
               f"un-decimated for exact loop bounds "
               f"(was ×{sorted({_f for _,_f in _loop_fr})}; "
               f"+{_extra} raw samples → larger Sound, watch GPU budget). "
@@ -2695,7 +2725,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
                                if _ri < len(mod.patterns[_pi]) and _ch < len(mod.patterns[_pi][_ri])
                                else None) if _pi < len(mod.patterns) else None))
     if _f_effect_count > 2:   # >2 since initial-speed-set typically uses 1-2 Fxx
-        print(f"   🎚️  {_f_effect_count} mid-song speed/tempo effects detected → using per-row time table")
+        _q(f"   🎚️  {_f_effect_count} mid-song speed/tempo effects detected → using per-row time table")
 
 
     # ── Estimate song duration vs Shadertoy's audio buffer cap (~180s) ──
@@ -2742,7 +2772,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
     # ========== COMMON TAB ==========
     # Instrument count: S3M/IT can exceed 31 (2ND_PM=54). Hardcoded 31
     # silenced instruments 32+ (voice/vocal samples) — feedback_s3m_
-    # instrument_cap, ported onto v1.63. Used by _gcoBody guard, isBass[],
+    # instrument_cap, ported onto v1.666. Used by _gcoBody guard, isBass[],
     # samples[] across Common+Sound; must be defined before common_glsl.
     # DYNAMIC instrument/sample count — sized to the actual file, never a
     # hardcoded cap. MOD naturally yields 31 (its fixed header), S3M/XM/IT
@@ -2756,7 +2786,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
                 len(getattr(mod, 'samples', []) or []))
     data_source_comment = "Embedded data (no PNG required)" if use_embedded else f"All data in 1024×1024 RGBA PNG: {png_file}"
     common_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.63 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.666 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    COMMON TAB
    Visualizer: {viz_name}
@@ -2798,7 +2828,8 @@ const bool  enableFAT          = {str(not _compat["no_fat"]).lower()};
 const bool  enableVelvetReverb = false;   // reverb OFF by default (opt-in)
 const bool  enableCombReverb   = false;   // reverb OFF by default (opt-in)
 const ivec2 surr_channels = ivec2(1, 4);  // 1-indexed; change to ivec2(2,3) to flip
-// Master volume (IT global·mix/128²). MOD/S3M/XM = 1.0; <1.0 for hot IT files.
+// Master volume (IT global·mix/128²). Reverted to 1.0 — 2.5 was killing audio
+// somewhere downstream (under investigation).
 const float MASTER_GAIN = 1.0;
 
 // Channel panning (0=left, 0.5=center, 1.0=right)
@@ -3079,7 +3110,7 @@ int getByte(int byteIndex) {{
     int channel = actualIndex & 3;
     int x = pixelIdx & 1023;
     int y = pixelIdx >> 10;
-    vec4 pixel = texelFetch(iChannel0, ivec2(x, y), 0);
+    vec4 pixel = texelFetch(iChannel3, ivec2(x, y), 0);
     if (channel == 0) return int(pixel.r * MUL1 + 0.5);
     if (channel == 1) return int(pixel.g * MUL1 + 0.5);
     if (channel == 2) return int(pixel.b * MUL1 + 0.5);
@@ -3415,9 +3446,9 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     _bass_idx = [i+1 for i, f in enumerate(bass_sample_flags) if f == 'true' and i < len(mod.samples)]
     if _bass_idx:
         _names = ', '.join(f"#{i} '{mod.samples[i-1]['name'].strip()}'" for i in _bass_idx)
-        print(f"   🔊 Bass samples (PhatBass targets): {_names}")
+        _q(f"   🔊 Bass samples (PhatBass targets): {_names}")
     else:
-        print(f"   🔊 No bass samples detected — PhatBass effect inactive")
+        _q(f"   🔊 No bass samples detected — PhatBass effect inactive")
     bass_flags_str = ', '.join(bass_sample_flags)
     # Resolve PhatBass routing mode:
     #   'auto'   → mix-wide if no bass detected, else per-sample (legacy)
@@ -3426,14 +3457,14 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     _pb_mode = _compat['phatbass_mode']
     if _pb_mode == 'sample':
         phatbass_mix_mode = 0
-        print(f"   🎚️  PhatBass routing: per-sample (forced via --phatbass-mode sample)")
+        _q(f"   🎚️  PhatBass routing: per-sample (forced via --phatbass-mode sample)")
     elif _pb_mode == 'mix':
         phatbass_mix_mode = 1
-        print(f"   🎚️  PhatBass routing: mix-wide (forced via --phatbass-mode mix)")
+        _q(f"   🎚️  PhatBass routing: mix-wide (forced via --phatbass-mode mix)")
     else:  # auto
         phatbass_mix_mode = 1 if not _bass_idx else 0
         _routing = 'mix-wide' if phatbass_mix_mode == 1 else 'per-sample'
-        print(f"   🎚️  PhatBass routing: {_routing} (auto)")
+        _q(f"   🎚️  PhatBass routing: {_routing} (auto)")
 
     # ── Only3D allpass coefficients (precomputed; ported from mod_player.py) ──
     # All coeffs are pure functions of freq+SR → bake to literal const vec2 so
@@ -3453,7 +3484,7 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     _ap_p0_2, _ap_p1p2_2, _ap_delay_2 = _only3d_coeffs(_ONLY3D_FREQ2)
 
     sound_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.63 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.666 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    SOUND TAB
    Visualizer: {viz_name}
@@ -3510,7 +3541,7 @@ float getMixedMono(float time_offset, Position pos, float rowTime) {{
     float mix = 0.0;
     for (int ch = 0; ch < NUM_CHANNELS; ch++)
         mix += getChannelOutput(ch, time_offset, pos, rowTime);
-    const float normFactor = 2.0 / float(NUM_CHANNELS);
+    const float normFactor = 5.0 / float(NUM_CHANNELS);  // bumped 2.0→5.0 (~2.5× louder; 6.0 hot for non-PNG with raw-perc)
     return mix * normFactor;
 }}
 
@@ -3548,7 +3579,7 @@ vec2 mainSound(int samp, float time) {{
 
 #if !USE_EMBEDDED_DATA
     // PNG mode - check magic signature
-    vec4 magic = texelFetch(iChannel0, ivec2(0, 0), 0);
+    vec4 magic = texelFetch(iChannel3, ivec2(0, 0), 0);
     int magicR = int(magic.r * MUL1 + 0.5);
     int magicG = int(magic.g * MUL1 + 0.5);
     int magicB = int(magic.b * MUL1 + 0.5);
@@ -3621,7 +3652,7 @@ vec2 mainSound(int samp, float time) {{
     // NNA / DCT / DCA / fadeout into the VoiceSegment timeline; tlGetOutput
     // sums the active segments. The entire pattern-player dry/3D/PhatBass
     // path below is preprocessor-removed for IT (no double-mix, no wasted
-    // per-sample pattern walk). v1.63's downstream limiter/FAT/comb still
+    // per-sample pattern walk). v1.666's downstream limiter/FAT/comb still
     // apply to _out.
     vec2 _out = tlGetOutput(playbackTime);
 #else
@@ -3642,7 +3673,7 @@ vec2 mainSound(int samp, float time) {{
     }}
     
     // OPT: const-qualified — NUM_CHANNELS is a #define.
-    const float normFactor = 2.0 / float(NUM_CHANNELS);
+    const float normFactor = 5.0 / float(NUM_CHANNELS);  // bumped 2.0→5.0 (~2.5× louder; 6.0 hot for non-PNG with raw-perc)
     surrL *= normFactor; surrR *= normFactor;
     centL *= normFactor; centR *= normFactor;
     
@@ -3759,8 +3790,8 @@ vec2 mainSound(int samp, float time) {{
         _out = sign(_out) * (min(_ax, vec2(_T)) + _reduced);
     }}
 
-    // Hand off to v1.63's comb reverb + buffer-fade (kept active; mod_player.py
-    // has these disabled but removing v1.63's working tail is not requested).
+    // Hand off to v1.666's comb reverb + buffer-fade (kept active; mod_player.py
+    // has these disabled but removing v1.666's working tail is not requested).
     float outL = _out.x;
     float outR = _out.y;
 
@@ -5815,7 +5846,7 @@ vec3  _v11_col;       // color accumulator (set by _v11_march)
 // DFT bin from Buffer A row 1 (spectrum). u=0..1 → bin 0..FFT_N/2-1.
 #define _v11_aud(u) texelFetch(iChannel1,ivec2(clamp(int(clamp(float(u),0.,1.)*float(FFT_N/2)),0,FFT_N/2-1),1),0).r
 // Waveform sample from Buffer A row 0 (time domain, 0..1 centered at 0.5).
-#define _v11_wav(u) (texelFetch(iChannel1,ivec2(clamp(int(clamp(float(u),0.,1.)*float(FFT_N)),0,FFT_N-1),0),0).r - 0.5)
+#define _v11_wav(u) (texelFetch(iChannel1,ivec2(clamp(int(clamp(float(u),0.,1.)*iChannelResolution[1].x),0,int(iChannelResolution[1].x)-1),70),0).a - 0.5)
 
 float _v11_de(vec3 z) {
     int n = 0;
@@ -5892,149 +5923,50 @@ vec3 _VizScene(vec2 C) {
 }
 """
 
-    elif viz == 12:  # Laser Patterns (0rblivius)
-        # Newton iteration + complex IFS + laser-grid fractal marcher.
-        # Based on https://www.shadertoy.com/view/4tyfWy + glslsandbox sources.
-        # No direct audio reads in outerscope; inner snd from Buffer A FFT.
-        # Prefixed: _v12_*.
+    elif viz == 12:  # Tunnel Bands (spectrum-driven tunnel ridges)
+        # Compact raymarcher (user-provided) — the deterministic
+        # `p.y += .095+sin(p.z)*.1` ridges are replaced by spectrum-history
+        # samples from Buffer A's ring buffer (SPEC_BASE..+SPEC_ROWS).
         viz_scene_block = r"""
-// === VIZ 12: Laser Patterns (0rblivius) =====================================
-// Newton iteration + complex IFS + laser-grid marcher.
-// Source: https://www.shadertoy.com/view/4tyfWy + glslsandbox.com/e#60588.0
-// Audio: inner FFT snd via Buffer A row 1 (iChannel1). Prefixed: _v12_*.
+// === VIZ 12: Tunnel Bands (spectrum-driven) =================================
+#define _v12_SPEC_BASE 134
+#define _v12_SPEC_ROWS 128
 
-#define _v12_H(h) (cos((h)*6.3+vec3(0,23,21))*.5+.5)
-#define _v12_aud(u) texelFetch(iChannel1,ivec2(clamp(int((u)*float(FFT_N/2)),0,FFT_N/2-1),1),0).r
-
-vec2 _v12_cmul(vec2 a, vec2 b) {
-    return vec2(a.x*b.x-a.y*b.y, a.x*b.y+a.y*b.x);
-}
-vec2 _v12_cdiv(vec2 a, vec2 b) {
-    vec2 cj = vec2(b.x,-b.y);
-    return _v12_cmul(a,cj)/(length(b)*length(b));
-}
-vec2 _v12_ccos(vec2 z){return vec2(cos(z.x)*cosh(z.y),-sin(z.x)*sinh(z.y));}
-vec2 _v12_csin(vec2 z){return vec2(sin(z.x)*cosh(z.y), cos(z.x)*sinh(z.y));}
-vec2 _v12_newton(vec2 z){
-    return z-(1.35-0.35*sin(0.3*iTime))*_v12_cdiv(_v12_csin(z),_v12_ccos(z));
-}
-vec2 _v12_rv(vec2 z,float a){
-    return vec2(z.x*cos(a)-z.y*sin(a), z.y*cos(a)+z.x*sin(a));
-}
-
-float _v12_star(vec2 uv, float anim) {
-    uv = abs(uv);
-    vec2 pos = min(uv.xy/uv.yx, anim);
-    float p = 2.0 - pos.x - pos.y;
-    return (2.0+p*(p*p-1.5))/(uv.x+uv.y);
-}
-vec3 _v12_lerp3(vec3 a,vec3 b,float t){return a+(b-a)*t;}
-float _v12_cosE(float ang,float rez,float offs){
-    return 1.0-(0.5-(1.0+cos(ang*rez+offs*3.14159265))*0.5);
-}
-float _v12_defC(float ang,float def,float ph){
-    return _v12_cosE(ang,4.,ph)*def+1.-def;
-}
-vec3 _v12_hue(vec3 col,float sh){
-    vec3 m=vec3(cos(sh),-sin(sh)*0.57735,0.);
-    m=vec3(m.xy,-m.y)+(1.-m.x)*0.33333;
-    return mat3(m,m.zyx,m.yzx)*col;
-}
-vec2 _v12_ruv(vec2 uv,float angle){
-    float a=angle*6.2831853;
-    return mat2(cos(a),-sin(a),sin(a),cos(a))*uv;
+// Ring-buffer read: age frames into the past (0 = newest), freq bin 0..FFT_N/2-1.
+// Buffer A writes one row/frame at SPEC_BASE + (iFrame % SPEC_ROWS).
+float _v12_spec(int bin, int age) {
+    int idx  = (iFrame - age) - (_v12_SPEC_ROWS * ((iFrame - age) / _v12_SPEC_ROWS));
+    if (idx < 0) idx += _v12_SPEC_ROWS;
+    int row  = _v12_SPEC_BASE + idx;
+    bin = clamp(bin, 0, FFT_N/2 - 1);
+    return texelFetch(iChannel1, ivec2(bin, row), 0).r;
 }
 
 vec3 _VizScene(vec2 C) {
-    vec4 O = vec4(0.0);
-    C.xy = _v12_ruv(C-0.5*iResolution.xy, cos(iTime*0.1)*sin(iTime*0.1))
-           +0.5*iResolution.xy;
-
-    vec2 uv = (C-0.5*iResolution.xy)/iResolution.y;
-    vec2 p  = uv*2.;
-
-    const float _v12_pi = 3.1415926;
-    float t12 = iTime+length(p)*cos(iTime/4.-0.04*length(p)*
-        cos(iTime*iTime/8.+0.0002*length(p)*cos(iTime*iTime*iTime/16.)));
-    vec3 col12 = vec3(0.000,0.302,0.502);
-    float snd12 = abs(sin(iTime));  // time-modulated (not FFT — original design)
-
-    float f12 = 0.0;
-    for (float i=0.; i<20.; i++) {
-        float s12=sin(t12+i*_v12_pi/10.)*2.*sin(iTime);
-        float c12=cos(t12+i*_v12_pi/10.)*2.*cos(iTime);
-        f12+=0.0002/(abs(p.x+c12/(1.+length(p)))*abs(p.y+s12/(1.+length(p))))
-             /(1.+length(p));
+    vec4 o = vec4(0.0);
+    float i = 0.0, d = 0.0, s = 0.0;
+    for(o*=i; i++<1e2; ) {
+        vec3 p = d * normalize(vec3(C+C, 0.0) - iResolution.xyx);
+        for (s = .1; s < 1.;
+            p.z -= iTime,
+            // Replace sin(p.z) ridges with spectrum: depth → time history,
+            // a fixed mid-low bin → ridge height. Falls back to small
+            // baseline when spectrum hasn't filled yet.
+            // sin/cos-free: linear spectrum drive + linear inner perturbation.
+            p.y += .35 + p.z * 1e-3
+                       + (_v12_spec(int(abs(p.z) * 5.0) + 4,
+                                    int(mod(abs(-p.z*3.) * 10.0, float(_v12_SPEC_ROWS)))) * 4.0) * 0.1
+                       - p.z * 5e-4,
+            p -= dot((p * s * .01), vec3(.01)) / s,
+            s += s);
+        d += s = .01 + max(abs(p.x)-2.5, abs(p.y));
+        o += (1.+cos(d+vec4(5,3,1,0))) / s;
     }
-
-    float ZOOM = 1.*(1.+snd12);
-    vec2  z12  = ZOOM*(C-0.5*iResolution.xy)/iResolution.y;
-    float t2   = iTime*.2+(.25+.05*sin(iTime*.1))/(length(z12)+.07)*2.2;
-    float si   = sin(t2), co = cos(t2);
-
-    vec3 colX = vec3(0.);
-    vec4 colours[8];
-    colours[0]=vec4(vec3(255.,155., 69.)/255.,0.5);
-    colours[1]=vec4(vec3(225.,214., 66.)/255.,1.0);
-    colours[2]=vec4(vec3( 63.,179.,163.)/255.,1.0);
-    colours[3]=vec4(vec3( 56.,127.,184.)/255.,1.0);
-    colours[4]=vec4(vec3( 37., 84.,163.)/255.,1.0);
-    colours[5]=vec4(vec3(101., 86.,163.)/255.,1.0);
-    colours[6]=vec4(vec3(178., 87.,159.)/255.,1.0);
-    colours[7]=vec4(vec3(238., 75., 93.)/255.,1.0);
-
-    vec2 pos12 = (C/min(iResolution.x,iResolution.y))*2.-1.;
-    pos12.x -= (iResolution.x/iResolution.y)*0.5;
-    pos12.x += 0.01;
-    float a3 = atan(pos12.x,pos12.y);
-    float r12 = length(pos12);
-    vec3  col3 = vec3(0.);
-    float edgeLim=0.8+abs(sin(iTime*0.3))*0.05, innerEdge=edgeLim-0.1;
-
-    for (int i=0; i<8; i++) {
-        edgeLim=0.;
-        float phase=iTime*float(i)*0.5;
-        vec3 rc = (i==7)
-            ? snd12*_v12_lerp3(colours[7].xyz,colours[0].xyz,abs(a3)/_v12_pi)
-            : snd12*_v12_lerp3(colours[i].xyz,colours[i+1].xyz,abs(a3)/_v12_pi);
-        float edge  =_v12_defC(a3,0.2,phase)*edgeLim;
-        float inEdge=_v12_defC(a3,0.1,phase)*innerEdge;
-        col3+=clamp(float(r12<edge)*smoothstep(r12,edge,edge-0.01),0.,1.)*rc;
-        col3-=clamp(float(r12<inEdge&&r12<edge)*smoothstep(r12,inEdge,inEdge-0.01),0.,1.)*rc;
-        edgeLim=innerEdge; innerEdge=edgeLim-0.1;
-    }
-
-    vec3 n1,q,r3=iResolution,
-         d=normalize(vec3((C*2.-r3.xy)/r3.y,1));
-
-    for(float i=0.,a,s,e,g=0.; ++i<50.;
-        O.xyz+=mix(vec3(1),_v12_H(g),.2)*1./e/5e3)
-    {
-        n1=g*d+col3;
-        float sndI=0.1*(_v12_aud(0.05)+_v12_aud(0.0501));
-        n1.z*=0.0;  // ceil(col.y) where col=vec3(0) → 0 always
-        a=30.;
-        n1=mod(n1-a,a*2.)-a+sndI*sndI;
-        s=3.;
-        for(int j=0;j<9;j++){
-            n1=.5+sndI-abs(n1);
-            if(n1.x<n1.z)n1=n1.zyx;
-            if(n1.z<n1.y)n1=n1.xzy;
-            s*=e=1.35-sndI;
-            n1=abs(n1)*e-vec3(
-                200.*(1.3-sndI)*abs(sin(320.-10.*mod(abs(sin(iTime)),1.))),
-                200.,0.1+2.*sndI);
-        }
-        g+=e=length(n1.yz)/s;
-    }
-
-    float anim12=sin(iTime*12.)*0.1+snd12;
-    O*=vec4(_v12_star(uv,anim12)*vec3(0.35,0.2,1.15)*15.,1.);
-    O+=vec4(_v12_hue(f12*col12+f12*col12*n1,iTime),1.);
-    O=tanh(O);
-    return O.rgb;
+    o = tanh(o / 3e3);
+    return o.rgb;
 }
 """
+
 
     elif viz == 13:  # Prismatic Fractals (Smull fork, Orblivius)
         # IFS box raymarcher with audio-reactive glow + dynamic palette.
@@ -6693,12 +6625,244 @@ vec3 _VizScene(vec2 C){
 }
 """
 
+    elif viz == 20:  # Nebula flight II (Orblivius)
+        # Star tunnel + spiral-noise nebula + audio-reactive terrain.
+        # Audio reads route through Buffer A's spectrum waterfall ring buffer
+        # (SPEC_BASE..+SPEC_ROWS) — same data the other viz audio-readers use.
+        # Prefixed: _v20_*.
+        viz_scene_block = r"""
+// === VIZ 20: Nebula flight II (Orblivius) ===================================
+// Enjoy and help improve!
+#define _v20_PASS_COUNT 1
+#define _v20_SPIRAL_NOISE_ITER 6
+#define _v20_SPEC_BASE 134
+#define _v20_SPEC_ROWS 128
+
+// Spectrum waterfall sampler (Buffer A ring buffer).
+// uv.x = freq bin in [0,1]; uv.y = time history in [0,1] (0=newest).
+float _v20_spec(vec2 uv) {
+    uv = fract(uv);
+    int bin  = clamp(int(uv.x * float(FFT_N/2 - 1)), 0, FFT_N/2 - 1);
+    int age  = clamp(int(uv.y * float(_v20_SPEC_ROWS - 1)), 0, _v20_SPEC_ROWS - 1);
+    int idx  = (iFrame - age) - (_v20_SPEC_ROWS * ((iFrame - age) / _v20_SPEC_ROWS));
+    if (idx < 0) idx += _v20_SPEC_ROWS;
+    return texelFetch(iChannel1, ivec2(bin, _v20_SPEC_BASE + idx), 0).r;
+}
+
+float _v20_fBrightness    = 2.;
+float _v20_fSteps         = 181.0;
+float _v20_fMinDist       = 0.8;
+float _v20_fMaxDist       = 5.0;
+float _v20_fRepeatMin     = 1.0;
+float _v20_fRepeatMax     = 2.0;
+float _v20_fDepthFade     = 0.6;
+float _v20_fParticleSize  = 0.005;
+float _v20_nebulaBrightness = 1.3;
+
+vec3 _v20_gCamRight, _v20_gCamUp;
+
+float _v20_Random(float x) {
+    return fract(sin(x*123.456)*23.4567 + sin(x*345.678)*45.6789 + sin(x*456.789)*56.789);
+}
+vec3 _v20_GetParticleColour(vec3 vParticlePos, float fParticleSize, vec3 vRayDir) {
+    float d        = dot(vParticlePos, vRayDir);
+    vec3 vDeltaPos = vParticlePos - vRayDir * d;
+    float dist     = length(vDeltaPos);
+    float fps  = fParticleSize;
+    float fps2 = fps * fps;
+    float core = clamp(1.0 - dist/fps, 0., 1.);
+    float halo = (fps  * 0.3) / (sqrt(dist) + fps * 0.2);
+    float glow = (fps2 * 0.5) / (dist*dist + fps2 * 0.25);
+    float dx = dot(vDeltaPos, _v20_gCamRight);
+    float dy = dot(vDeltaPos, _v20_gCamUp);
+    float starSeed  = fract(sin(dot(vParticlePos.xy, vec2(12.9898, 78.233))) * 43758.5453);
+    float starAngle = starSeed * 6.2831 + iTime * (0.2 + starSeed * 0.6);
+    float cs = cos(starAngle), sn = sin(starAngle);
+    vec2 r = vec2( cs*dx + sn*dy, -sn*dx + cs*dy);
+    float rayWidthK = 1.0 / (fps2 * 0.09);
+    float rayLenK   = 1.0 / (fps  * 4.0);
+    float hStreak = exp(-r.y*r.y*rayWidthK) * exp(-abs(r.x)*rayLenK);
+    float vStreak = exp(-r.x*r.x*rayWidthK) * exp(-abs(r.y)*rayLenK);
+    float rays = (hStreak + vStreak) * 0.35;
+    float fShade = core + halo + glow + rays;
+    fShade *= exp2(-d * _v20_fDepthFade) * _v20_fBrightness;
+    float h = fract(starSeed * 7.13 + 0.137);
+    vec3 tint = mix(vec3(0.6, 0.8, 1.0), vec3(1.0, 1.0, 1.0), smoothstep(0.0,  0.33, h));
+    tint      = mix(tint,                vec3(1.0, 0.95, 0.75), smoothstep(0.33, 0.66, h));
+    tint      = mix(tint,                vec3(1.0, 0.7, 0.5),   smoothstep(0.66, 1.0,  h));
+    tint = mix(vec3(1.), tint, 0.8);
+    return vec3(fShade) * tint;
+}
+vec3 _v20_GetParticlePos(vec3 vRayDir, float fZPos, float fSeed) {
+    float fAngle         = atan(vRayDir.x, vRayDir.y);
+    float fAngleFraction = fract(fAngle / (3.14*2.0));
+    float fSegment       = floor(fAngleFraction * _v20_fSteps + fSeed) + 0.5 - fSeed;
+    float fParticleAngle = fSegment / _v20_fSteps * (3.14*2.0);
+    float fSegmentPos    = fSegment / _v20_fSteps;
+    float fRadius        = _v20_fMinDist + _v20_Random(fSegmentPos + fSeed) * (_v20_fMaxDist - _v20_fMinDist);
+    float tunnelZ        = vRayDir.z / length(vRayDir.xy / fRadius) + fZPos;
+    float fRepeat        = _v20_fRepeatMin + _v20_Random(fSegmentPos + 0.1 + fSeed) * (_v20_fRepeatMax - _v20_fRepeatMin);
+    float fParticleZ     = (ceil(tunnelZ / fRepeat) - 0.5) * fRepeat - fZPos;
+    return vec3(sin(fParticleAngle)*fRadius, cos(fParticleAngle)*fRadius, fParticleZ);
+}
+vec3 _v20_Starfield(vec3 vRayDir, float fZPos, float fSeed) {
+    return _v20_GetParticleColour(_v20_GetParticlePos(vRayDir, fZPos, fSeed), _v20_fParticleSize, vRayDir);
+}
+vec3 _v20_RotateX(vec3 p, float a) { float s=sin(a),c=cos(a); return vec3(p.x, c*p.y+s*p.z, -s*p.y+c*p.z); }
+vec3 _v20_RotateY(vec3 p, float a) { float s=sin(a),c=cos(a); return vec3(c*p.x+s*p.z, p.y, -s*p.x+c*p.z); }
+vec3 _v20_RotateZ(vec3 p, float a) { float s=sin(a),c=cos(a); return vec3(c*p.x+s*p.y, -s*p.x+c*p.y, p.z); }
+float _v20_h1(vec3 p) { p=fract(p*.1031); p+=dot(p,p.yzx+19.19); return fract((p.x+p.y)*p.z); }
+float _v20_hashV3(vec3 p){ p=fract(p*.1031); p+=dot(p,p.yzx+19.19); return fract((p.x+p.y)*p.z); }
+float _v20_vn(vec3 p) {
+    vec3 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+    return mix(mix(mix(_v20_h1(i),            _v20_h1(i+vec3(1,0,0)),f.x),
+                   mix(_v20_h1(i+vec3(0,1,0)),_v20_h1(i+vec3(1,1,0)),f.x),f.y),
+               mix(mix(_v20_h1(i+vec3(0,0,1)),_v20_h1(i+vec3(1,0,1)),f.x),
+                   mix(_v20_h1(i+vec3(0,1,1)),_v20_h1(i+vec3(1,1,1)),f.x),f.y),f.z);
+}
+float _v20_pn(vec3 p) { return 2.4*_v20_vn(p)-1.; }
+float _v20_hashF(float p) { vec3 p3=fract(vec3(p)*.1031); p3+=dot(p3,p3.yzx+19.19); return fract((p3.x+p3.y)*p3.z); }
+const float _v20_nudge = 20.;
+float _v20_normalizer = 1./sqrt(1.+_v20_nudge*_v20_nudge);
+float _v20_SpiralNoiseC(vec3 p, vec4 id) {
+    float iter=2., n=2.-id.x;
+    for (int i=0; i<_v20_SPIRAL_NOISE_ITER; i++) {
+       n += -abs(sin(p.y*iter)+cos(p.x*iter))/iter;
+        p.xy += vec2(p.y,-p.x)*_v20_nudge; p.xy *= _v20_normalizer;
+        p.xz += vec2(p.z,-p.x)*_v20_nudge; p.xz *= _v20_normalizer;
+        iter *= id.y+.733733;
+    }
+    return n;
+}
+float _v20_mapCloud(vec3 p, vec4 id) {
+    float k = 2.*id.w+.1;
+    return k*(.5 + _v20_SpiralNoiseC(p.zxy*.4132+333.,id)*3. + _v20_pn(p*8.5)*.12);
+}
+vec3 _v20_hsv2rgb(float x, float y, float z) {
+    return z+z*y*(clamp(abs(mod(x*6.+vec3(0,4,2),6.)-3.)-1.,0.,1.)-1.);
+}
+vec4 _v20_renderClouds(vec3 ro, vec3 rd, float tmax, vec4 id) {
+    float max_dist = min(tmax, 22.),
+          td=0., d, t, noi, lDist, a, sp=9.,
+          rRef=2.*id.x,
+          h=.05+.25*id.z;
+    vec3 pos, lightColor;
+    vec4 sum = vec4(0);
+    t = .1*_v20_hashF(_v20_hashF(dot(rd, vec3(1.0))));
+    for (int i=0; i<100; i++) {
+        if (td>.9 || sum.a>.99 || t>max_dist) break;
+        a   = smoothstep(max_dist, 0., t);
+        pos = ro + t*rd;
+        d   = abs(_v20_mapCloud(pos, id)) + .07;
+        lDist      = max(length(mod(pos+sp*.5,sp)-sp*.5), .001);
+        noi        = _v20_pn(.05*pos);
+        lightColor = mix(_v20_hsv2rgb(noi,.5,.6),
+                         _v20_hsv2rgb(noi+.3,.5,.6),
+                         smoothstep(rRef*.5, rRef*2., lDist));
+        sum.rgb += a*lightColor/exp(lDist*lDist*lDist*.08)/30.;
+        if (d < h) {
+            td += (1.-td)*(h-d)+.005;
+            sum.rgb += sum.a*sum.rgb*.25/lDist;
+            sum     += (1.-sum.a)*.02*td*a;
+        }
+        td += .015;
+        t  += max(d*.08*max(min(lDist,d),2.), .01);
+    }
+    sum = clamp(sum, 0., 1.);
+    sum.xyz *= sum.xyz*(3.-sum.xyz-sum.xyz);
+    return sum;
+}
+
+vec3 _VizScene(vec2 fragCoord) {
+    vec2 vScreenPos = (fragCoord/iResolution.xy)*2.-1.;
+    vScreenPos.x *= iResolution.x/iResolution.y;
+    vec3 vRayDir = normalize(vec3(vScreenPos, 1.0));
+
+    vec3 vEuler = vec3(sin(iTime*.2)*.125, sin(iTime*.1)*.125, .5+sin(iTime*.3)*.5);
+    if (iMouse.z > 0.) {
+        vEuler.x = -((iMouse.y/iResolution.y)*2.-1.);
+        vEuler.y = -((iMouse.x/iResolution.x)*2.-1.);
+        vEuler.z = 0.;
+    }
+    vRayDir = _v20_RotateX(vRayDir, vEuler.x);
+    vRayDir = _v20_RotateY(vRayDir, vEuler.y);
+    vRayDir = _v20_RotateZ(vRayDir, vEuler.z);
+
+    _v20_gCamRight = _v20_RotateZ(_v20_RotateY(_v20_RotateX(vec3(1.,0.,0.), vEuler.x), vEuler.y), vEuler.z);
+    _v20_gCamUp    = _v20_RotateZ(_v20_RotateY(_v20_RotateX(vec3(0.,1.,0.), vEuler.x), vEuler.y), vEuler.z);
+
+    float speed = 1.;
+    float fZPos = 2.0 + iTime*speed;
+
+    vec3 col  = mix(vec3(.005,0.,.01), vec3(.01,.005,0.), vRayDir.y*.5+.5);
+    float fSeed = 0.;
+    for (int i=0; i<_v20_PASS_COUNT; i++) {
+        col  += _v20_Starfield(vRayDir, fZPos, fSeed);
+        fSeed += 1.234;
+    }
+
+    vec3 ro     = vec3(sin(iTime*.04)*3., cos(iTime*.03)*2., iTime*speed);
+    vec4 clouds = _v20_renderClouds(ro, vRayDir, 22., vec4(.5,.4,.16,.7));
+    col = col + clouds.rgb * _v20_nebulaBrightness * (1.-clamp(length(col)*2.,0.,1.));
+
+    vec3 vRayDirT = normalize(vec3(vScreenPos, 1.0));
+    vRayDirT = _v20_RotateX(vRayDirT, vEuler.x);
+    vRayDirT = _v20_RotateY(vRayDirT, vEuler.y);
+    vRayDirT = _v20_RotateZ(vRayDirT, -.1 + vEuler.z * 0.15);
+
+    vec4 terrainAccum = vec4(0);
+    float hitY = 0., minSt = 999.;
+    {
+        float ii_t = 0., dd_t = 0., s_t;
+        vec2 curve_t = vec2(sin(iTime*0.35)*0.004, sin(iTime*0.4)*0.003);
+        for(; ii_t++ < 40.; ) {
+            vec3 p = dd_t * vRayDirT;
+            p.xy += dd_t * dd_t * curve_t;
+            p.z += iTime * 8.;
+            float audioElev = 0.;
+            for (s_t = .2; s_t < .9;
+                audioElev += 1.2 * _v20_spec(vec2(mod(p.x*0.02+0.5, 1.), mod(p.z*0.03, 1.))),
+                s_t += s_t);
+            p.y += -.2 + audioElev;
+            float silenceBoost = (1.0 - smoothstep(0.0, 0.4, audioElev)) * 2.5;
+            s_t = .03 + max(abs(p.x) - 2.5, abs(p.y)) + silenceBoost;
+            dd_t += s_t;
+            if (s_t < minSt) { minSt = s_t; hitY = audioElev; }
+            float elevationFactor = smoothstep(-1.5, 2.0, p.y * p.y);
+            float freqAtThisHeight = clamp(audioElev * 0.2, 0., 1.);
+            float amp = _v20_spec(vec2(freqAtThisHeight, mod(p.z*0.03, 1.)));
+            float stepT = (audioElev * 0.3 + p.z * 0.012 + p.x * 0.04);
+            vec3 stepHue = _v20_hsv2rgb(stepT, 1.0, 1.0);
+            vec4 terrainColor = vec4(stepHue, 1.0) / max(s_t, 0.01);
+            terrainColor.rgb *= (0.1 + .8 * elevationFactor);
+            terrainColor.rgb *= max(0.15, amp * audioElev * 1.5);
+            float zDim   = exp(-dd_t * 0.04);
+            float zBands = 0.2 + 0.8 * cos(p.z * 0.01);
+            terrainColor.rgb *= (0.2 + 0.7 * zDim) * (0.6 + 0.4 * zBands);
+            float fade = smoothstep(80., 10., dd_t);
+            terrainColor *= fade;
+            if (fade < 0.0001) break;
+            terrainAccum += terrainColor;
+        }
+    }
+
+    float t = clamp(0.85 - hitY * 0.35, 0., 0.85);
+    vec3 heightHue = _v20_hsv2rgb(t, 1.0, 1.0);
+    col += heightHue * terrainAccum.r / 100.;
+
+    float luma = dot(col, vec3(0.299, 0.587, 0.114));
+    col = mix(vec3(luma), col, 1.6);
+
+    return tanh(col*1.5);
+}
+"""
+
     else:
         viz_scene_block = "\n// viz not recognized — black backdrop\n"
 
 
     image_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.63 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.666 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    IMAGE TAB — iChannel0: alphabet texture (shadertoy.com/view/4sf3RB)
                 iChannel1: Buffer A (audio + FFT + smoothed bands)
@@ -6806,7 +6970,7 @@ makeStr(printBPMVal) {bpm_val_chars} _end
 makeStr(printSpdVal) {spd_val_chars} _end
 
 // ---- Static label strings ----
-makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _6 _3 _ _NUM _NUM _NUM _end
+makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _6 _6 _6 _ _NUM _NUM _NUM _end
 makeStr(printCredit) _COPY _2 _0 _2 _6 _ _O _R _B _L _I _V _I _U _S _end
 makeStr(printLoad)   _L _O _A _D _I _N _G _DOT _DOT _DOT _end
 makeStr(printSpec)   _S _P _E _C _T _R _U _M _end
@@ -7052,6 +7216,8 @@ void mainImage(out vec4 O, vec2 C) {{
 
     // getPosition() clamps time to SONG_DURATION_S — visualizer freezes at end
     Position pos = getPosition(iTime);
+    // Darken fractal backdrop uniformly across all views (header, info, tracker, strip)
+    col *= 0.75;
     // Accumulate tracker UI into separate buffer so it overlays pure (no curtain tint)
     vec3 trk = vec3(0.0);
     col *= 1.0 - 0.50 * printHdr   (pUV(fp, ML+1.,  7., CH));
@@ -7105,14 +7271,51 @@ void mainImage(out vec4 O, vec2 C) {{
     col *= 1.0 - 0.45 * printSpdVal(pUV(fp, rx+7.*CW+1., iy2+1., CH));
     trk += YELLOW * printSpdVal(pUV(fp, rx+7.*CW, iy2, CH));
 
+    // ============ SONG PROGRESS BAR ============
+    // Spans full width in the 10px gap between the info rows and the tracker.
+    // Click anywhere inside it (iMouse) to seek the visual display position.
+    {{
+        // SONG_DURATION_S works in both PNG and VQ-embedded modes;
+        // PNG_SONG_SAMPS only exists when --png is set.
+        float _songDur  = SONG_DURATION_S;
+        float _prog     = clamp(iTime / _songDur, 0.0, 1.0);
+        // Seek: if user clicks inside the bar, override visual progress.
+        float _bX0 = ML, _bX1 = iResolution.x - ML;
+        float _bY0 = iy2 + float(CH) + 2.0;
+        float _bY1 = _bY0 + 10.0;
+        if (iMouse.z > 0.0 && iMouse.y >= _bY0 && iMouse.y <= _bY1)
+            _prog = clamp((iMouse.x - _bX0) / (_bX1 - _bX0), 0.0, 1.0);
+        float _fill = _bX0 + (_bX1 - _bX0) * _prog;
+        if (fp.y >= _bY0 && fp.y <= _bY1 && fp.x >= _bX0 && fp.x <= _bX1) {{
+            bool _filled = fp.x < _fill;
+            bool _border = fp.x < _bX0+1.5 || fp.x > _bX1-1.5 ||
+                           fp.y < _bY0+0.5 || fp.y > _bY1-0.5;
+            col = vec3(0.0);
+            if (_filled)       trk += mix(CYAN, WHITE, _prog * 0.25);
+            else if (_border)  trk += vec3(0.25, 0.40, 0.55);
+            else               trk += vec3(0.04, 0.08, 0.12);
+        }}
+        // Bright playhead at fill edge
+        float _edge = abs(fp.x - _fill);
+        if (_edge < 1.5 && fp.y >= _bY0 && fp.y <= _bY1)
+            {{ col = vec3(0.0); trk += mix(WHITE, CYAN, _edge / 1.5); }}
+    }}
 
     // ============ TRACKER ============
-    float ty   = iy2+CH+10.;
-    float TCW  = 18.;          // tracker column char width (narrower than info-bar CW=25)
-    float TW   = 9.*TCW+6.;   // 9 chars per cell + 6px gap = 168px
+    float ty   = iy2+CH+14.;
     float rNW  = 2.*CW;
-    float txOff= ML+rNW+8. + _scrollX;  // scroll offset applied to all tracks
-    const int HVR = 5;  // 11 visible rows; oscillo shrinks to give tracker more space
+    float _trkLeft  = ML + rNW + 8.;
+    float _trkRight = iResolution.x - ML;
+    float _availW   = _trkRight - _trkLeft;
+    // EVERY cell stretches to the same width: TW = _availW / N. Always fills.
+    // Font stays at 18 px when there's room; shrinks proportionally when not.
+    const float _natTCW = 18.;          // natural char width
+    float TW    = _availW / float(NUM_CHANNELS);
+    float TCW   = min(_natTCW, (TW - 6.) / 9.);          // shrink only if cell too narrow
+    float _textW   = 9. * TCW;
+    float _cellPad = max(0., (TW - _textW - 6.) * 0.5);  // center text in cell
+    float txOff = _trkLeft;
+    const int NROWS = 12;  // visible tracker rows (best subjective fit; 64 % 12 = 4 stub page)
 
     // Track headers — dynamic loop over all channels, colored by tc%4,
     // scrolled with _scrollX so wide songs scroll horizontally.
@@ -7126,8 +7329,8 @@ void mainImage(out vec4 O, vec2 C) {{
             if(tx > ML+rNW+8.-TW && tx < iResolution.x - ML) {{
                 int digits = (tc+1 >= 10) ? 2 : 1;
                 // Label font: 65% of CH; digit font: 85% of CH (taller+wider for readability)
-                float _tHdr   = CH * 0.65;
-                float _dHdr   = CH * 0.85;  // digit height — larger than label
+                float _tHdr   = CH * 0.85;  // label "TRACK" — bumped from 0.65
+                float _dHdr   = CH * 0.95;  // digit height — bumped from 0.85
                 float _tyHdr  = ty + (CH + 3.0 - _tHdr) * 0.5;
                 float _dyHdr  = ty + (CH + 3.0 - _dHdr) * 0.5;
                 float numCW   = TCW * 0.95;  // digit cell width
@@ -7150,11 +7353,11 @@ void mainImage(out vec4 O, vec2 C) {{
     // lines section below), not trk-overlay blue lines.
 
     float tTop = ty+CH+3.;
-    float tBot = tTop+float(2*HVR+1)*CH;
+    float tBot = tTop+float(NROWS)*CH;
 
     // Page mode: show a fixed page of rows, frame moves line by line within it
     // Page flips when frame hits bottom → jumps to top of next page
-    int pageSize = 2*HVR+1;                             // e.g. 9 rows visible
+    int pageSize = NROWS;
     int pageStart = (pos.row / pageSize) * pageSize;    // first row of current page
     int frameRow  = pos.row - pageStart;                // frame position within page (0..pageSize-1)
 
@@ -7169,8 +7372,22 @@ void mainImage(out vec4 O, vec2 C) {{
         // Base row color
         if(ri_z == frameRow) {{
             col = vec3(0.12, 0.38, 0.72);
-        }} else if((ri_z & 1) == 0) {{
-            col *= 0.55;
+        }} else {{
+            // Alternating row stripe (tracker classic): even=darker, odd=lighter
+            int _absRow = pageStart + ri_z;
+            col *= ((_absRow & 1) == 0) ? 0.50 : 1.00;
+            // Column-position fade: outer track columns slightly darker,
+            // center brighter — soft horizontal vignette across the tracker.
+            if (_xInT >= 0.0) {{
+                int _tcF = int(_xInT / TW);
+                float _ctr = float(NUM_CHANNELS - 1) * 0.5;
+                float _d   = abs(float(_tcF) - _ctr) / max(_ctr, 1.0);  // 0 center → 1 edge
+                col *= 1.0 - 0.35 * _d;
+            }}
+            // Row-distance fade: rows farther from the playing row dim out.
+            // Classic tracker focus effect — eye drawn to the current row.
+            float _rDist = abs(float(ri_z - frameRow)) / max(float(NROWS), 1.0);
+            col *= 1.0 - 0.55 * _rDist;
         }}
         // 3D bevel: 2px highlight (top + left), 2px shadow (bottom + right)
         bool _hiH = _rowFrac < 2.0;
@@ -7213,7 +7430,16 @@ void mainImage(out vec4 O, vec2 C) {{
             bool _hSh  = fp.y > tTop - 2.0 || (_xH >= 0.0 && _cFH >= TW - 2.0);
             if(_hHi)      col = min(vec3(1.0), col + vec3(0.22, 0.22, 0.32));
             else if(_hSh) col = max(col * 0.20, vec3(0.05, 0.02, 0.02));
-            else          col = min(vec3(1.0), col * 1.20);  // brighten interior
+            else {{
+                // Diagonal gradient REFLECTED around the cell's diagonal axis:
+                // brightest along the diagonal (top-left↔bottom-right), fading
+                // to darker on both off-diagonal corners (top-right & bottom-left).
+                float _gX = (_xH >= 0.0 ? _cFH : 0.0) / max(TW, 1.0);
+                float _gY = (fp.y - ty) / max(tTop - ty, 1.0);
+                float _dToDiag = abs(_gX - _gY);                   // 0 on diag → up to 1 at off-diag corners
+                float _gM = mix(1.66, 0.34, _dToDiag);             // 66% lighter on diag → 66% darker off it
+                col = min(vec3(1.0), col * _gM);
+            }}
         }}
     }}
 
@@ -7249,15 +7475,16 @@ void mainImage(out vec4 O, vec2 C) {{
         float xInT=fp.x-txOff;
         if(xInT>=0.&&xInT<float(NUM_CHANNELS)*TW && fp.x >= ML+rNW+8.) {{
             int tc =int(xInT/TW);
-            int ci =int((xInT-float(tc)*TW)/TCW);
-            if(ci<9) {{
+            float _xInCell = xInT - float(tc)*TW - _cellPad;  // pixel inside text area
+            int ci = int(_xInCell / TCW);
+            if(_xInCell >= 0. && ci >= 0 && ci < 9) {{
                 int rn = pageStart + ri_abs;
                 int sp = pos.songPos;
                 if(rn<0)  {{ rn+=64; sp=max(0,sp-1); }}
                 if(rn>=64){{ rn-=64; sp=min(SONG_LENGTH-1,sp+1); }}
                 Note n=getNote(sp,rn,tc);
                 int c=nCell(n.period,n.instrument,n.effect,n.param,ci);
-                float _sx = txOff+float(tc)*TW+float(ci)*TCW;
+                float _sx = txOff+float(tc)*TW+_cellPad+float(ci)*TCW+3.0;
                 float _sy = tTop+float(ri_abs)*CH;
                 col *= 1.0 - 0.45 * drawCh(c, fp, _sx+1., _sy+1., TCW,CH);
                 float g=drawCh(c, fp, _sx, _sy, TCW,CH);
@@ -7317,10 +7544,7 @@ void mainImage(out vec4 O, vec2 C) {{
 
     if(oh>20.&&fp.y>oy&&fp.y<by1 && fp.x>2.0 && fp.x<iResolution.x-2.0 && _sdf_pre < -1.5) {{
         float sy = fp.y - oy;
-        // Dim V7 under the strip — was 0.35; now 0.50 so the visualizer
-        // reads brighter as ambient context behind the spectrum/oscillo
-        // content (per user feedback: "brighten the backdrop").
-        col *= 0.50;
+        // backdrop already darkened globally above (col *= 0.50)
 
         if (!specMode) {{
             // ── Oscilloscope (real audio from Buffer A row 0) ────────────
@@ -7356,7 +7580,7 @@ void mainImage(out vec4 O, vec2 C) {{
                 // GPU bilinear filtering via texture() handles sub-sample
                 // smoothness — no cusps between sample points.
                 int   bufW   = int(iChannelResolution[1].x);
-                int   maxIdx = min(FFT_N - 1, bufW - 1);
+                int   maxIdx = bufW - 1;  // use full image-width of WAVE_BASE row 70
                 float bufY   = 0.5 / iChannelResolution[1].y;
 
                 // ── Smooth quadratic-Bézier waveform (ported mod_player.py) ─
@@ -7373,13 +7597,13 @@ void mainImage(out vec4 O, vec2 C) {{
                 int   _iC = min(maxIdx, _i0 + 1);
                 int   _iD = min(maxIdx, _i0 + 2);
                 vec2 _PA = vec2(float(_iA) / float(maxIdx) * iResolution.x,
-                    (clamp(texelFetch(iChannel1, ivec2(_iA, 0), 0).r * 3.0, -0.9, 0.9) * 0.40 + 0.5) * oh);
+                    (clamp((texelFetch(iChannel1, ivec2(_iA, 70), 0).a - 0.5) * 9.0, -0.9, 0.9) * 0.40 + 0.5) * oh);
                 vec2 _PB = vec2(float(_iB) / float(maxIdx) * iResolution.x,
-                    (clamp(texelFetch(iChannel1, ivec2(_iB, 0), 0).r * 3.0, -0.9, 0.9) * 0.40 + 0.5) * oh);
+                    (clamp((texelFetch(iChannel1, ivec2(_iB, 70), 0).a - 0.5) * 9.0, -0.9, 0.9) * 0.40 + 0.5) * oh);
                 vec2 _PC = vec2(float(_iC) / float(maxIdx) * iResolution.x,
-                    (clamp(texelFetch(iChannel1, ivec2(_iC, 0), 0).r * 3.0, -0.9, 0.9) * 0.40 + 0.5) * oh);
+                    (clamp((texelFetch(iChannel1, ivec2(_iC, 70), 0).a - 0.5) * 9.0, -0.9, 0.9) * 0.40 + 0.5) * oh);
                 vec2 _PD = vec2(float(_iD) / float(maxIdx) * iResolution.x,
-                    (clamp(texelFetch(iChannel1, ivec2(_iD, 0), 0).r * 3.0, -0.9, 0.9) * 0.40 + 0.5) * oh);
+                    (clamp((texelFetch(iChannel1, ivec2(_iD, 70), 0).a - 0.5) * 9.0, -0.9, 0.9) * 0.40 + 0.5) * oh);
                 vec2 _M0 = 0.5 * (_PA + _PB);
                 vec2 _M1 = 0.5 * (_PB + _PC);
                 vec2 _M2 = 0.5 * (_PC + _PD);
@@ -7607,7 +7831,7 @@ void mainImage(out vec4 O, vec2 C) {{
     // Directional frame bevel: use SDF gradient as surface normal, light from top-left.
     // This correctly follows the rounded corner arc instead of creating hard pixel seams.
     vec2 _sdfGrad  = vec2(dFdx(_sdf_pre), dFdy(_sdf_pre));
-    float _bevelDir = dot(_sdfGrad, vec2(-1.0, -1.0)) * 0.707;
+    float _bevelDir = dot(_sdfGrad, vec2(-1.0, 1.0)) * 0.707;
     float _bvHi    = clamp(_bevelDir * 4.0, 0.0, 1.0);
     float _bvLo    = clamp(-_bevelDir * 4.0, 0.0, 1.0);
     col = min(vec3(1.0), col + vec3(0.22, 0.22, 0.32) * _frame * _bvHi);
@@ -7655,7 +7879,7 @@ void mainImage(out vec4 O, vec2 C) {{
             "    } else if (py == WAVE_BASE) {\n"
             "        // ── Row 70: newest row — RAW BIPOLAR audio (Zuvuya scroll) ──\n"
             "        float u  = float(px) / float(iResolution.x);\n"
-            "        float mu = 1.0 - abs(u * 2.0 - 1.0);\n"
+            "        float mu = 1.0 - u;  // linear time scan, left=old → right=new (conventional)\n"
             "        float t  = iTime - mu * 0.5;\n"
             "        float ticksPerSec = float(BPM) * 2.0 / 5.0;\n"
             "        float rowTime = float(SPEED) / ticksPerSec;\n"
@@ -7698,6 +7922,16 @@ void mainImage(out vec4 O, vec2 C) {{
             "    } else if (py > WAVE_BASE && py < WAVE_BASE + WAVE_ROWS) {\n"
             "        // ── Rows 71-133: scroll — copy row above (one frame younger) ──\n"
             "        O = texelFetch(iChannel0, ivec2(px, py - 1), 0);\n"
+            "    } else if (py >= SPEC_BASE && py < SPEC_BASE + SPEC_ROWS && px < FFT_N/2) {\n"
+            "        // ── Spectrum waterfall RING BUFFER (no scroll — 1 write/frame total) ──\n"
+            "        // Each frame writes the current FFT row at SPEC_BASE + (iFrame % SPEC_ROWS),\n"
+            "        // leaving the other rows untouched.  Readers index by\n"
+            "        //   SPEC_BASE + ((iFrame - age + SPEC_ROWS) % SPEC_ROWS)\n"
+            "        // where age = frames into the past (0 = newest).\n"
+            "        if (py == SPEC_BASE + (iFrame % SPEC_ROWS))\n"
+            "            O = texelFetch(iChannel0, ivec2(px, 1), 0);\n"
+            "        else\n"
+            "            O = texelFetch(iChannel0, ivec2(px, py), 0);  // hold existing\n"
             "    }"
         )
 
@@ -7707,7 +7941,7 @@ void mainImage(out vec4 O, vec2 C) {{
     # Setup: Buffer A iChannel0 = Buffer A (self-ref)
     #        Image   iChannel1 = Buffer A output
     buffer_a_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.63 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.666 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    Contact: subband@gmail.com or
             subband@protonmail.com
@@ -7732,6 +7966,8 @@ void mainImage(out vec4 O, vec2 C) {{
 #define HIST_BASE 3
 #define WAVE_BASE 70      // rows 70..(70+WAVE_ROWS-1) — Zuvuya waveform scroll memory
 #define WAVE_ROWS 64      // 64 rows of history, full-width x
+#define SPEC_BASE 134     // rows 134..(134+SPEC_ROWS-1) — FFT-magnitude waterfall (viz12/20 etc.)
+#define SPEC_ROWS 128     // 128 frames of past spectrum history (~2 sec @ 60fps)
 
 // File-scope iTime clamp — see Image tab for explanation.
 #define iTime clamp(iTime - INTRO_SILENCE_S, 0.0, SONG_DURATION_S)
@@ -7750,47 +7986,9 @@ void mainImage(out vec4 O, vec2 C) {{
     if (iFrame < 16) return;
 
     if (py == 0 && px < FFT_N) {{
-        // ── Row 0: mixed audio sample at time-offset px ────────────────────
-        // Synthesizes from note pattern data via _synthWave (waveType[]
-        // dispatch on instrument). Real audio (getChannelOutput) lives in
-        // Sound only — the VQ codebook isn't accessible here by design.
-        float dt  = 1.0 / FFT_SR;
-        float t   = iTime - float(FFT_N - px - 1) * dt;
-        float ticksPerSec = float(BPM) * 2.0 / 5.0;
-        float rowTime = float(SPEED) / ticksPerSec;
-        Position pos = getPosition(t);
-        float s = 0.0;
-        for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
-            Note tn = getNote(pos.songPos, pos.row, ch);
-            int trow = pos.row, tpat = pos.songPos;
-            if (tn.instrument <= 0 || tn.period <= 0) {{
-                int sr = pos.row, sp2 = pos.songPos;
-                for (int lb = 1; lb < 48; lb++) {{
-                    sr--;
-                    if (sr < 0) {{ if (sp2>0) {{sp2--; sr=63;}} else break; }}
-                    Note pn = getNote(sp2, sr, ch);
-                    if (pn.instrument > 0 && pn.period > 0) {{
-                        tn = pn; trow = sr; tpat = sp2; break;
-                    }}
-                }}
-            }}
-            if (tn.period <= 0) continue;
-            float f = periodToFreq(tn.period);
-            SampleInfo si = samples[tn.instrument - 1];
-            int vol = si.volume;
-            Note cr = getNote(pos.songPos, pos.row, ch);
-            if (cr.effect == 0xC) vol = min(cr.param, 64);
-            else if (tn.effect == 0xC) vol = min(tn.param, 64);
-            float amp = float(vol) / 64.0;
-            int trigSgr = patTickOffset[tpat] + (trow - patStartRow[tpat]);
-            float trigT = float(fetchTick(trigSgr)) / TICKS_PER_SEC;
-            float age   = max(0.0, t - trigT);
-            float env   = exp(-age * 3.5);
-            int wt = waveType[tn.instrument - 1];
-            s += amp * env * _synthWave(wt, f, t);
-        }}
-        s /= float(NUM_CHANNELS);
-        O = vec4(s, 0.0, 0.0, 1.0);
+        // ── Row 0: unused. Oscilloscope reads WAVE_BASE row 70 alpha
+        // (same per-pixel synth already running for the Zuvuya curtain).
+        O = vec4(0.0);
 
     }} else if (py == 1 && px < FFT_N / 2) {{
         // ── Row 1: DFT magnitude at LINEAR-spaced frequency bin px ──────────
@@ -7805,7 +8003,7 @@ void mainImage(out vec4 O, vec2 C) {{
         float phase_re = 1.0,     phase_im = 0.0;
         float re = 0.0, im = 0.0;
         for (int n = 0; n < FFT_N; n++) {{
-            float s = texelFetch(iChannel0, ivec2(n, 0), 0).r;
+            float s = texelFetch(iChannel0, ivec2(n, 70), 0).a - 0.5;
             float w = 0.5 * (1.0 - cos(TWO_PI * float(n) / float(FFT_N)));
             re += s * w * phase_re;
             im += s * w * phase_im;
@@ -7942,7 +8140,12 @@ void mainImage(out vec4 O, vec2 C) {{
             float scrollOffset = texelFetch(iChannel0, ivec2(5, 2), 0).r;
             float prevPressed  = texelFetch(iChannel0, ivec2(7, 2), 0).r;
             float currPressed  = iMouse.z > 0.0 ? 1.0 : 0.0;
+            float prevDragDead = texelFetch(iChannel0, ivec2(8, 2), 0).r;
+            bool inBounds = iMouse.y > iResolution.y - 471.0 && iMouse.y < iResolution.y - 65.0;
             if (currPressed > 0.5 && prevPressed < 0.5) scrollAnchor = scrollOffset;
+            // Re-entering bounds after leaving: re-anchor so scroll doesn't jump
+            if (prevDragDead > 0.5 && currPressed > 0.5 && inBounds)
+                scrollAnchor = scrollOffset + (abs(iMouse.z) - iMouse.x);
             O = vec4(scrollAnchor, 0., 0., 1.);
         }} else if (px == 7) {{
             // ── Previous mouse pressed state ──────────────────────────────────
@@ -7953,9 +8156,10 @@ void mainImage(out vec4 O, vec2 C) {{
             float prevPressed = texelFetch(iChannel0, ivec2(7, 2), 0).r;
             float currPressed = iMouse.z > 0.0 ? 1.0 : 0.0;
             bool inBounds     = iMouse.y > iResolution.y - 471.0 && iMouse.y < iResolution.y - 65.0;
-            if (currPressed > 0.5 && prevPressed < 0.5) dragDead = 0.0;
-            if (currPressed > 0.5 && !inBounds) dragDead = 1.0;
-            if (currPressed < 0.5) dragDead = 0.0;
+            if (currPressed > 0.5 && prevPressed < 0.5) dragDead = 0.0;   // new press: clear
+            if (currPressed > 0.5 && !inBounds) dragDead = 1.0;           // left bounds: kill
+            if (dragDead > 0.5 && currPressed > 0.5 && inBounds) dragDead = 0.0; // re-entered: revive
+            if (currPressed < 0.5) dragDead = 0.0;                        // released: clear
             O = vec4(dragDead, 0., 0., 1.);
         }}
 
@@ -8032,7 +8236,8 @@ void mainImage(out vec4 O, vec2 C) {{
     # it's obvious the platform (not our shader) ended playback. Done as a
     # rename+wrapper post-pass so it works regardless of which --viz is active.
     _dlg_anchor = 'void mainImage(out vec4 O, vec2 C)'
-    if image_glsl.count(_dlg_anchor) == 1:
+    _is_png_build = (compat or {}).get('use_png', False)
+    if image_glsl.count(_dlg_anchor) == 1 and not _is_png_build:
         image_glsl = image_glsl.replace(_dlg_anchor, 'void _vizMainImage(out vec4 O, vec2 C)', 1)
         image_glsl += r'''
 
@@ -8045,12 +8250,12 @@ void _drawLimitDialog(inout vec3 col, vec2 fp) {
     vec2 res = iResolution.xy;
     col = mix(col, vec3(0.0), 0.18);               // subtle dim — just a hint darker
     vec2 ctr = res * 0.5;
-    vec2 hw  = vec2(min(res.x * 0.42, 320.0), min(res.y * 0.20, 92.0));
+    vec2 hw  = vec2(min(res.x * 0.50, 440.0), min(res.y * 0.28, 124.0));
     vec2 d   = abs(fp - ctr);
     if (d.x > hw.x || d.y > hw.y) return;          // outside the dialog box
     if (d.x > hw.x - 2.5 || d.y > hw.y - 2.5) { col = vec3(0.82, 0.84, 0.94); return; } // border
-    col = mix(col, vec3(0.05, 0.06, 0.09), 0.88);  // panel fill (slightly see-through)
-    float CW = clamp(hw.x * 2.0 / 22.0, 6.0, 16.0), CH = CW * 1.55;
+    col = mix(col, vec3(0.05, 0.06, 0.09), 0.90);  // panel fill
+    float CW = clamp(hw.x * 2.0 / 26.0, 8.0, 22.0), CH = CW * 1.6;
     // ASCII (uppercase). 32=space 46='.' 48-57=digits 65-90=A-Z
     int L1[23] = int[](77,65,88,32,76,73,77,73,84,32,49,56,48,46,48,32,83,69,67,79,78,68,83); // MAX LIMIT 180.0 SECONDS
     int L2[20] = int[](73,77,80,79,83,69,68,32,66,89,32,83,72,65,68,69,82,84,79,89);           // IMPOSED BY SHADERTOY
@@ -8059,8 +8264,9 @@ void _drawLimitDialog(inout vec3 col, vec2 fp) {
     float lx1 = ctr.x - 11.5 * CW;  // 23 chars
     float lx2 = ctr.x - 10.0 * CW;  // 20 chars
     float lx3 = ctr.x -  8.0 * CW;  // 16 chars
-    // ty in flipped space (y=0 at top): subtract to go above centre, lines step downward (+)
-    float t = 0.0, ty = ctr.y - CH * 1.1;
+    // ty: centre 3-line block in dialog. Block spans CH*4.2 (3 lines + 2 gaps of CH*1.6).
+    // Block centre = ty + CH*2.1 → set equal to ctr.y → ty = ctr.y - CH*2.1
+    float t = 0.0, ty = ctr.y - CH * 2.1;
     for (int i = 0; i < 23; i++) if (L1[i] != 32) t = max(t, drawCh(L1[i], fp, lx1 + float(i)*CW, ty,         CW, CH));
     for (int i = 0; i < 20; i++) if (L2[i] != 32) t = max(t, drawCh(L2[i], fp, lx2 + float(i)*CW, ty + CH*1.6, CW, CH));
     for (int i = 0; i < 16; i++) if (L3[i] != 32) t = max(t, drawCh(L3[i], fp, lx3 + float(i)*CW, ty + CH*3.2, CW, CH));
@@ -8075,9 +8281,9 @@ void mainImage(out vec4 O, vec2 C) {
     O = vec4(_c, 1.0);
 }
 '''
-        print("   ✓ 180s-cap dialog overlay injected (Image tab; shows when buffer exhausted)")
+        _q("   ✓ 180s-cap dialog overlay injected (Image tab; shows when buffer exhausted)")
     else:
-        print(f"   ⚠ dialog overlay skipped (mainImage anchor count="
+        _q(f"   ⚠ dialog overlay skipped (mainImage anchor count="
               f"{image_glsl.count(_dlg_anchor)}, expected 1)")
 
     with open(output_file.replace('.glsl', '_image.glsl'), 'w') as f:
@@ -10529,6 +10735,16 @@ _VQ_ENCODER_B64 = (
     'ZF9wYXRoLCBvdXRfcGF0aCkK'
 )
 
+def _count_const_elems(path):
+    """Count total const array elements in a GLSL file (for ANGLE budget check)."""
+    import re as _re_ce
+    try:
+        txt = open(path, encoding='utf-8', errors='replace').read()
+        return sum(int(sz) for sz in _re_ce.findall(r'const\s+\w+\s+\w+\[(\d+)\]', txt))
+    except Exception:
+        return 0
+
+
 def _trim_song_to_audio_cap(mod, cap_sec=SHADERTOY_AUDIO_CAP_SEC, strict=False):
     """Trim mod.song_positions to the first ~cap_sec of playback.
 
@@ -10721,13 +10937,14 @@ def _render_mp3_via_toolchain(base_name, secs):
     else:
         _sp.run(["lame", "--quiet", "-q", "2", _wav, _mp3])
     if _os.path.exists(_mp3):
-        print(f"   ✓ wrote {_mp3}  ({secs:.0f}s, {_os.path.getsize(_mp3):,} B) — "
+        _q(f"   ✓ wrote {_mp3}  ({secs:.0f}s, {_os.path.getsize(_mp3):,} B) — "
               f"this is exactly what the ShaderToy Sound tab plays")
     else:
         print("   ✗ mp3 encode failed (WAV is at " + _wav + ")")
 
 
-def _pack_build_into_png(common_path, sound_path, png_path):
+def _pack_build_into_png(common_path, sound_path, png_path,
+                          bufferA_path=None, image_path=None):
     """Repackage a finished (embedded) VQ build's const-array data into ONE PNG.
 
     The PNG is purely a data-packaging vehicle — the decoder logic is unchanged.
@@ -10744,6 +10961,28 @@ def _pack_build_into_png(common_path, sound_path, png_path):
     common = open(common_path).read()
     sound  = open(sound_path).read()
 
+    # ── Cascade-macro fix: extract rowSeekCum + getNote from Common ──────────
+    # These functions call fetch*Byte macros which cascade through getByte to
+    # fetchPixel. In Common, fetchPixel is the macro stub `0`, so the function
+    # bodies bake to return zeros at parse time (silent audio, blank visuals).
+    # Solution: move them to each per-pass tab AFTER the real `int fetchPixel`
+    # function is defined — there the macro chain resolves to the real call.
+    _pat_funcs_src = ""
+    _m_rs = _re.search(
+        r'^// Reconstruct[^\n]*\n//[^\n]*\nint rowSeekCum\(int targetRow\) \{.*?\n\}',
+        common, _re.S | _re.M)
+    if _m_rs:
+        _pat_funcs_src += _m_rs.group(0) + "\n\n"
+        common = common.replace(_m_rs.group(0),
+            "// rowSeekCum: moved per-pass (fetchPixel macro cascade — see Sound/BufferA/Image)")
+    _m_gn = _re.search(
+        r'^Note getNote\(int songPos, int row, int channel\) \{.*?\n\}',
+        common, _re.S | _re.M)
+    if _m_gn:
+        _pat_funcs_src += _m_gn.group(0) + "\n\n"
+        common = common.replace(_m_gn.group(0),
+            "// getNote: moved per-pass (fetchPixel macro cascade — see Sound/BufferA/Image)")
+
     def _logical(nm):
         m = _re.match(r'(.*?)(\d+)$', nm); return m.group(1) if m else nm
 
@@ -10755,15 +10994,30 @@ def _pack_build_into_png(common_path, sound_path, png_path):
     for src in (common, sound):
         for m in _decl_re.finditer(src):
             nm = m.group(1)
-            ints = [int(x) for x in _re.findall(r'-?\d+', m.group(2))]
+            # CRITICAL: strip every "ivec4" keyword from the body before extracting
+            # numbers — `re.findall(r'-?\d+')` would otherwise match the "4" in
+            # "ivec4" and prepend it to each ivec4's values, shifting the entire
+            # stream by 1 every 4 ints. This silently corrupted ALL PNG-mode
+            # builds (vqCodebook[0..3] read as the literal 4 from "ivec4" instead
+            # of the actual codebook bytes → audio = noise).
+            _body_no_kw = m.group(2).replace('ivec4', '')
+            ints = [int(x) for x in _re.findall(r'-?\d+', _body_no_kw)]
             cm = _re.match(r'.*?(\d+)$', nm)
             ch = int(cm.group(1)) if cm else 0
             arr_chunks.setdefault(_logical(nm), {})[ch] = ints
 
-    # Only the fetcher-backed DATA arrays get moved to the PNG. Any other
-    # `const ivec4` array (indexed inline) is left untouched.
-    _KNOWN = {'patDict', 'patBitmap', 'patIdx', 'patRowSeek', 'rowStartTick',
-              'vqCodes', 'vqCodebook'}
+    # ALL large data goes to PNG: VQ sample data AND pattern arrays.
+    # Rationale: for complex songs (>8ch, >120s) pattern arrays alone can
+    # exceed 11,000 ANGLE private-variable slots in Common, crashing with
+    # "Total size of declared private variables exceeds implementation-defined
+    # limit". Example: skyscraper.s3m full-song = 14,480 slots from pattern
+    # arrays alone, vs the ~10,000 ANGLE budget.
+    # getByte is injected into Common (not Sound) because Common is prepended
+    # to every ShaderToy pass — so all 3 render passes (Image, BufferA, Sound)
+    # can call the pattern-decode fetch functions that are also in Common.
+    # JSON wires iChannel3 to all 3 passes; use local file path (not base64×3)
+    # to keep JSON small and avoid the "froze after 1 frame" 1.2MB JSON issue.
+    _KNOWN = {'vqCodes', 'vqCodebook', 'patBitmap', 'patDict', 'patIdx', 'patRowSeek'}
 
     def _stream(lg):
         out = bytearray()
@@ -10772,8 +11026,117 @@ def _pack_build_into_png(common_path, sound_path, png_path):
                 out += _struct.pack('>i', v if v < 0 else v & 0xFFFFFFFF)
         return out
 
-    order = [lg for lg in sorted(arr_chunks) if lg in _KNOWN]
-    blob = bytearray(); off = {}
+    # ── Parse int/SampleInfo arrays we want to move to PNG ───────────────────
+    # These are `const int NAME[N] = int[](...);` or `const SampleInfo samples[N]`
+    # declarations in Common GLSL that are song-specific but NOT ivec4-packed.
+    # Keep these as const int arrays in Common — getPosition() reads them on
+    # every sample; PNG texelFetches on this hot path caused GPU hang.
+    _INT_ARRAY_NAMES = set()   # nothing moves to PNG metadata section
+    _int_decl_re2 = _re.compile(
+        r'[ \t]*const int\s+([A-Za-z_]\w*)\[\d+\]\s*=\s*int\[\]\((.*?)\);\n?',
+        _re.S | _re.M)
+    _int_arrays = {}   # name -> [int values]
+    for _m2 in _int_decl_re2.finditer(common):
+        _nm2 = _m2.group(1)
+        if _nm2 in _INT_ARRAY_NAMES:
+            _int_arrays[_nm2] = [int(x.strip()) for x in _m2.group(2).split(',')
+                                 if x.strip().lstrip('-').isdigit() or
+                                 (x.strip().startswith('-') and x.strip()[1:].isdigit())]
+
+    # Parse SampleInfo struct field names (needed to build the accessor function).
+    _smpstruct_re = _re.compile(r'struct SampleInfo\s*\{([^}]+)\}', _re.S)
+    _smpstruct_m  = _smpstruct_re.search(common)
+    _smpfields = []
+    if _smpstruct_m:
+        _raw = _smpstruct_m.group(1).replace('int', '').strip()
+        for _tok in _re.split(r'[,;]', _raw):
+            _ft = _tok.strip()
+            if _ft and not _ft.startswith('//'):
+                _smpfields.append(_ft)
+
+    # Parse SampleInfo array instantiation values.
+    _smpinst_re = _re.compile(
+        r'const SampleInfo samples\[(\d+)\]\s*=\s*SampleInfo\[\]\((.*?)\);\n?',
+        _re.S)
+    _smpinst_m = _smpinst_re.search(common)
+    _smp_data = []    # list of int lists, one per sample
+    if _smpinst_m:
+        for _sc in _re.findall(r'SampleInfo\(([^)]+)\)', _smpinst_m.group(2)):
+            _smp_data.append([int(x.strip()) for x in _sc.split(',') if x.strip()])
+
+    # Parse scalar #define values (for the PNG header).
+    def _parse_define_num(src, name, default=0):
+        _dm = _re.search(rf'#define\s+{name}\s+([\d.]+)', src)
+        return float(_dm.group(1)) if _dm else float(default)
+    _total_ticks_val = int(_parse_define_num(common, 'TOTAL_TICKS', 0))
+    _bpm_val         = int(_parse_define_num(common, 'BPM', 125))
+    _speed_val       = int(_parse_define_num(common, 'SPEED', 6))
+    _num_ch_val      = int(_parse_define_num(common, 'NUM_CHANNELS', 4))
+    _num_sr_val      = int(_parse_define_num(common, 'NUM_SONG_ROWS', 0))
+    _song_len_val    = int(_parse_define_num(common, 'SONG_LENGTH', 0))
+
+    # ── Build PNG header (64 bytes) + metadata byte-sections ─────────────────
+    # Header layout (getByte offsets 0-63):
+    #   0- 3: TOTAL_TICKS (int32 BE)
+    #   4- 5: BPM (uint16 BE)
+    #      6: INITIAL_SPEED (uint8)
+    #      7: NUM_CHANNELS (uint8)
+    #   8- 9: NUM_SONG_ROWS (uint16 BE)
+    #  10-11: SONG_LENGTH (uint16 BE)
+    #     12: NUM_SAMPLES (uint8)
+    #     13: SMP_FIELDS  (uint8) — int fields per SampleInfo entry
+    #  14-15: reserved
+    #  16-19: SAMPLEINFO_PNG_OFF (int32 BE)
+    #  20-23: SONGPOS_PNG_OFF    (int32 BE)
+    #  24-27: PATROWOFF_PNG_OFF  (int32 BE)
+    #  28-31: PATSTARTROW_PNG_OFF (int32 BE)
+    #  32-35: PATTICKOFF_PNG_OFF  (int32 BE)
+    #  36-63: reserved zeros
+    _meta_blob = bytearray()   # metadata sections (follows the 64-byte header)
+    _meta_off  = {}            # name -> getByte() offset = 64 + position in _meta_blob
+
+    def _pack_i32_arr(vals):
+        out = bytearray()
+        for v in vals:
+            out += _struct.pack('>i', v)
+        return out
+
+    # _sampleInfo, songPositions, patRowOffset, patStartRow, patTickOffset all
+    # stay as const arrays in Common — no longer packed into PNG metadata.
+    # (getPosition + _getSMP are on the per-sample hot path; PNG reads here
+    # caused the GPU audio pre-render hang.)
+
+    # 64-byte header
+    _header = bytearray(64)
+    _struct.pack_into('>i', _header, 0,  _total_ticks_val)
+    _struct.pack_into('>H', _header, 4,  _bpm_val & 0xFFFF)
+    _header[6]  = _speed_val & 0xFF
+    _header[7]  = _num_ch_val & 0xFF
+    _struct.pack_into('>H', _header, 8,  _num_sr_val & 0xFFFF)
+    _struct.pack_into('>H', _header, 10, _song_len_val & 0xFFFF)
+    _header[12] = len(_smp_data) & 0xFF
+    _header[13] = len(_smpfields) & 0xFF
+    _HDR_SLOTS = {
+        '_sampleInfo': 16, 'songPositions': 20,
+        'patRowOffset': 24, 'patStartRow': 28, 'patTickOffset': 32,
+    }
+    for _aname, _slot in _HDR_SLOTS.items():
+        if _aname in _meta_off:
+            _struct.pack_into('>i', _header, _slot, _meta_off[_aname])
+
+    # Explicit order: VQ first (vqCodebook at offset 0 for backward-compat),
+    # then pattern arrays, then rowStartTick. Alphabetical sort would put
+    # patXxx before vqXxx, but we want vqCodebook first so VQCODEBOOK_PNG_OFF
+    # is predictable. rowStartTick last (largest; benefits from being aligned).
+    _VQ_NAMES  = [lg for lg in ('vqCodebook', 'vqCodes') if lg in arr_chunks and lg in _KNOWN]
+    _PAT_NAMES = [lg for lg in ('patBitmap', 'patDict', 'patIdx', 'patRowSeek')
+                  if lg in arr_chunks and lg in _KNOWN]
+    # rowStartTick stays as const ivec4 array in Common — getPosition() reads
+    # it every sample; PNG texelFetches on a hot binary-search path = GPU hang.
+    order = _VQ_NAMES + _PAT_NAMES
+    # Start blob with: [64-byte header][metadata sections][existing ivec4 sections]
+    blob = bytearray(_header) + bytearray(_meta_blob)
+    off  = dict(_meta_off)   # seed with metadata offsets
     for lg in order:
         off[lg] = len(blob); blob += _stream(lg)
 
@@ -10784,10 +11147,19 @@ def _pack_build_into_png(common_path, sound_path, png_path):
         raise ValueError(f"--png: packed data {len(data)} B exceeds PNG capacity {cap} B")
     buf = bytearray(cap); buf[:len(data)] = data
     _Image.frombytes('RGBA', (TEX, TEX), bytes(buf)).save(png_path, format='PNG', optimize=True)
-
     # 3. Offset #defines (uppercased logical name + _PNG_OFF) for Common.
+    #    ivec4 sections (VQ/patterns/rowStartTick) stay as compile-time #defines —
+    #    they're on the hot per-sample path and must stay zero-cost.
+    #    Metadata sections (SampleInfo, songPositions, patRowOffset, patStartRow,
+    #    patTickOffset) are read dynamically from the PNG header at runtime (TOC):
+    #    the PNG header stores their byte offsets at fixed header slots (bytes 16-35).
+    #    This lets the SAME compiled GLSL work with any song's PNG (generic shader).
     def _defname(lg): return lg.upper() + '_PNG_OFF'
     defines = "".join(f"#define {_defname(lg):24s} {off[lg]}\n" for lg in order)
+    # Image reads from Buffer A (iChannel1) directly — no PNG proxy needed.
+    # NOTE: SAMPLEINFO/SONGPOS/PATROWOFF/PATSTARTROW/PATTICKOFF are NOT #defined here.
+    # Their section offsets are stored in the PNG header (bytes 16-35) and read at
+    # runtime by the accessor functions via _pI32(slot), so the shader is song-generic.
 
     # 4. PNG data fetch primitives. fetchPixel() = ONE texelFetch = ONE RGBA
     #    pixel = 4 data bytes (big-endian r=MSB..a=LSB, matching _extractByte's
@@ -10795,29 +11167,147 @@ def _pack_build_into_png(common_path, sound_path, png_path):
     #    getU32() reads 4 consecutive bytes (little-endian, the form the VQ code
     #    bitstream wants) in AT MOST 2 texelFetches — so the hot per-sample
     #    4-byte code read is 1–2 fetches instead of 4.
-    getbyte = (
+    #    _pI32/_pU16 are big-endian int32/uint16 readers for the metadata header
+    #    and for the songPositions/patRowOffset/SampleInfo sections.
+    # Per-pass fetchPixel + _pngOk implementations.
+    # Sound/BufferA/BufferB: read PNG directly from iChannel3 at row 0.
+    # Image: read the PNG proxy written by Buffer A into its rows PNG_PROXY_ROW+,
+    #        accessed via iChannel1 (Buffer A framebuffer).  No iChannel3 needed.
+    # Splitting implementations per-pass (rather than in Common) is required because:
+    #   (a) The sampler differs (iChannel3 vs iChannel1).
+    #   (b) The GLSL preprocessor expands macro bodies at definition-time, so
+    #       a Common-level #define override from Image's tab code would be too late.
+    # fetchPixel uses a single-pixel (4-byte) cache.  One texelFetch on RGBA8
+    # iChannel3 returns exactly one pixel, so cache granularity = fetch
+    # granularity.  Without it, 4 consecutive getByte calls on the same pixel
+    # = 4 fetches; with it, the 2nd/3rd/4th byte of the same pixel are free.
+    # Embedded mode does NOT use PNG_F — it reads `const ivec4` arrays directly
+    # (zero-cost local memory), so the cache is PNG-mode-only.
+    # PNG_F.cur (ivec4): 4 unpacked bytes of the cached pixel (cur[0]=R .. cur[3]=A).
+    # PNG_F.gidx:        pixel index of the cached pixel (-1 = empty).
+    # PNG_F.idx:         last byte accessed within cur (0..3); reset to 0 on miss.
+    #
+    # Operator-precedence note: in GLSL/C, '+' (prec 4) binds tighter than '>>'
+    # (prec 5), so 'b+1>>10' == '(b+1)>>10' — correct for direct Y.
+    # For the Image proxy Y we need PNG_PROXY_ROW + (pix>>10), so we add explicit
+    # inner parens: 'PNG_PROXY_ROW+(pix>>10)'.
+    def _fp_body(ch, y_fn):
+        """Build per-pass fetchPixel + _pngOk with single-pixel int cache.
+        ch:   GLSL sampler name ('iChannel3' or 'iChannel1')
+        y_fn: callable(pix_expr: str) -> GLSL Y-coordinate string
+        """
+        lines = [
+            "#ifndef MUL1\n#define MUL1 255.0\n#endif\n",
+            f"// fetchPixel: single-pixel int cache via {ch}.\n",
+            "int _fp_grp=-1; int _fp_c;\n",
+            "int fetchPixel(int pi){\n",
+            "    if(pi!=_fp_grp){\n",
+            "        _fp_grp=pi;\n",
+            f"        vec4 _p0=texelFetch({ch},ivec2(pi&1023,{y_fn('pi')}),0);\n",
+            "        _fp_c=(int(_p0.r*MUL1+.5)<<24)|(int(_p0.g*MUL1+.5)<<16)|(int(_p0.b*MUL1+.5)<<8)|int(_p0.a*MUL1+.5);\n",
+            "    }\n",
+            "    return _fp_c;\n",
+            "}\n",
+            "bool _pngOk(){return fetchPixel(0)==((77<<24)|(79<<16)|(68<<8));}\n",
+        ]
+        return "".join(lines)
+    # Direct: iChannel3, Y = pix >> 10 (row index within 1024-wide PNG).
+    _getbyte_direct = _fp_body("iChannel3", lambda pv: f"{pv}>>10")
+    # Proxy: Image reads PNG data from Buffer A's output (iChannel1).
+    # Buffer A relays iChannel3 rows starting at PNG_PROXY_ROW so Image
+    # doesn't need its own iChannel3 binding.
+    _PNG_PROXY_ROW = 262  # 134 (after WAVE) + 128 (SPEC_ROWS waterfall) = 262
+    _getbyte_proxy = (
+        f"#define PNG_PROXY_ROW {_PNG_PROXY_ROW}\n"
+        + _fp_body("iChannel1", lambda pv: f"PNG_PROXY_ROW+({pv}>>10)")
+    )
+    # Unified: runtime-select iChannel3 (when bound) vs iChannel1 proxy (Image).
+    # iChannelResolution[3].x > 0 when ch3 is wired (Sound, Buffer A).
+    # iChannelResolution[3].x == 0 when ch3 is absent (Image) → use iChannel1 proxy.
+    # Same block injected into every per-pass tab; no special-casing needed.
+    _getbyte_unified = (
+        "// Strip Common's macro stubs so the real function definitions below win.\n"
+        "#undef fetchPixel\n#undef _pngOk\n"
+        f"#define PNG_PROXY_ROW {_PNG_PROXY_ROW}\n"
         "#ifndef MUL1\n#define MUL1 255.0\n#endif\n"
-        "// One texelFetch = one RGBA pixel = 4 data bytes (r=MSB .. a=LSB).\n"
-        "int fetchPixel(int pi) {\n"
-        "    vec4 p = texelFetch(iChannel0, ivec2(pi & 1023, pi >> 10), 0);\n"
-        "    return (int(p.r*MUL1+0.5)<<24)|(int(p.g*MUL1+0.5)<<16)|(int(p.b*MUL1+0.5)<<8)|int(p.a*MUL1+0.5);\n"
+        "// fetchPixel: iChannel3 if bound (Sound/BufferA), iChannel1 proxy (Image).\n"
+        "// Single-pixel int cache (r,g,b,a each 0..255 packed into one 32-bit int).\n"
+        "int _fp_grp=-1; int _fp_c;\n"
+        "int fetchPixel(int pi){\n"
+        "    if(pi!=_fp_grp){\n"
+        "        _fp_grp=pi;\n"
+        "        vec4 _p0;\n"
+        "        if(int(iChannelResolution[3].x)>0){\n"
+        "            _p0=texelFetch(iChannel3,ivec2(pi&1023,pi>>10),0);\n"
+        "        } else {\n"
+        "            _p0=texelFetch(iChannel1,ivec2(pi&1023,PNG_PROXY_ROW+(pi>>10)),0);\n"
+        "        }\n"
+        "        _fp_c=(int(_p0.r*MUL1+.5)<<24)|(int(_p0.g*MUL1+.5)<<16)|(int(_p0.b*MUL1+.5)<<8)|int(_p0.a*MUL1+.5);\n"
+        "    }\n"
+        "    return _fp_c;\n"
         "}\n"
-        "// One data byte (the +4 skips the 4-byte magic). One texelFetch.\n"
-        "int getByte(int byteIndex) {\n"
-        "    int ai = byteIndex + 4;\n"
-        "    return (fetchPixel(ai >> 2) >> (24 - (ai & 3) * 8)) & 0xFF;\n"
-        "}\n"
-        "// Four consecutive data bytes, little-endian, in <=2 texelFetches.\n"
-        "int getU32(int b) {\n"
-        "    int ai = b + 4; int pi = ai >> 2; int pos = ai & 3;\n"
-        "    int w0 = fetchPixel(pi);\n"
-        "    if (pos == 0) return ((w0>>24)&0xFF)|(((w0>>16)&0xFF)<<8)|(((w0>>8)&0xFF)<<16)|((w0&0xFF)<<24);\n"
-        "    int w1 = fetchPixel(pi + 1);\n"
-        "    int q[8];\n"
-        "    q[0]=(w0>>24)&0xFF; q[1]=(w0>>16)&0xFF; q[2]=(w0>>8)&0xFF; q[3]=w0&0xFF;\n"
-        "    q[4]=(w1>>24)&0xFF; q[5]=(w1>>16)&0xFF; q[6]=(w1>>8)&0xFF; q[7]=w1&0xFF;\n"
-        "    return q[pos] | (q[pos+1]<<8) | (q[pos+2]<<16) | (q[pos+3]<<24);\n"
-        "}\n")
+        "bool _pngOk(){return fetchPixel(0)==((77<<24)|(79<<16)|(68<<8));}\n"
+    )
+    # Forward declarations for Common: getByte/getU32/_getSMP call fetchPixel, which
+    # is implemented per-pass.  GLSL ES allows forward declarations; the definition
+    # provided by each pass satisfies the prototype.
+    # Forward declarations in Common — per-pass implementations injected into each tab.
+    # Common tab is validated standalone by ShaderToy and will show "undefined function"
+    # for fetchPixel there, but that is cosmetic: the actual per-pass compilation
+    # (Common + tab code) succeeds because each tab provides a concrete implementation.
+    # CASCADING MACROS: fetchPixel/_pngOk are macro stubs in Common. Every helper
+    # that touches them is ALSO a macro, so calls expand at the per-pass call site
+    # where the real `int fetchPixel(int pi)` function exists (after #undef).
+    # Common standalone validation sees only macro expansions terminating at the
+    # stubs — no undefined-function errors. Functions in Common bodies that touch
+    # these macros would bake to stub values at parse time, so anything calling
+    # the chain MUST be a macro itself (no function bodies in Common that use them).
+    _protos = (
+        "// fetchPixel/_pngOk: macro stubs for Common standalone validation.\n"
+        "// Per-pass tabs #undef them and provide real function implementations.\n"
+        "#define fetchPixel(pi) 0\n"
+        "#define _pngOk() false\n"
+    )
+    getbyte = (
+        "// PNG data accessors — all macros so calls cascade-resolve fetchPixel\n"
+        "// at the per-pass call site (where real fetchPixel function exists).\n"
+        "#define getByte(byteIndex) (((fetchPixel(((byteIndex)+4)>>2) >> (24-((((byteIndex)+4)&3)<<3))) & 0xFF))\n"
+        "// 4 bytes little-endian — 4× getByte; single-pixel int cache amortizes to 1-2 texelFetches.\n"
+        "#define getU32(b) ((getByte(b)) | (getByte((b)+1)<<8) | (getByte((b)+2)<<16) | (getByte((b)+3)<<24))\n"
+        "// PNG header/metadata readers (big-endian int32 / uint16).\n"
+        "#define _pI32(b) ((getByte(b)<<24) | (getByte((b)+1)<<16) | (getByte((b)+2)<<8) | getByte((b)+3))\n"
+        "#define _pU16(b) ((getByte(b)<<8) | getByte((b)+1))\n")
+
+    # Accessor functions for metadata sections: SampleInfo + position arrays.
+    # Section offsets are read from the PNG header at runtime (TOC pattern):
+    #   header byte 16 = SAMPLEINFO section offset  (_pI32(16))
+    #   header byte 20 = SONGPOS section offset      (_pI32(20))
+    #   header byte 24 = PATROWOFF section offset    (_pI32(24))
+    #   header byte 28 = PATSTARTROW section offset  (_pI32(28))
+    #   header byte 32 = PATTICKOFF section offset   (_pI32(32))
+    # Each function reads its section base from the header once per call — O(1)
+    # texelFetch overhead (~4 extra per call), acceptable since these are called
+    # at most once per tick (not per sample). This makes the GLSL song-generic.
+    if _smpfields and '_sampleInfo' in off:
+        # PNG path: read SampleInfo fields from PNG blob via fetchPixel.
+        _n_smp_bytes = len(_smpfields) * 4
+        _fld_lines = "\n".join(
+            f"    _s.{fn}=_pI32(_b+{i*4});" for i, fn in enumerate(_smpfields))
+        getbyte += (
+            f"SampleInfo _getSMP(int _si){{\n"
+            f"    int _b=fetchPixel(5)+_si*{_n_smp_bytes};\n"
+            f"    SampleInfo _s;\n"
+            f"{_fld_lines}\n"
+            f"    return _s;}}\n")
+    # Const-array path: samples[] stays in Common, used directly — no _getSMP wrapper needed.
+    if 'songPositions' in off:
+        getbyte += "#define _gSPos(_i) (_pI32(fetchPixel(6)+(_i)*4))\n"
+    if 'patRowOffset' in off:
+        getbyte += "#define _gPRowOff(_i) (_pI32(fetchPixel(7)+(_i)*4))\n"
+    if 'patStartRow' in off:
+        getbyte += "#define _gPSRow(_i) (_pI32(fetchPixel(8)+(_i)*4))\n"
+    if 'patTickOffset' in off:
+        getbyte += "#define _gPTickOff(_i) (_pI32(fetchPixel(9)+(_i)*4))\n"
 
     # 5. Map each byte-fetcher to its logical array, and rewrite its body.
     fmap = {'fetchDictByte': 'patDict', 'fetchBitmapByte': 'patBitmap',
@@ -10845,37 +11335,215 @@ def _pack_build_into_png(common_path, sound_path, png_path):
                 continue
             src = _re.sub(
                 rf'int {fn}\(int (\w+)\)\s*\{{.*?\n\}}',
-                lambda mm, fn=fn, lg=lg: f'int {fn}(int {mm.group(1)}) {{ return getByte({_defname(lg)} + {mm.group(1)}); }}',
+                lambda mm, fn=fn, lg=lg: f'#define {fn}(byteIdx) (getByte({_defname(lg)} + (byteIdx)))',
                 src, count=1, flags=_re.S)
-        # fetchTick: 16-bit little-endian read from rowStartTick.
+        # fetchTick: 16-bit little-endian read from rowStartTick. Macro form so
+        # the cascading getByte→fetchPixel resolves at the per-pass call site.
         if 'rowStartTick' in off:
             src = _re.sub(
                 r'int fetchTick\(int (\w+)\)\s*\{.*?\n\}',
-                lambda mm: (f'int fetchTick(int {mm.group(1)}) {{ int _b = {mm.group(1)} * 2; '
-                            f'return getByte(ROWSTARTTICK_PNG_OFF + _b) | '
-                            f'(getByte(ROWSTARTTICK_PNG_OFF + _b + 1) << 8); }}'),
+                lambda mm: ('#define fetchTick(rowIdx) (getByte(ROWSTARTTICK_PNG_OFF + (rowIdx)*2) | '
+                            '(getByte(ROWSTARTTICK_PNG_OFF + (rowIdx)*2 + 1) << 8))'),
                 src, count=1, flags=_re.S)
         return src
 
-    common = _rewrite_fetchers(common)
-    sound  = _rewrite_fetchers(sound)
+    # 6. Strip the now-dead const arrays from both tabs.
+    #    CRITICAL ORDER: strip declarations BEFORE rewriting array accesses, so that
+    #    e.g. `songPositions[88]` in `const int songPositions[88] = int[](...);`
+    #    doesn't get turned into `_gSPos(88)` before the declaration can be removed.
 
-    # 6. Strip the now-dead const arrays from both tabs (ONLY the known data ones).
+    # 6a. Strip `const ivec4` arrays that moved to PNG (rowStartTick, VQ data, patterns).
     def _strip_known(src):
         return _decl_re.sub(lambda m: '' if _logical(m.group(1)) in _KNOWN else m.group(0), src)
     common = _strip_known(common)
     sound  = _strip_known(sound)
 
-    # 7. Inject getByte + offset defines into Common (once), flip USE_EMBEDDED_DATA.
-    if 'int getByte(' not in common:
-        common = common.replace('int _extractByte(',
-                                defines + getbyte + '\nint _extractByte(', 1)
+    # 6b. Strip `const int NAME[N] = int[](...);` arrays moved to PNG.
+    if _int_arrays:
+        _names_pat = '|'.join(_re.escape(n) for n in _int_arrays)
+        _int_strip_re = _re.compile(
+            rf'[ \t]*const int\s+(?:{_names_pat})\[\d+\]\s*=\s*int\[\]\(.*?\);\s*\n?',
+            _re.S | _re.M)
+        common = _int_strip_re.sub('', common)
+        sound  = _int_strip_re.sub('', sound)
+
+    # 6c. Strip `const SampleInfo samples[N] = SampleInfo[](...);` instantiation
+    # ONLY when _sampleInfo was packed into PNG (accessor _getSMP replaces it).
+    # If _sampleInfo stays as a const array, keep the instantiation in place.
+    if _smp_data and '_sampleInfo' in off:
+        _smpinst_strip = _re.compile(
+            r'[ \t]*const SampleInfo samples\[\d+\]\s*=\s*SampleInfo\[\]\(.*?\);\s*\n?',
+            _re.S)
+        common = _smpinst_strip.sub('', common)
+        sound  = _smpinst_strip.sub('', sound)
+
+    # 6d. Now that declarations are gone, rewrite function-body fetchers.
+    common = _rewrite_fetchers(common)
+    sound  = _rewrite_fetchers(sound)
+
+    # 6e. Rewrite array ACCESSES to accessor function calls.
+    #     Declarations already stripped above, so only genuine access sites remain.
+    def _rewrite_accesses(src):
+        if '_sampleInfo' in off:
+            src = _re.sub(r'\bsamples\[([^\]]+)\]', r'_getSMP(\1)', src)
+        if 'songPositions' in off:
+            src = _re.sub(r'\bsongPositions\[([^\]]+)\]', r'_gSPos(\1)', src)
+        if 'patRowOffset' in off:
+            src = _re.sub(r'\bpatRowOffset\[([^\]]+)\]', r'_gPRowOff(\1)', src)
+        if 'patStartRow' in off:
+            src = _re.sub(r'\bpatStartRow\[([^\]]+)\]', r'_gPSRow(\1)', src)
+        if 'patTickOffset' in off:
+            src = _re.sub(r'\bpatTickOffset\[([^\]]+)\]', r'_gPTickOff(\1)', src)
+        return src
+    common = _rewrite_accesses(common)
+    sound  = _rewrite_accesses(sound)
+    # PNG_SONG_SAMPS: full-song sample count computed once here, used both in the
+    # image-tab iTime loop patch below and in the Sound modulo + defines injection.
+    # Match GLSL's own TICKS_PER_SEC = SR/((125*SR)//(50*BPM)), so samples_per_tick
+    # = (125*SR)//(50*BPM). SPEED is already baked into TOTAL_TICKS (tick count).
+    _png_song_samps = (((125 * 44100) // (50 * _bpm_val)) * _total_ticks_val
+                       if (_total_ticks_val > 0 and _bpm_val > 0) else 0)
+
+    # Also rewrite Buffer A and Image: they reference samples[], patTickOffset[],
+    # patStartRow[] etc. from Common, but Common's declarations were stripped.
+    # Common now exposes _getSMP()/_gPTickOff() etc. — rewrite the access sites.
+    import os as _os
+    for _extra_path in (bufferA_path, image_path):
+        if _extra_path and _os.path.exists(_extra_path):
+            _src = open(_extra_path).read()
+            _src = _rewrite_accesses(_src)
+            if _extra_path in (image_path, bufferA_path) and _png_song_samps > 0:
+                # PNG mode: loop the visual display instead of clamping at song end.
+                # Same as Sound's play_samp %= PNG_SONG_SAMPS — all three passes
+                # terminate/loop at the song boundary.  Use a literal float seconds
+                # value — SAMP_PER_SEC is a local in mainSound(), not a global.
+                _src = _re.sub(
+                    r'#define iTime clamp\(iTime\s*-\s*INTRO_SILENCE_S,\s*0\.0,\s*SONG_DURATION_S\)',
+                    '#define iTime mod(max(iTime - INTRO_SILENCE_S, 0.0), '
+                    f'{_png_song_samps / 44100.0})',
+                    _src)
+            if _extra_path == bufferA_path:
+                # ── Buffer A: _pngOk guard + PNG proxy write ──────────────────────
+                if 'int fetchPixel(' not in _src:
+                    _src = ("#undef fetchPixel\n#undef _pngOk\n"
+                            f"#define PNG_PROXY_ROW {_PNG_PROXY_ROW}\n"
+                            + _getbyte_direct + _pat_funcs_src + _src)
+                # Guard: if iChannel3 isn't a valid PNG (e.g. first frames), skip
+                # all computation.  Placed right after the iFrame<16 splash skip.
+                _src = _src.replace(
+                    'if (iFrame < 16) return;',
+                    'if (iFrame < 16) return;\n    if (!_pngOk()) { O = vec4(0.0); return; }',
+                    1)
+                # PNG proxy write: relay iChannel3 rows to Image via Buffer A framebuffer.
+                # Image's fetchPixel reads iChannel1 at row PNG_PROXY_ROW+(pix>>10).
+                _src = _src.replace(
+                    'if (!_pngOk()) { O = vec4(0.0); return; }',
+                    'if (!_pngOk()) { O = vec4(0.0); return; }\n'
+                    '    // PNG proxy: relay PNG rows to Image tab via Buffer A output\n'
+                    '    if (py >= PNG_PROXY_ROW && px < 1024) {\n'
+                    '        O = texelFetch(iChannel3, ivec2(px, py - PNG_PROXY_ROW), 0);\n'
+                    '        return;\n'
+                    '    }',
+                    1)
+            if _extra_path == image_path:
+                # ── Image: fetchPixel via iChannel1 Buffer A proxy ─────
+                if 'int fetchPixel(' not in _src:
+                    _src = ("#undef fetchPixel\n#undef _pngOk\n"
+                            + _getbyte_proxy + _pat_funcs_src + _src)
+                # Guard: if PNG not ready yet, skip.
+                _src = _src.replace(
+                    '    Position pos = getPosition(iTime);',
+                    '    if (!_pngOk()) { O = vec4(0.0); return; }\n'
+                    '    Position pos = getPosition(iTime);',
+                    1)
+            open(_extra_path, 'w').write(_src)
+
+    # TOTAL_TICKS stays as the song's literal value (not fetchPixel(1)) under the
+    # cascading-macro architecture. If TOTAL_TICKS expanded to fetchPixel(1) at
+    # Common parse time, the fetchPixel macro stub (= 0) would bake getPosition's
+    # `float songDuration = float(TOTAL_TICKS) / TICKS_PER_SEC` to 0, producing
+    # NaN from mod(time, 0) and a blank screen + silent audio. Keeping the literal
+    # means this build is single-song (swapping the PNG doesn't change TOTAL_TICKS),
+    # which is the typical case for embedded shaders. The fetchPixel(1) header
+    # slot is unused in this mode (harmless).
+
+    # PNG_SONG_SAMPS: compile-time sample count for the full song (no texelFetches).
+    # ShaderToy pre-renders ALL 7.9M samples (180s×44100Hz) at startup. Without a
+    # termination guard the silent tail still runs expensive texelFetches for every
+    # sample past song end, causing a hang. Solution: loop the song with a fast
+    # compile-time modulo — zero texelFetches in the tail, plays continuously.
+    if _png_song_samps > 0:
+        defines += f"#define PNG_SONG_SAMPS      {_png_song_samps}\n"
+        # Replace the SONG_DURATION_SAMPS termination block with a fast modulo loop.
+        sound = _re.sub(
+            r'[ \t]*// Clamp to song duration.*?'
+            r'if \(play_samp >= SONG_DURATION_SAMPS\) return vec2\(0\.0\);\n',
+            '    play_samp %= PNG_SONG_SAMPS;\n',
+            sound, count=1, flags=_re.S)
+
+    # 7. Inject getByte + offset defines, flip USE_EMBEDDED_DATA.
+    #    If pattern arrays are in PNG (or any metadata section): getByte must live
+    #    in COMMON so that all 3 ShaderToy passes (Image, BufferA, Sound) can call
+    #    fetch functions and the new accessor functions, which are defined in Common.
+    #    ShaderToy prepends Common to every pass, so getByte in Common is
+    #    automatically available in Sound — no separate Sound injection needed.
+    #    If ONLY VQ data is in PNG: inject into Sound only (Image/BufferA don't
+    #    call getByte).
+    _has_pat_in_png = any(k in off for k in ('patBitmap', 'patDict', 'patIdx', 'patRowSeek',
+                                              '_sampleInfo', 'songPositions', 'rowStartTick'))
+    if _has_pat_in_png:
+        # Inject into Common — before the first pattern fetch function or accessor.
+        # Common gets forward declarations for fetchPixel/pngOk (per-pass impls satisfy them)
+        # plus getByte/getU32 etc. which call fetchPixel through the prototype.
+        if '#define getByte(' not in common:
+            _anchor_re_c = _re.compile(
+                r'int (?:fetchDictByte|fetchBitmapByte|fetchIdxByte|fetchRowSeekByte|'
+                r'fetchTick|fetchTickRaw)\(')
+            _mc = _anchor_re_c.search(common)
+            if _mc:
+                common = common[:_mc.start()] + defines + _protos + getbyte + '\n' + common[_mc.start():]
+            else:
+                common = defines + _protos + getbyte + '\n' + common
+        # Sound inherits defines+getByte from Common but needs its own fetchPixel impl.
+        if 'int fetchPixel(' not in sound:
+            sound = ("#undef fetchPixel\n#undef _pngOk\n"
+                     + _getbyte_direct + _pat_funcs_src + sound)
+    else:
+        # Only VQ in PNG: inject into Sound only (Image/BufferA don't call getByte).
+        # No prototype needed — _getbyte_direct impl comes immediately before getByte.
+        if '#define getByte(' not in sound:
+            _anchor_re = _re.compile(r'(int (?:fetchCodesByte|fetchCodebookByte)\(|void mainSound\()')
+            _m = _anchor_re.search(sound)
+            if _m:
+                _insert_at = _m.start()
+                sound = sound[:_insert_at] + defines + _getbyte_unified + getbyte + '\n' + sound[_insert_at:]
+            else:
+                sound = defines + _getbyte_unified + getbyte + '\n' + sound
     common = _re.sub(r'#define\s+USE_EMBEDDED_DATA\s+\d+', '#define USE_EMBEDDED_DATA 0', common)
     sound  = _re.sub(r'#define\s+USE_EMBEDDED_DATA\s+\d+', '#define USE_EMBEDDED_DATA 0', sound)
 
+    # Inject PNG magic guard at the very top of mainSound() — one texelFetch per
+    # sample (cheap) instead of one per getByte call. Returns silence immediately
+    # when iChannel3 is not the real PNG (wrong texture, Buffer B self-loopback
+    # zeros, or texture not yet uploaded).
+    sound = _re.sub(
+        r'(vec2 mainSound\(\s*int\s+\w+\s*,\s*float\s+\w+\s*\)\s*\{)',
+        r'\1\n    if (!_pngOk()) return vec2(0.0);',
+        sound, count=1)
+
+    # Remove the 180s buffer-cap fade-out — PNG builds stream continuously,
+    # there is no pre-allocated 180s buffer to fade against.
+    sound = _re.sub(
+        r'    // ── Buffer-end fade-out ─+.*?outR \*= _bufFade;\n',
+        '',
+        sound, count=1, flags=_re.S)
+
     open(common_path, 'w').write(common)
     open(sound_path, 'w').write(sound)
-    return len(data), off
+    # Return (data_bytes, offsets_dict, patterns_in_png).
+    # patterns_in_png=True means Common now calls getByte(iChannel3) for pattern
+    # decode — all 3 ShaderToy render passes need iChannel3 wired.
+    return len(data), off, _has_pat_in_png
 
 
 def _emit_html_player(mod, html_file, downsample, vec_dim):
@@ -10915,10 +11583,14 @@ def _emit_html_player(mod, html_file, downsample, vec_dim):
                 _html_src = _html_src[:_isp] + _autoplay_js + _html_src[_isp:]
                 with open(html_file, 'w') as _hf:
                     _hf.write(_html_src)
-                print("   ✓ autoplay injected (starts on load; falls back to first interaction)")
+                _q("   ✓ autoplay injected (starts on load; falls back to first interaction)")
     except Exception as _e:
         print(f"   ✗ autoplay injection skipped: {_e}")
 
+
+def _q(*a, **k):
+    """Silenced verbose patch log; set NOISY=1 in env to restore."""
+    pass
 
 def main():
     import argparse
@@ -10932,7 +11604,7 @@ def main():
         epilog=(
             "Examples:\n"
             "  # Standard ShaderToy build — embedded, no DSP, fits most GPUs:\n"
-            "  python3 mod_player.py SONG.S3M --no-dsp --downsample 2\n\n"
+            "  python3 mod_player.py SONG.S3M --no-dsp\n\n"
             "  # Full-rate, highest quality (may exceed a tight GPU's limit):\n"
             "  python3 mod_player.py SONG.S3M --no-dsp --bitrate hi\n\n"
             "  # Audition only order positions 35-36 (speed carried over from earlier):\n"
@@ -10946,14 +11618,14 @@ def main():
         sys.stderr.write(f"\n❌  {message}\n\n")
         _p.print_usage(sys.stderr)
         sys.stderr.write(
-            "\n  Example:   python3 mod_player.py SONG.S3M --no-dsp --downsample 2\n"
+            "\n  Example:   python3 mod_player.py SONG.S3M --no-dsp\n"
             "  Full help: python3 mod_player.py --help\n\n")
         sys.exit(2)
     parser.error = _friendly_argerror
     parser.add_argument('modfile', help='MOD/S3M/IT file to play')
-    parser.add_argument('--downsample', type=int, default=2,
+    parser.add_argument('--downsample', type=int, default=1,
                         help='Sample decimation factor: 1=full-rate, 2=22kHz, 4=11kHz. '
-                             '(DEFAULT 2.) '
+                             '(DEFAULT 1.) '
                              'HF percussion (cymbals/rides) gets max(1,DS//2) to keep shimmer.')
     parser.add_argument('--bitrate', choices=['lo','med','hi','ultra'], default='hi',
                         help='RVQ codebook size (mp3-style quality knob). '
@@ -10991,12 +11663,12 @@ def main():
             iv = int(v)
         except (TypeError, ValueError):
             iv = None
-        if iv is None or not (0 <= iv <= 19):
+        if iv is None or not (0 <= iv <= 20):
             raise argparse.ArgumentTypeError(
-                "invalid choice: %r (choose from [0..19], 0=sun rays backdrop)" % v)
+                "invalid choice: %r (choose from [0..20], 0=sun rays backdrop)" % v)
         return iv
-    parser.add_argument('--viz', type=_viz_arg, default=6, metavar='[0..19]',
-                        help='Image-tab visualizer (choose from [0..19]):\n'
+    parser.add_argument('--viz', type=_viz_arg, default=6, metavar='[0..20]',
+                        help='Image-tab visualizer (choose from [0..20]):\n'
                              '  0 = Sun Rays          (cabbibo-style — warm/cool god-ray corona)\n'
                              '  1 = Reactive 001     (PAEz fork — SDF circles + cosmic web)  ← default\n'
                              '  2 = Fluxline Surfer  (mrange — DR2 dodecahedron + glowtracer)\n'
@@ -11090,6 +11762,18 @@ def main():
     # no overflow and the next part picks up exactly where this one ended.
     parser.add_argument('--cap-strict', dest='cap_strict', action='store_true',
                         default=False, help=argparse.SUPPRESS)
+    parser.add_argument('--size-budget-kb', dest='size_budget_kb', type=int, default=500,
+                        metavar='KB',
+                        help='ANGLE/ShaderToy data budget per part, in KB total '
+                             '(common+sound .glsl files combined; default: 500). '
+                             'Auto-split retries if a part exceeds this. Use 0 to disable. '
+                             'Reference fits: 2ND_PM common 130 + sound 302 ≈ 432KB ✓; '
+                             'skyscraper per-pos common 20 + sound 439 ≈ 459KB ✓. '
+                             'ANGLE\'s actual private-var limit is per-GPU; this is a soft '
+                             'proxy. Lower = more aggressive splits.')
+    # Deprecated alias: --elem-budget (const array element count). Hidden but accepted.
+    parser.add_argument('--elem-budget', dest='_legacy_elem_budget', type=int, default=None,
+                        help=argparse.SUPPRESS)
     # Internal: skip HTML-player generation. Set by the auto-split driver on the
     # per-part GLSL children so ONLY the parent emits a single full-song HTML
     # player (the HTML player has no 180s limit, so one file covers the whole
@@ -11178,7 +11862,7 @@ def main():
     parser.add_argument('--no-dsp', dest='no_dsp', action='store_true', default=False,
                         help="MASTER SWITCH: disable ALL DSP effect processing in the output "
                              "shaders (3D surround, FAT4X exciter, PhatBass; velvet/comb reverb "
-                             "are already off in v1.63). Forces ENABLE_3D/FAT/PHATBASS/"
+                             "are already off in v1.666). Forces ENABLE_3D/FAT/PHATBASS/"
                              "VELVETREVERB/COMBREVERB = 0 and WINS over any individual "
                              "--surround/--phatbass/--fat4x passed alongside it. This is the "
                              "lightest Sound-tab path (no DSP private-vars) → best chance of "
@@ -11191,7 +11875,7 @@ def main():
                              "resolution but slower compile. Default: 1024 (or 128 if "
                              "--max-compat without override).")
     parser.add_argument('--max-compat', action='store_true', default=False,
-                        help='[NO-OP — max-compat is now the DEFAULT in v1.40+ (current: v1.63)] '
+                        help='[NO-OP — max-compat is now the DEFAULT in v1.40+ (current: v1.666)] '
                              'This flag previously enabled compatibility mode '
                              'for problematic GPUs/drivers (Windows + Firefox + '
                              'NVIDIA, etc.). The compat preset (--resampler '
@@ -11210,6 +11894,16 @@ def main():
         parser.print_help()
         sys.exit(0)
     args = parser.parse_args()
+
+    # PNG mode FORCES ultra bitrate — no const-array size pressure, use best
+    # quality always. Overrides any explicit --bitrate flag the user passed.
+    # Also forces --no-raw-perc: the raw _presvPCM[] const array (~21KB) +
+    # raw-decode branch in getSampleF inflate Sound's ANGLE private-var budget,
+    # which kills high-channel XM files (e.g. maxmlism.xm @ 30ch) before they
+    # even load. Drops a little drum crispness; trades for build that runs.
+    if args.use_png:
+        args.bitrate = 'ultra'
+        args.raw_perc = False
 
     # args.emit_json defaults True; pass --no-json to suppress JSON output.
 
@@ -11512,7 +12206,7 @@ def main():
             mod.song_positions = _new_ord
             mod.orders         = _new_ord
             mod.song_length    = len(_new_ord)
-            print(f"   ✓ Variable-row split: {_n_split} >64-row patterns → "
+            _q(f"   ✓ Variable-row split: {_n_split} >64-row patterns → "
                   f"{len(_new_pats)} sub-patterns, order {len(_old_ord)}→"
                   f"{len(_new_ord)}, {_n_brk} synthetic breaks"
                   + (f", ⚠{_n_bd} mid-pattern B/D in long patterns (split "
@@ -11539,7 +12233,7 @@ def main():
                   if isinstance(s, dict) and s.get('env_pts'))
         _nc5 = sum(1 for s in it.samples
                    if isinstance(s, dict) and (s.get('c5_speed') or 8363) != 8363)
-        print(f"   ✓ MOD+ pattern-player path (no timeline). "
+        _q(f"   ✓ MOD+ pattern-player path (no timeline). "
               f"{_ie} samples carry a vol/pan envelope; {_nc5} carry a "
               f"non-8363 c5_speed → c2sp pitch rate-scale.")
     elif fmt == 'XM':
@@ -11583,7 +12277,7 @@ def main():
         mod._it_timeline_tps  = None
         _ie_xm = sum(1 for s in xm.samples
                      if isinstance(s, dict) and s.get('env_pts'))
-        print(f"   ✓ MOD+ pattern-player path (no timeline). "
+        _q(f"   ✓ MOD+ pattern-player path (no timeline). "
               f"{_ie_xm} instruments carry a vol envelope.")
     elif fmt in ('STM', 'MTM'):
         raise ValueError(
@@ -11698,17 +12392,78 @@ def main():
                 if any((_c.get('command') in (2, 3)) or (_c.get('effect') in (0xB, 0xD))
                        for _c in _row):
                     break
-        if _last >= 1 and (_start_pos is not None or _total > 180.0):
-            # Pass-through argv: drop --start/--positions/--output-base (+values).
+        # ── ANGLE / ShaderToy size budget ──────────────────────────────────────
+        # The user-facing knob is now KB (default 200 = total Common+Sound .glsl
+        # combined). Empirically from build logs:
+        #   2ND_PM.S3M (embedded, fits): common ≈ 130KB + sound ≈ 302KB ≈ 432KB
+        #   skyscraper (embedded, fits): similar
+        # ANGLE's per-shader private-var limit roughly correlates with this total.
+        # We over-estimate (conservative bw_factor=4) so the pre-split estimate
+        # over-counts → fewer retries needed.
+        #
+        # Legacy: --elem-budget 12000 ≈ --size-budget-kb 200 (rough 1KB ≈ 60 elems
+        # for ivec4-packed const arrays). If user passed --elem-budget, convert.
+        _size_budget_kb = getattr(args, 'size_budget_kb', 200) or 200
+        _legacy_eb = getattr(args, '_legacy_elem_budget', None)
+        if _legacy_eb is not None:
+            # Old elem-count → rough KB conversion (1 ivec4 const elem ≈ 16 bytes
+            # source + comma/whitespace ≈ 20 bytes; 12000 elems ≈ 240KB raw text,
+            # but the relevant compiled size is lower → use ÷60 factor).
+            _size_budget_kb = max(20, _legacy_eb // 60)
+            print(f"   ⚠️  --elem-budget {_legacy_eb} is deprecated; "
+                  f"using --size-budget-kb {_size_budget_kb} instead")
+        _dsf_est  = getattr(args, 'downsample', 1) or 1
+        _vdim_est = getattr(args, 'vec_dim', 2) or 2
+        _avg_bwf  = 4   # conservative: actual bw_compress_sample factor ≥ 4 for most samples
+        _smps_est = getattr(mod, 'samples', None) or []
+        # Fixed shader-code overhead (Sound tab synthesis + Common tab decoder/struct
+        # decls + pattern RLE). Measured empirically: skyscraper sound ≈ 420KB
+        # baseline regardless of sample count. NB: this is a per-build constant
+        # — splitting doesn't shrink it (each part carries the full shader code).
+        _FIXED_OVERHEAD_KB = 420
+        def _est_kb_for_sampset(_sset):
+            """Estimate KB for Common+Sound .glsl total when only these sample
+            indices (0-based) carry data. Used to pre-pick split points."""
+            _raw_bytes = 0
+            for _si in _sset:
+                if 0 <= _si < len(_smps_est):
+                    _smp = _smps_est[_si]
+                    _raw = (_smp.get('data') if isinstance(_smp, dict)
+                            else getattr(_smp, 'data', None))
+                    _raw_bytes += len(_raw) if _raw is not None else 0
+            # Sample bytes after bw + downsample compression (VQ is per-vec_dim
+            # group + 17 bits/vec packed in 4×4-bit nibbles → ~5 GLSL chars each).
+            # Empirically: 558,912 raw → 83KB packed → ~170KB GLSL text for skyscraper.
+            # Rough conversion: raw_bytes / (bwf*dsf*vdim) × 5 chars / 1024 KB.
+            _samp_kb = (_raw_bytes // (_avg_bwf * _dsf_est * _vdim_est)) * 5 // 1024
+            return _samp_kb + _FIXED_OVERHEAD_KB
+        # Full-song estimate (all samples with data)
+        _all_samps_with_data = set(
+            _si for _si, _smp in enumerate(_smps_est)
+            if ((_smp.get('data') if isinstance(_smp, dict) else
+                 getattr(_smp, 'data', None)) is not None))
+        _est_full_kb = _est_kb_for_sampset(_all_samps_with_data)
+        _est_over_budget = (not getattr(args, 'use_png', False) and
+                            _size_budget_kb > 0 and
+                            _est_full_kb > _size_budget_kb)
+        if _last >= 1 and (_start_pos is not None or _total > 180.0 or _est_over_budget):
+            # Pass-through argv: drop --start/--positions/--output-base/--elem-budget
+            # (+values). Children get the resolved --size-budget-kb instead, so the
+            # deprecation warning fires once (in the parent) instead of per-child.
             _passthru = []; _skip = False
             for _tok in list(sys.argv[1:]):
                 if _skip: _skip = False; continue
-                if _tok in ('--start', '--positions', '--output-base'):
+                if _tok in ('--start', '--positions', '--output-base',
+                            '--elem-budget', '--size-budget-kb'):
                     _skip = True; continue
                 if any(_tok.startswith(_pre + '=') for _pre in
-                       ('--start', '--positions', '--output-base')):
+                       ('--start', '--positions', '--output-base',
+                        '--elem-budget', '--size-budget-kb')):
                     continue
                 _passthru.append(_tok)
+            # Inject resolved --size-budget-kb so children skip the auto-split
+            # branch (their budget covers only their own slice; never re-splits).
+            _passthru += ['--size-budget-kb', '0']
 
             def _emit_part(_K, _A, _B):
                 # Render positions _A.._B as its own bundle, then rename to
@@ -11742,6 +12497,51 @@ def main():
                     else:
                         _dst = f"{_base}_shadertoy_part{_K}" + _rest
                     os.replace(_src, _dst)
+                # ── ANGLE/ShaderToy size-budget check (non-PNG only) ─────────
+                # Measure ACTUAL Common+Sound .glsl bytes after the child build,
+                # compare against --size-budget-kb, retry with fewer positions
+                # if over. The child has already shed exclusive-to-dropped-pattern
+                # samples (via _trim_song_to_audio_cap's drop-unused-instruments
+                # pass), so the measurement reflects the part's true cost.
+                if not getattr(args, 'use_png', False) and _size_budget_kb > 0:
+                    _common_f = f"{_base}_shadertoy_part{_K}_common.glsl"
+                    _sound_f  = f"{_base}_shadertoy_part{_K}_sound.glsl"
+                    _cb = os.path.getsize(_common_f) if os.path.exists(_common_f) else 0
+                    _sb = os.path.getsize(_sound_f)  if os.path.exists(_sound_f)  else 0
+                    _total_kb = (_cb + _sb) // 1024
+                    _over = _total_kb > _size_budget_kb
+                    _can_shrink = (_kept is not None and _kept > 1 and _B > _A)
+                    if _over and _can_shrink:
+                        # Reduce position range proportionally + 15% safety margin.
+                        # Subtract fixed overhead from both sides since shrinking
+                        # positions only reduces the variable sample-data portion.
+                        _var_kb = max(1, _total_kb - _FIXED_OVERHEAD_KB)
+                        _var_budget = max(1, _size_budget_kb - _FIXED_OVERHEAD_KB)
+                        _ratio = (_var_budget / _var_kb) * 0.85
+                        _new_B = _A + max(0, int((_B - _A) * _ratio))
+                        if _new_B < _B:
+                            print(f"   ⚠️  part {_K}: {_total_kb}KB (common {_cb//1024}+sound {_sb//1024}) "
+                                  f"> {_size_budget_kb}KB budget → retry positions {_A}–{_new_B} "
+                                  f"(was {_A}–{_B})")
+                            # Remove the oversized output before retry
+                            import glob as _gl2
+                            for _sf3 in _gl2.glob(f"{_base}_shadertoy_part{_K}_*") + \
+                                         [f"{_base}_shadertoy_part{_K}.json"]:
+                                try: os.remove(_sf3)
+                                except Exception: pass
+                            return _emit_part(_K, _A, _new_B)
+                    elif _over and not _can_shrink:
+                        # Single position already; can't split further. The shader
+                        # code overhead is roughly fixed (~420KB), so if budget is
+                        # below that floor, NO part will ever fit. Tell user clearly.
+                        print(f"   ⚠️  part {_K}: {_total_kb}KB (common {_cb//1024}+sound {_sb//1024}) "
+                              f"> {_size_budget_kb}KB budget — already 1 position, "
+                              f"can't shrink further. Fixed shader overhead is ~{_FIXED_OVERHEAD_KB}KB; "
+                              f"raise --size-budget-kb above that, or disable DSP features "
+                              f"(--no-surround --no-phatbass --no-fat4x) to shrink the Sound tab.")
+                    elif _total_kb > 0:
+                        _q(f"   ✓ part {_K}: {_total_kb}KB (common {_cb//1024}+sound {_sb//1024}) "
+                              f"≤ {_size_budget_kb}KB budget")
                 return _kept
 
             # ── Clean up ALL stale {base}_shadertoy* outputs from any prior build
@@ -11780,17 +12580,80 @@ def main():
                               f"{_A}-{_A + _kept - 1}; positions {_A + _kept}-{_B} NOT covered. "
                               f"Omit --start for the gap-free auto-split.")
             else:
-                print(f"\n🧩 auto-split: song ≈{_total:.0f}s > 180s cap → ≤180s part bundles")
+                _reason = ('budget' if _est_over_budget and _total <= 180.0
+                           else '180s' if _total > 180.0 else 'budget+180s')
+                print(f"\n🧩 auto-split ({_reason}): song ≈{_total:.0f}s, "
+                      f"~{_est_full_kb}KB est → ≤180s + ≤{_size_budget_kb}KB parts")
+
+                # ── Per-position sample-usage scanner ──────────────────────────────
+                # Pre-scan patterns to find cumulative sample sets per position.
+                # Used by _budgetB() to give _emit_part a smarter initial B so the
+                # first child build lands close to the budget boundary (reduces retries).
+                # Also tells us which samples each PART will actually need, so excluded
+                # patterns shed their exclusive samples → smaller VQ → smaller Sound tab.
+                _pos_samp_sets = []  # _pos_samp_sets[i] = set of 0-based sample indices used at position i
+                for _psi, _pspat in enumerate(_sp_full):
+                    _ps_rows = mod.patterns[_pspat] if 0 <= _pspat < len(mod.patterns) else None
+                    _ps_used = set()
+                    for _ps_row in (_ps_rows or []):
+                        for _ps_cell in (_ps_row or []):
+                            _ps_s = ((_ps_cell.get('instrument') or
+                                      _ps_cell.get('sample') or 0)
+                                     if _ps_cell else 0)
+                            if _ps_s: _ps_used.add(_ps_s - 1)  # 0-indexed
+                    _pos_samp_sets.append(_ps_used)
+
+                def _budgetB(_start):
+                    """Find the last position p in [_start.._last] where:
+                    - cumulative estimated KB ≤ _size_budget_kb, AND
+                    - cumulative time ≤ 180s.
+                    Returns _start if no further position fits (always include ≥1)."""
+                    _bspd = getattr(mod, 'initial_speed', 6) or 6
+                    _btmp = getattr(mod, 'initial_tempo', 125) or 125
+                    _bcum_samps = set(); _bcum_t = 0.0; _bbest = _start
+                    for _bpi in range(_start, _last + 1):
+                        _bpat = _sp_full[_bpi]
+                        _brows = mod.patterns[_bpat] if 0 <= _bpat < len(mod.patterns) else None
+                        for _brow in (_brows or []):
+                            for _bci in range(min(_nch, len(_brow) if _brow else 0)):
+                                try:
+                                    _bc = (_brow[_bci] or {})
+                                    _bcmd = _bc.get('command'); _binf = _bc.get('info', 0)
+                                    _beff = _bc.get('effect');  _bprm = _bc.get('param', 0)
+                                    if _bcmd == 1  and _binf: _bspd = _binf
+                                    elif _bcmd == 20 and _binf: _btmp = _binf
+                                    elif _beff == 0xF and _bprm:
+                                        if _bprm < 0x20: _bspd = _bprm
+                                        else:            _btmp = _bprm
+                                except Exception: pass
+                            _bcum_t += _bspd / max(1.0, _btmp * 0.4)
+                        _bcum_samps |= _pos_samp_sets[_bpi]
+                        _best_kb = _est_kb_for_sampset(_bcum_samps)
+                        if _bcum_t > 180.0 or _best_kb > _size_budget_kb:
+                            break  # this position would overflow — stop BEFORE adding it
+                        _bbest = _bpi
+                    return _bbest
+
+                # Total samples-with-data in the full song (denominator for "dropped X of Y").
+                _full_samp_count = len(_all_samps_with_data)
                 _cur = 0; _K = 0
                 while _cur <= _last and _K < 64:
                     _K += 1
-                    print(f"\n   ── part {_K}: positions {_cur}.. → {_base}_shadertoy_part{_K}_* ──")
-                    _kept = _emit_part(_K, _cur, _last)
+                    # Pre-estimate the best ending position for this part
+                    _est_end = _budgetB(_cur)
+                    _cum_samps_part = set().union(*_pos_samp_sets[_cur:_est_end+1])
+                    _est_kb_part = _est_kb_for_sampset(_cum_samps_part)
+                    _used_in_part = len(_cum_samps_part & _all_samps_with_data)
+                    _dropped_in_part = _full_samp_count - _used_in_part
+                    print(f"\n   ── part {_K}: positions {_cur}–{_est_end} "
+                          f"(~{_est_kb_part}KB est, "
+                          f"{_used_in_part}/{_full_samp_count} samples used, "
+                          f"{_dropped_in_part} dropped) → {_base}_shadertoy_part{_K}_* ──")
+                    _kept = _emit_part(_K, _cur, _est_end)
                     if not _kept or _kept < 1:
-                        _kept = (_last - _cur + 1)
-                    # STRICT trim kept exactly the positions that fit ≤180s and
-                    # dropped the straddler → next part starts right after (gap-free,
-                    # no overlap). The final part keeps the rest (≤180s), ends loop.
+                        _kept = (_est_end - _cur + 1)
+                    # STRICT trim kept exactly the positions that fit ≤180s + budget;
+                    # dropped straddler → next part starts right after (gap-free, no overlap).
                     _end = min(_cur + _kept - 1, _last)
                     _emitted.append((_cur, _end))
                     _cur = _end + 1
@@ -12023,7 +12886,7 @@ def main():
                         row[ch] = dict(empty)
                         muted_cells += 1
 
-        print(f"🎚️  --solo {solo_ch_1based}: kept channel {solo_ch_1based}, "
+        _q(f"🎚️  --solo {solo_ch_1based}: kept channel {solo_ch_1based}, "
               f"muted {mod.num_channels - 1} other channel(s) "
               f"({muted_cells} cells cleared across {len(mod.patterns)} pattern(s)).")
 
@@ -12612,7 +13475,7 @@ Generated by MOD2GLSL
                         # hardcoded 31 — 2ND_PM has 54 instruments and the
                         # 31-cap silenced its voice/vocal samples (instr
                         # 32-54 were never encoded). See feedback_s3m_
-                        # instrument_cap; this is that fix ported onto v1.63.
+                        # instrument_cap; this is that fix ported onto v1.666.
                         self.samples_info = []
                         self.sample_bytes = []
                         _n_smp = max(31, len(m.samples))
@@ -12963,7 +13826,7 @@ Generated by MOD2GLSL
                 # glsl_state_dump.py / sound_exec.py inject it themselves.
                 _ct = _ct.replace(
                     "GLSL (The Last) MOD Player v1.42 (c) 2026 Orblivius",
-                    "GLSL (The Last) MOD Player v1.63 (c) 2026 Orblivius", 1)
+                    "GLSL (The Last) MOD Player v1.666 (c) 2026 Orblivius", 1)
                 _ct = _ct.replace("   COMMON TAB\n", f"   COMMON TAB\n   Visualizer: {_vname}\n", 1)
 
                 # Inject visualizer note-synth helpers (waveType[] + _synthWave).
@@ -13158,7 +14021,7 @@ Generated by MOD2GLSL
                     lambda _m: _fixed_ft, _ct, count=1, flags=_re_ft.DOTALL)
                 if _nft == 1:
                     _ct = _ct2
-                    print(f"   ✓ fetchTick patched to span {_n_tk} rowStartTick chunk(s) "
+                    _q(f"   ✓ fetchTick patched to span {_n_tk} rowStartTick chunk(s) "
                           f"(encoder emitted rowStartTick0-only — >4096-row overflow bug)")
                 else:
                     print("   WARNING: fetchTick block not found — multi-chunk timing patch skipped")
@@ -13180,7 +14043,7 @@ Generated by MOD2GLSL
                     f'for (int _bs = 0; _bs < {_bs_iters}; _bs++)', _ct, count=1)
                 if _nbs == 1:
                     _ct = _ct_bs
-                    print(f"   ✓ getPosition binary search → {_bs_iters} iters "
+                    _q(f"   ✓ getPosition binary search → {_bs_iters} iters "
                           f"(was 12; {_n_rows_bs} rows need convergence)")
                 else:
                     print("   WARNING: getPosition _bs loop not found — iter fix skipped")
@@ -13350,7 +14213,7 @@ Generated by MOD2GLSL
                                + f"const SampleInfo samples[{_si_n}] = SampleInfo[](\n    "
                                + ",\n    ".join(_si_entries) + "\n);")
                     _ct = _ct[:_m_si.start()] + _si_new + _ct[_m_si.end():]
-                    print(f"   ✓ SampleInfo samples[] rebuilt: {_si_n} entries "
+                    _q(f"   ✓ SampleInfo samples[] rebuilt: {_si_n} entries "
                           f"(was declared [31]; commas repaired; "
                           f"{_n_clamped} loop-bound clamps)")
                     # ── Add the c2sp 8th struct field to match the rebuilt
@@ -13364,11 +14227,11 @@ Generated by MOD2GLSL
                             r'(struct\s+SampleInfo\s*\{\s*int\s+[^;}]*?bwFactor,\s*finetune)\s*;',
                             r'\1, c2sp;', _ct, count=1)
                         if _n_struct == 1:
-                            print(f"   ✓ SampleInfo struct → +c2sp field "
+                            _q(f"   ✓ SampleInfo struct → +c2sp field "
                                   f"({_n_c2} non-8363 samples get a rate-scale; "
                                   f"rest ×1.0)")
                         else:
-                            print(f"   ✗ WARNING: SampleInfo struct def not "
+                            _q(f"   ✗ WARNING: SampleInfo struct def not "
                                   f"patched for c2sp — GLSL will not compile")
                     # ── Add itCut/itRes (9th/10th) struct fields to match the
                     # rebuilt 10-value SampleInfo(...) constructors. Carries
@@ -13382,11 +14245,11 @@ Generated by MOD2GLSL
                             r'(struct\s+SampleInfo\s*\{\s*int\s+[^;}]*?finetune,\s*c2sp)\s*;',
                             r'\1, itCut, itRes;', _ct, count=1)
                         if _n_fstruct == 1:
-                            print(f"   ✓ SampleInfo struct → +itCut/itRes "
+                            _q(f"   ✓ SampleInfo struct → +itCut/itRes "
                                   f"({_n_filt} IT samples carry a resonant "
                                   f"filter; rest 127/0 = inert)")
                         else:
-                            print(f"   ✗ WARNING: SampleInfo struct def not "
+                            _q(f"   ✗ WARNING: SampleInfo struct def not "
                                   f"patched for itCut/itRes — GLSL will not "
                                   f"compile")
                     # ── Add eOff/eN/eSus/eLp (11..14) for the MOD+ per-sample
@@ -13398,11 +14261,11 @@ Generated by MOD2GLSL
                             r'(struct\s+SampleInfo\s*\{\s*int\s+[^;}]*?itCut,\s*itRes)\s*;',
                             r'\1, eOff, eN, eSus, eLp;', _ct, count=1)
                         if _n_estruct == 1:
-                            print(f"   ✓ SampleInfo struct → +eOff/eN/eSus/eLp "
+                            _q(f"   ✓ SampleInfo struct → +eOff/eN/eSus/eLp "
                                   f"({_n_env} samples carry a vol envelope; "
                                   f"{len(_env_pts_all)} env points)")
                         else:
-                            print(f"   ✗ WARNING: SampleInfo struct not "
+                            _q(f"   ✗ WARNING: SampleInfo struct not "
                                   f"patched for envelope — GLSL won't compile")
                     # ── Add nna (15th) struct field — IT-ONLY. S3M/MOD/XM
                     # builds keep the 14-field struct so every function-
@@ -13418,10 +14281,10 @@ Generated by MOD2GLSL
                         _n_nna = sum(1 for s in (getattr(mod,'samples',[]) or [])
                                      if isinstance(s, dict) and s.get('nna', 0))
                         if _n_nstruct == 1:
-                            print(f"   ✓ SampleInfo struct → +nna "
+                            _q(f"   ✓ SampleInfo struct → +nna "
                                   f"({_n_nna} samples carry NNA != cut)")
                         else:
-                            print(f"   ✗ WARNING: SampleInfo struct not "
+                            _q(f"   ✗ WARNING: SampleInfo struct not "
                                   f"patched for nna — GLSL won't compile")
                 else:
                     print("   WARNING: SampleInfo samples[] block not found — cap fix skipped")
@@ -13514,7 +14377,7 @@ Generated by MOD2GLSL
                                 _ct = _ct[:_sp_end+1] + _vs_decl + _ct[_sp_end+1:]
                             else:
                                 _ct = _ct + '\n' + _vs_decl
-                            print(f"   ✓ _vsSparse {_enc_mode} injected ({_n_applied} vol overrides, "
+                            _q(f"   ✓ _vsSparse {_enc_mode} injected ({_n_applied} vol overrides, "
                                   f"{len(_vcol_side_capture[0])} total dropped volcols)")
                         else:
                             print("   WARNING: songPositions not found — _volSide skip")
@@ -13541,6 +14404,7 @@ Generated by MOD2GLSL
                                      'fft_n':         getattr(args, '_compat_fft_n', 256),
                                      'extra_pragmas': getattr(args, '_compat_extra_pragmas', False),
                                      'phatbass_mode': args.phatbass_mode,
+                                     'use_png':       _png_mode,
                                  })
             glsl_common_file = _fb_glsl.replace('.glsl', '_common.glsl')
 
@@ -13561,6 +14425,7 @@ Generated by MOD2GLSL
                              'fft_n':         getattr(args, '_compat_fft_n', 256),
                              'extra_pragmas': getattr(args, '_compat_extra_pragmas', False),
                              'phatbass_mode': args.phatbass_mode,
+                             'use_png':       _png_mode,
                          })
     import os as _os2
     # create_shadertoy_glsl writes: _tmp_tabs_shadertoy_common/sound/image/bufferA.glsl
@@ -13792,7 +14657,7 @@ Generated by MOD2GLSL
                     _sound_src = _re3.sub(r'(inst >= 1 && inst <= )\d+',
                                           r'\g<1>' + str(_real_n), _sound_src)
                     if _ng:
-                        print(f"   ✓ _gcoBody instrument guard → > {_real_n} "
+                        _q(f"   ✓ _gcoBody instrument guard → > {_real_n} "
                               f"(was 31; matches rebuilt samples[])")
 
                 # ── Vol side-channel: patch _gcoBody to apply _volSide[] ────
@@ -13849,7 +14714,7 @@ Generated by MOD2GLSL
                     _sound_src = _sound_src.replace(
                         '        // Current row partial (non-trigger row only — trigger handled above)',
                         _vs5_block)
-                    print(f"   ✓ _gcoBody patched with _volSide[] vol side-channel (5 sites)")
+                    _q(f"   ✓ _gcoBody patched with _volSide[] vol side-channel (5 sites)")
 
                 # ── Fine vol slide fix: S3M DF2 (upper nibble=F) = fine DOWN,
                 # D2F (lower nibble=F) = fine UP.  Fires once at tick 0, not
@@ -13910,7 +14775,7 @@ Generated by MOD2GLSL
                     '_fsT',
                 ]
                 _fs_found = sum(1 for p in _fs_checks if p in _sound_src)
-                print(f"   ✓ fine vol slide (DF2/D2F) patched at {_fs_found}/5 pattern groups")
+                _q(f"   ✓ fine vol slide (DF2/D2F) patched at {_fs_found}/5 pattern groups")
 
                 # ── Instrument-only vol-reset fix (S_nn P0 / XM inst-only rows) ──────
                 # ProTracker: a row with instrument but no period (e.g. S01 P0 A0F) does
@@ -13951,9 +14816,9 @@ Generated by MOD2GLSL
                 )
                 if _pcr_cond_old in _sound_src:
                     _sound_src = _sound_src.replace(_pcr_cond_old, _pcr_cond_new)
-                    print(f"   ✓ instrument-only vol-reset fix: current-row partial condition widened")
+                    _q(f"   ✓ instrument-only vol-reset fix: current-row partial condition widened")
                 else:
-                    print(f"   ✗ WARNING: current-row partial condition not found for vol-reset fix")
+                    _q(f"   ✗ WARNING: current-row partial condition not found for vol-reset fix")
 
                 # Forward scan instrument-only vol reset (rows between trigger and current row).
                 # Same ProTracker rule: any intermediate row with inst>0, period=0 resets vol.
@@ -13975,9 +14840,9 @@ Generated by MOD2GLSL
                 )
                 if _fwd_volreset_old in _sound_src:
                     _sound_src = _sound_src.replace(_fwd_volreset_old, _fwd_volreset_new)
-                    print(f"   ✓ instrument-only vol-reset fix: forward scan vol reset added")
+                    _q(f"   ✓ instrument-only vol-reset fix: forward scan vol reset added")
                 else:
-                    print(f"   ✗ WARNING: forward scan vol block not found for vol-reset fix")
+                    _q(f"   ✗ WARNING: forward scan vol block not found for vol-reset fix")
 
                 # ── Float32 tick-boundary fix: pos.tick may compute as 0.9999…
                 # instead of 1.0 when samppos/822 is exact, making int(pos.tick)
@@ -13986,9 +14851,9 @@ Generated by MOD2GLSL
                 _new_pct = 'int _pct = int(pos.tick + 0.0001);'
                 if _old_pct in _sound_src:
                     _sound_src = _sound_src.replace(_old_pct, _new_pct)
-                    print(f"   ✓ float32 tick-boundary epsilon applied to _pct")
+                    _q(f"   ✓ float32 tick-boundary epsilon applied to _pct")
                 else:
-                    print(f"   ✗ WARNING: could not find _pct definition for epsilon fix")
+                    _q(f"   ✗ WARNING: could not find _pct definition for epsilon fix")
 
                 # ── Vibrato/tremolo tick-0 phase fix ─────────────────────────
                 # MikIT calls do_vibrato()/do_tremolo() on EVERY tick including
@@ -14030,9 +14895,9 @@ Generated by MOD2GLSL
                         _sound_src = _sound_src.replace(_old, _new)
                         _vt_fixed += 1
                 if _vt_fixed == 8:
-                    print(f"   ✓ vibrato/tremolo tick-0 phase fix applied (8/8 sites)")
+                    _q(f"   ✓ vibrato/tremolo tick-0 phase fix applied (8/8 sites)")
                 else:
-                    print(f"   ✗ WARNING: vib/trem phase fix only matched {_vt_fixed}/8 sites")
+                    _q(f"   ✗ WARNING: vib/trem phase fix only matched {_vt_fixed}/8 sites")
 
                 # ── Tremolo tick-boundary ramp (declick) ─────────────────────
                 # Command-7 tremolo steps _tremoloDelta once PER TICK and it was
@@ -14057,9 +14922,9 @@ Generated by MOD2GLSL
                 )
                 if _trem_old in _sound_src:
                     _sound_src = _sound_src.replace(_trem_old, _trem_new, 1)
-                    print(f"   ✓ tremolo tick-boundary ramp applied (declick)")
+                    _q(f"   ✓ tremolo tick-boundary ramp applied (declick)")
                 else:
-                    print(f"   ✗ WARNING: tremolo delta line not found for ramp declick")
+                    _q(f"   ✗ WARNING: tremolo delta line not found for ramp declick")
 
                 # ── Arpeggio tick-boundary epsilon fix ──────────────────────
                 # pos.tick is a float computed from sampleTime.  At the exact
@@ -14072,9 +14937,9 @@ Generated by MOD2GLSL
                 _arp_new = 'int _arpStep = _pct - (_pct / 3) * 3;'
                 if _arp_old in _sound_src:
                     _sound_src = _sound_src.replace(_arp_old, _arp_new)
-                    print(f"   ✓ arpeggio tick-boundary epsilon fix applied")
+                    _q(f"   ✓ arpeggio tick-boundary epsilon fix applied")
                 else:
-                    print(f"   ✗ WARNING: arpeggio epsilon fix pattern not found")
+                    _q(f"   ✗ WARNING: arpeggio epsilon fix pattern not found")
 
                 # ── c2spd exact float rate-scale (inst33 pos-20 phase-drift) ──
                 # The encoder no longer integer-rounds period*8363/c2 (that
@@ -14099,10 +14964,10 @@ Generated by MOD2GLSL
                 if _frq_n == 1:
                     _sound_src = _sound_src.replace(_frq_old, _frq_new)
                 if _cf_n == 3 and _frq_n == 1:
-                    print(f"   ✓ c2spd float rate-scale applied "
+                    _q(f"   ✓ c2spd float rate-scale applied "
                           f"(3 _Cf accumulators + 1 freq)")
                 else:
-                    print(f"   ✗ WARNING: c2spd rate-scale matched "
+                    _q(f"   ✗ WARNING: c2spd rate-scale matched "
                           f"{_cf_n}/3 _Cf + {_frq_n}/1 freq "
                           f"(expected 3 + 1) — pitch fix incomplete")
 
@@ -14154,11 +15019,11 @@ Generated by MOD2GLSL
                 if _dq_an == 1 and _dq_cfn == 3:
                     _sound_src = _sound_src.replace(_dq_anchor, _dq_block, 1)
                     _sound_src = _sound_src.replace(_dq_cf_old, _dq_cf_new)
-                    print(f"   ✓ base-pitch de-quantization applied "
+                    _q(f"   ✓ base-pitch de-quantization applied "
                           f"(DEQUANT_PITCH gate; 3 _Cf × _pitchCorr; "
                           f"_Pt/integrator/audits untouched)")
                 else:
-                    print(f"   ✗ WARNING: de-quant NOT applied "
+                    _q(f"   ✗ WARNING: de-quant NOT applied "
                           f"(anchor×{_dq_an} exp 1, _Cf×{_dq_cfn} exp 3) "
                           f"— high-note pitch still 12-bit quantized")
 
@@ -14188,11 +15053,11 @@ Generated by MOD2GLSL
                 _tpfix_n = _sound_src.count(_tpfix_old)
                 if _tpfix_n == 1:
                     _sound_src = _sound_src.replace(_tpfix_old, _tpfix_new, 1)
-                    print("   ✓ tone-porta current-row target fix applied "
+                    _q("   ✓ tone-porta current-row target fix applied "
                           "(declick on all-Gxx porta leads; head target == "
                           "forward-scan target → continuous fSamplePos)")
                 else:
-                    print(f"   ✗ WARNING: tone-porta target fix NOT applied "
+                    _q(f"   ✗ WARNING: tone-porta target fix NOT applied "
                           f"(anchor×{_tpfix_n} exp 1) — porta-lead clicks remain")
 
                 # ── --xfade: tunable retrigger/note-on declick crossfade window ──
@@ -14210,10 +15075,10 @@ Generated by MOD2GLSL
                             _xf_a, f'if (ageSamples < {float(_xf_n)} && ageSamples >= 0.0) {{')
                         _sound_src = _sound_src.replace(
                             _xf_b, f'float t = ageSamples / {float(_xf_n)};')
-                        print(f"   ✓ retrigger declick crossfade window → {_xf_n} samples "
+                        _q(f"   ✓ retrigger declick crossfade window → {_xf_n} samples "
                               f"({_xf_n/44100.0*1000.0:.1f}ms)")
                     else:
-                        print(f"   ✗ WARNING: --xfade patch NOT applied "
+                        _q(f"   ✗ WARNING: --xfade patch NOT applied "
                               f"(anchors {_xf_na}/{_xf_nb}, expected 1/1)")
 
                 # ── MikIT note-on volume reset (inst25 frozen-accent fix) ───
@@ -14221,7 +15086,7 @@ Generated by MOD2GLSL
                 # mikit_engine.py:560-575 — a cell carrying an INSTRUMENT
                 # number unconditionally resets channel volume to that
                 # sample's default volume (porta or kick), THEN a volume
-                # column / Cxx on the same cell overrides.  v1.63's volume
+                # column / Cxx on the same cell overrides.  v1.666's volume
                 # forward-scan never did the inst→sample-default reset, so on
                 # tone-porta leads (inst25: note+G every ~2 rows, volcol=20
                 # on the off-rows) the volcol value froze and never returned
@@ -14305,13 +15170,13 @@ Generated by MOD2GLSL
                     _sound_src = _sound_src.replace(_miv_t_old, _miv_t_new)
                     _sound_src = _sound_src.replace(_miv_c_old, _miv_c_new)
                     _sound_src = _sound_src.replace(_miv_p_old, _miv_p_new)
-                    print(f"   ✓ MikIT inst-vol reset: vcol-priority (no-click) "
+                    _q(f"   ✓ MikIT inst-vol reset: vcol-priority (no-click) "
                           f"applied at fwd-scan + trigger(VOL_INIT) + "
                           f"trig→current + current-row")
                 elif getattr(mod, 'is_s3m', False):
                     # Only warn for S3M — _vsGet/_volSide is S3M-only, so XM/MOD
                     # will always have count=0 here (not a bug, just not applicable).
-                    print(f"   ✗ WARNING: inst-vol-reset targets "
+                    _q(f"   ✗ WARNING: inst-vol-reset targets "
                           f"fwd×{_miv_n} trig×{_miv_tn} cont×{_miv_cn} "
                           f"cur×{_miv_pn} (expected 1,1,1,1) — frozen")
 
@@ -14339,9 +15204,9 @@ Generated by MOD2GLSL
                 _ptf_n = _sound_src.count(_ptf_old)
                 if _ptf_n == 1:
                     _sound_src = _sound_src.replace(_ptf_old, _ptf_new)
-                    print(f"   ✓ pTrigPat=-1 fade-from-silence patch applied")
+                    _q(f"   ✓ pTrigPat=-1 fade-from-silence patch applied")
                 else:
-                    print(f"   ✗ WARNING: pTrigPat=-1 fade patch: found {_ptf_n} "
+                    _q(f"   ✗ WARNING: pTrigPat=-1 fade patch: found {_ptf_n} "
                           f"occurrences of anchor (expected 1) — skipped")
 
                 # ── gated stateless ratio-AA (box integrator) ─────────────
@@ -14423,12 +15288,12 @@ Generated by MOD2GLSL
                     _sound_src = _sound_src.replace(
                         _aa_call_old, _aa_call_new, 1)
                     if _aa_on:
-                        print("   ✓ gated ratio-AA injected & ENABLED via "
+                        _q("   ✓ gated ratio-AA injected & ENABLED via "
                               "--aa (#define AA_RESAMPLE 1) — alias suppression "
                               "on pitched-up notes; deliberate divergence from "
                               "the linear/no-AA MikIT/IT oracle")
                     else:
-                        print("   ✓ gated ratio-AA injected, OFF (oracle-1:1; "
+                        _q("   ✓ gated ratio-AA injected, OFF (oracle-1:1; "
                               "pass --aa to enable, or #define AA_RESAMPLE 1)")
                 else:
                     print(f"   ⚠ ratio-AA skipped (getSampleF sig×"
@@ -14438,7 +15303,7 @@ Generated by MOD2GLSL
                 # ── IT instrument resonant filter (it2play 2-pole LPF) ────
                 # Recovered algorithm (it2play it2drivers/hq.c, captured in
                 # session a3158c73): coeffs from cutoff/res, mixrate-dependent
-                # (filterStep=24). The IIR is recursive; v1.63's Sound shader
+                # (filterStep=24). The IIR is recursive; v1.666's Sound shader
                 # is stateless per sample, so realize it as a truncated
                 # impulse-response FIR: h[k] = the 2-pole's response (run its
                 # a/b/c K steps), convolved with the voice's dry source read
@@ -14503,7 +15368,7 @@ Generated by MOD2GLSL
                         _itf_def_anchor, _itf_defs, 1)
                     _sound_src = _sound_src.replace(
                         _itf_anchor, _itf_block, 1)
-                    print(f"   ✓ IT resonant filter injected (it2play 2-pole, "
+                    _q(f"   ✓ IT resonant filter injected (it2play 2-pole, "
                           f"stateless K=IT_FILT_TAPS FIR; ON by default, "
                           f"#define IT_FILTER 0 to skip; inert for non-filter "
                           f"samples)")
@@ -14626,11 +15491,11 @@ Generated by MOD2GLSL
                     _sound_src = _sound_src.replace(
                         _ve_sig, _ve_fn + "\n" + _ve_sig, 1)
                     _sound_src = _sound_src.replace(_ve_old, _ve_new, 1)
-                    print(f"   ✓ MOD+ vol envelope injected into _gcoBody "
+                    _q(f"   ✓ MOD+ vol envelope injected into _gcoBody "
                           f"(stateless f(elapsed-ticks); eN=0 ⇒ inert ⇒ "
                           f"S3M/MOD untouched)")
                 elif getattr(mod, 'is_it', False):
-                    print(f"   ⋯ MOD+ _itVolEnv skipped (NNA envelope-"
+                    _q(f"   ⋯ MOD+ _itVolEnv skipped (NNA envelope-"
                           f"follower port covers env via envValueAt — "
                           f"avoids env² double-apply that silences ghosts)")
                 else:
@@ -14661,7 +15526,7 @@ Generated by MOD2GLSL
                                     "    if (trigNote.instrument")
                     if _sound_src.count(_ko_decl_old) == 1:
                         _sound_src = _sound_src.replace(_ko_decl_old, _ko_decl_new, 1)
-                        print("   ✓ keyOffEtick declared in _gcoBody")
+                        _q("   ✓ keyOffEtick declared in _gcoBody")
                     else:
                         print(f"   ⚠ keyOffEtick decl anchor ×"
                               f"{_sound_src.count(_ko_decl_old)} — skipped")
@@ -14691,7 +15556,7 @@ Generated by MOD2GLSL
                         "            // ANY row with period > 0")
                     if _sound_src.count(_ko_scan_old) == 1:
                         _sound_src = _sound_src.replace(_ko_scan_old, _ko_scan_new, 1)
-                        print("   ✓ forward-scan key-off detection injected")
+                        _q("   ✓ forward-scan key-off detection injected")
                     else:
                         print(f"   ⚠ fwd-scan key-off anchor ×"
                               f"{_sound_src.count(_ko_scan_old)} — skipped")
@@ -14727,7 +15592,7 @@ Generated by MOD2GLSL
                         "        if (_pcr.period <= 0) {")
                     if _sound_src.count(_ko_cur_old) == 1:
                         _sound_src = _sound_src.replace(_ko_cur_old, _ko_cur_new, 1)
-                        print("   ✓ current-row key-off detection injected")
+                        _q("   ✓ current-row key-off detection injected")
                     else:
                         print(f"   ⚠ cur-row key-off anchor ×"
                               f"{_sound_src.count(_ko_cur_old)} — skipped")
@@ -14980,7 +15845,7 @@ Generated by MOD2GLSL
                         '            return s_prev * (1.0 - t) + s_curr * t;'
                     )
                     _sound_src, _np3 = _re_nna.subn(_p3_src, _p3_dst, _sound_src, count=1)
-                    print(f"   ✓ NNA envelope-follower port: aux_arrays={'OK' if _aux_ok else 'FAIL'}, "
+                    _q(f"   ✓ NNA envelope-follower port: aux_arrays={'OK' if _aux_ok else 'FAIL'}, "
                           f"patches=({_np1},{_np2},{_np3}) (expect 1,1,1), "
                           f"cap=31→{_nsmp_nna}, {_n_inst_env}/{_nsmp_nna} insts have env_on "
                           f"({_et} pts; sample-borrow bug FIXED — was 'wooump' on env_on=False insts)")
@@ -15157,14 +16022,14 @@ Generated by MOD2GLSL
                             _gh_sub_ok = True
                         else:
                             _gh_sub_ok = False
-                        print(f"   ✓ Ghost-slot table: {_NGH} ghosts ({_NGH*16/1024:.1f}KB), "
+                        _q(f"   ✓ Ghost-slot table: {_NGH} ghosts ({_NGH*16/1024:.1f}KB), "
                               f"sort=(ch,start), inject_common={_gh_inj}, "
                               f"inject_loop={_gh_sub_ok} (peak 24 concurrent → ~2 iter avg)")
                     except Exception as _gh_err:
                         print(f"   ⚠ Ghost-slot table failed: {_gh_err}")
                     """  # end disabled ghost-slot block
                 else:
-                    print(f"   ⋯ NNA envelope-follower port skipped (not IT — "
+                    _q(f"   ⋯ NNA envelope-follower port skipped (not IT — "
                           f"S3M/MOD/XM stay byte-identical, no GPU cost)")
 
                 # ── IT NNA timeline graft (mod_player.py's refined engine) ─
@@ -15273,7 +16138,7 @@ Generated by MOD2GLSL
                             "#define USE_TIMELINE_DSP 1", 1)
                         _sound_src = _sound_src.replace(
                             _tl_anchor, _tl_block + _tl_anchor, 1)
-                        print(f"   ✓ NNA timeline injected (Common define "
+                        _q(f"   ✓ NNA timeline injected (Common define "
                               f"0→1, Sound tlGetOutput + packed segs; "
                               f"{len(_tlg):,} B arrays)")
                     else:
@@ -15422,7 +16287,7 @@ Generated by MOD2GLSL
                                    ('enableCombReverb','ENABLE_COMBREVERB')):
                     _common_src = _flagdef(_common_src, _sym, _mac)
                     _sound_src  = _flagdef(_sound_src,  _sym, _mac)
-                print("   ✓ enable3D/enableFAT → #define + #if "
+                _q("   ✓ enable3D/enableFAT → #define + #if "
                       "(disabled features removed by preprocessor, not just dead-stripped)")
 
                 # ── --preserve / --raw-perc: store instruments RAW (no VQ) ─
@@ -15506,7 +16371,7 @@ Generated by MOD2GLSL
                     if _perc:
                         _pn_new = len(set(_perc) - set(_presv_ids))
                         _presv_ids = sorted(set(_presv_ids) | set(_perc))
-                        print(f"   ✓ --raw-perc: {len(_perc)} percussion "
+                        _q(f"   ✓ --raw-perc: {len(_perc)} percussion "
                               f"sample(s) RAW {_perc} (~{_acc//1024}KB"
                               + (f", {_drop} over-budget→VQ" if _drop else "")
                               + f", +{_pn_new} beyond --preserve)")
@@ -15644,7 +16509,7 @@ Generated by MOD2GLSL
                         else:
                             print("   WARNING: getSample() not found — "
                                   "--preserve hook not installed")
-                        print(f"   ✓ --preserve {_presv_ids}: "
+                        _q(f"   ✓ --preserve {_presv_ids}: "
                               f"{len(_prows)} instrument(s) stored RAW "
                               f"({len(_ppcm):,} int8, no VQ) — pristine")
 
@@ -15656,7 +16521,7 @@ Generated by MOD2GLSL
                 _moved_kb = sum(len(a) for a in _arrays) // 1024
                 _moved_fn_count = (len(_fetch_fns) + len(_gs_fns) + len(_gsf_fns) + len(_lz_fns)
                                    + (1 if _gco_fn else 0) + (1 if _gcobody_fn else 0))
-                print(f"   ✂️  Moved {len(_arrays)} arrays + {_moved_fn_count} fns "
+                _q(f"   ✂️  Moved {len(_arrays)} arrays + {_moved_fn_count} fns "
                       f"({_moved_kb} KB) from Common → Sound prelude")
         except Exception as _splerr:
             print(f"   WARNING: Common→Sound split failed ({_splerr}); leaving Common intact")
@@ -15664,15 +16529,21 @@ Generated by MOD2GLSL
     # ── --png: repackage the finished VQ build's data into the PNG ──────────────
     # Everything above produced a normal VQ build (const arrays). Now move ALL of
     # that array data into the PNG and point the fetchers at it (decoder unchanged).
+    _png_patterns_in_png = False   # set True below if pattern arrays moved to PNG
     if _png_mode:
         png_file = base_name + "_player_data.png"
-        _tot, _offs = _pack_build_into_png(glsl_common_file,
-                                           base_name + "_shadertoy_sound.glsl", png_file)
+        _tot, _offs, _png_patterns_in_png = _pack_build_into_png(
+            glsl_common_file, base_name + "_shadertoy_sound.glsl", png_file,
+            bufferA_path=base_name + "_shadertoy_bufferA.glsl",
+            image_path=base_name + "_shadertoy_image.glsl")
         png_size = os.path.getsize(png_file)
-        print(f"   🖼️  --png: packed {len(_offs)} data array(s) → {png_file} "
+        _q(f"   🖼️  --png: packed {len(_offs)} data array(s) → {png_file} "
               f"({_tot:,} B data, {png_size:,} B file); fetchers read the PNG (USE_EMBEDDED_DATA 0)")
         for _lg in sorted(_offs):
-            print(f"        {_lg}_PNG_OFF = {_offs[_lg]}")
+            _q(f"        {_lg}_PNG_OFF = {_offs[_lg]}")
+        if _png_patterns_in_png:
+            _q(f"   ✓ Pattern arrays in PNG — Common ivec4 budget freed; "
+                  f"iChannel3 wired to all 3 passes in JSON")
         args.use_png = True   # restore so JSON wiring + summary reflect PNG mode
 
     # Summary
@@ -15719,13 +16590,57 @@ Generated by MOD2GLSL
                              "sampler": _SMP_BUF}
             # --png: the data PNG as a NEAREST / no-vflip / no-sRGB texture so
             # texelFetch reads the raw bytes exactly (any filtering/flip/sRGB
-            # would corrupt the packed data). Wired to Sound iChannel0.
+            # would corrupt the packed data). Wired to iChannel3 on Sound,
+            # and (when pattern arrays are in PNG) also on Image and Buffer A.
             _SMP_DATA = {"filter": "nearest", "wrap": "clamp",
                          "vflip": "false", "srgb": "false", "internal": "byte"}
-            _IN_PNG = {"channel": 0, "type": "texture", "id": "dataPNG0",
-                       "filepath": base_name + "_player_data.png", "sampler": _SMP_DATA}
+            # iChannel3 PNG input for Sound: embed as base64 data: URL so Sound
+            # (audio render) is fully self-contained and needs no manual upload.
+            # Image / BufferA use local file path (not base64) — same PNG, tiny
+            # JSON overhead, avoids the "1.2MB JSON froze after 1 frame" issue.
+            import base64 as _b64
+            _png_local = base_name + "_player_data.png"
+            _png_abs   = os.path.abspath(_png_local)
+            _png_filepath_sound = _png_abs   # fallback: local path
+            try:
+                if os.path.exists(_png_local):
+                    # NOTE: do NOT gzip-wrap before base64. Browsers don't apply
+                    # Content-Encoding to data URLs — they'd see 1F 8B (gzip) where
+                    # they expect 89 50 4E 47 (PNG) and fail to decode the texture,
+                    # resulting in fetchPixel(0)==0, _pngOk()==false, silent audio.
+                    _png_raw = open(_png_local,'rb').read()
+                    _png_b64 = _b64.b64encode(_png_raw).decode('ascii')
+                    _png_filepath_sound = f"data:image/png;base64,{_png_b64}"
+            except Exception as _pe:
+                print(f"   ⚠️  could not embed PNG as data URL ({_pe}); "
+                      f"JSON Sound iChannel3 keeps absolute filepath")
+            # Sound, Buffer A, Image passes: base64 embedded PNG (self-contained).
+            # All three need fetchPixel → iChannel3 = PNG texture.
+            _IN_PNG3 = {"channel": 3, "type": "texture", "id": "dataPNG3",
+                        "filepath": _png_filepath_sound, "sampler": _SMP_DATA}
+            # Image / BufferA passes: local file path only (no base64 duplication)
+            _IN_PNG3_PATH = {"channel": 3, "type": "texture", "id": "dataPNG3",
+                             "filepath": _png_abs, "sampler": _SMP_DATA}
+            # Buffer B: iChannel3 = its own framebuffer (zeros). Direct iChannel3
+            # fetch with no branch (matches Sound/BufferA pattern). _pngOk() returns
+            # false on zeros (harmless). Buffer B is deleted after import anyway.
+            _BUFB_FP = (
+                "#undef fetchPixel\n#undef _pngOk\n"
+                "#ifndef MUL1\n#define MUL1 255.0\n#endif\n"
+                "// fetchPixel: single-pixel int cache via iChannel3 (direct).\n"
+                "int _fp_grp=-1; int _fp_c;\n"
+                "int fetchPixel(int pi){\n"
+                "    if(pi!=_fp_grp){\n"
+                "        _fp_grp=pi;\n"
+                "        vec4 _p0=texelFetch(iChannel3,ivec2(pi&1023,pi>>10),0);\n"
+                "        _fp_c=(int(_p0.r*MUL1+.5)<<24)|(int(_p0.g*MUL1+.5)<<16)|(int(_p0.b*MUL1+.5)<<8)|int(_p0.a*MUL1+.5);\n"
+                "    }\n"
+                "    return _fp_c;\n"
+                "}\n"
+                "bool _pngOk(){return fetchPixel(0)==((77<<24)|(79<<16)|(68<<8));}\n"
+            )
             _st_name = (mod.title.strip() or base_name)[:64]
-            _st_desc = f"{_st_name} — MOD2GLSL v1.63"
+            _st_desc = f"{_st_name} — MOD2GLSL v1.666"
             # Image is placed first so ShaderToy's new-shader first-tab reset only
             # wipes Image code (user re-pastes from *_shadertoy_image.glsl).
             # Image inputs ARE included: channels survive the reset so they are
@@ -15740,15 +16655,26 @@ Generated by MOD2GLSL
                 # Buffer B FIRST → ShaderToy selects the first tab after import,
                 # so Buffer B is selected and absorbs the reset. Delete it after.
                 # Output ID XsXGR8 verified from real ShaderToy export (enigma.json).
+                # Buffer B: iChannel3 = self-reference (zeros).  Common only has a
+                # fetchPixel prototype — Buffer B's code provides a concrete body so
+                # compilation succeeds.  _pngOk() returns false on zeros (harmless).
+                # Buffer B is deleted after import; the self-ref keeps ShaderToy happy.
                 {"outputs": [{"channel": 0, "id": "XsXGR8"}],
-                 "inputs": [],
+                 "inputs": [{"channel": 3, "id": "XsXGR8",
+                             "filepath": "/media/previz/buffer01.png",
+                             "type": "buffer", "sampler": _SMP_BUF}],
                  "code": ("// *** DELETE THIS TAB after import ***\n"
                           "// After clicking ×, press Cmd+Z (Mac) / Ctrl+Z (Win) immediately!\n"
                           "// ShaderToy pastes this tab's code into Image on delete —\n"
                           "// Cmd+Z undoes that and restores Image's real code.\n"
+                          "#undef fetchPixel\n#undef _pngOk\n"
+                          "int fetchPixel(int pi){return 0;}\n"
+                          "bool _pngOk(){return false;}\n"
                           "void mainImage(out vec4 o,in vec2 u){o=vec4(0);}"),
                  "name": "Buffer B", "description": "", "type": "buffer"},
                 # Image, Common, Buffer A, Sound follow — all survive import intact.
+                # Image iChannel3 = PNG (same as Sound/Buffer A) — getPosition/getByte
+                # in Common call fetchPixel which Image now satisfies directly.
                 {"outputs": [{"channel": 0, "id": "4dfGRr"}],
                  "inputs": [
                      {"channel": 0, "id": "4dXGzr",
@@ -15760,7 +16686,7 @@ Generated by MOD2GLSL
                      {"channel": 2, "id": "Xsf3zn",
                       "filepath": "/media/a/f735bee5b64ef98879dc618b016ecf7939a5756040c2cde21ccb15e69a6e1cfb.png",
                       "type": "texture", "sampler": _SMP_TEX},
-                 ],
+                 ],  # Image reads PNG via Buffer A proxy (iChannel1) — no iChannel3 needed
                  "code": _c_image, "name": "Image",
                  "description": "", "type": "image"},
                 {"outputs": [], "inputs": [],
@@ -15771,10 +16697,12 @@ Generated by MOD2GLSL
                      {"channel": 0, "id": "4dXGR8",
                       "filepath": "/media/previz/buffer00.png",
                       "type": "buffer", "sampler": _SMP_BUF},
-                 ],
+                 ] + ([_IN_PNG3] if args.use_png else []),
+                 # Buffer A iChannel3: base64-embedded PNG (browser cannot load local paths).
                  "code": _c_bufA, "name": "Buffer A",
                  "description": "", "type": "buffer"},
-                {"outputs": [], "inputs": [],
+                {"outputs": [],
+                 "inputs": ([_IN_PNG3] if args.use_png else []),
                  "code": _c_sound, "name": "Sound",
                  "description": "", "type": "sound"},
             ]
@@ -15811,7 +16739,34 @@ Generated by MOD2GLSL
     print(f"                      {bufA_file_short}  ← Buffer A (FFT + state)")
     if args.use_png and png_size:
         print(f"   🖼️  Sample PNG:     {png_file} ({png_size} bytes)")
-    print(f"   🗜️  Compression:    RLE (patterns ~50%)")
+    # Real compression %: read header #defines from generated Common GLSL.
+    try:
+        import re as _re_cmp
+        _cgi = open(glsl_common_file).read()
+        _rle_pct = _vq_pct = None
+        _m_tn = _re_cmp.search(r'#define\s+TOTAL_NOTES\s+(\d+)', _cgi)
+        _m_bm = _re_cmp.search(r'#define\s+BITMAP_BYTES\s+(\d+)', _cgi)
+        _m_id = _re_cmp.search(r'#define\s+IDX_BYTES\s+(\d+)', _cgi)
+        _m_dn = _re_cmp.search(r'#define\s+DICT_NOTES\s+(\d+)', _cgi)
+        _m_rk = _re_cmp.search(r'#define\s+ROWSEEK_BYTES\s+(\d+)', _cgi)
+        if _m_tn and _m_bm and _m_id and _m_dn:
+            _raw_pat = int(_m_tn.group(1)) * 4   # 4-byte note × notes
+            _cmp_pat = int(_m_bm.group(1)) + int(_m_id.group(1)) + int(_m_dn.group(1))*4 + (int(_m_rk.group(1)) if _m_rk else 0)
+            _rle_pct = 100 - (100*_cmp_pat // max(_raw_pat,1))
+        _m_ts = _re_cmp.search(r'#define\s+TOTAL_SAMPLES\s+(\d+)', _cgi)
+        _m_vc = _re_cmp.search(r'#define\s+RVQ_CODES_BYTES\s+(\d+)', _cgi)
+        _m_vk = _re_cmp.search(r'#define\s+RVQ_CB_BYTES\s+(\d+)', _cgi)
+        if _m_ts and _m_vc and _m_vk:
+            _raw_smp = int(_m_ts.group(1))            # raw PCM bytes (int8 → 1 B/sample)
+            _cmp_smp = int(_m_vc.group(1)) + int(_m_vk.group(1))
+            _vq_pct  = 100 - (100*_cmp_smp // max(_raw_smp,1))
+        _parts = []
+        if _rle_pct is not None: _parts.append(f"patterns RLE −{_rle_pct}%")
+        if _vq_pct  is not None: _parts.append(f"samples RVQ −{_vq_pct}%")
+        if _parts:
+            print(f"   🗜️  Compression:    {', '.join(_parts)}")
+    except Exception as _ce:
+        print(f"   🗜️  Compression:    (stats unavailable: {_ce})")
     if getattr(args, 'emit_json', False):
         print(f"")
         print(f"   🔗 After import:")
@@ -15825,15 +16780,27 @@ Generated by MOD2GLSL
         print(f"      ⚠️  If Image code is blank, paste from:")
         print(f"         Image    ← {base_name}_shadertoy_image.glsl")
         print(f"         Buffer A ← {base_name}_shadertoy_bufferA.glsl  (if also blank)")
-        print(f"      Sound    → no channels needed")
+        if args.use_png:
+            print(f"      Sound    → iChannel3 PNG (base64-embedded in JSON, self-contained)")
+            if _png_patterns_in_png:
+                print(f"      Buffer A → iChannel3 PNG (local file path: {os.path.basename(_png_local)})")
+                print(f"      Image    → NO iChannel3 (reads PNG via Buffer A proxy at iChannel1)")
+                print(f"      📌 Pattern + sample data both in PNG.")
+                print(f"         Sound: PNG embedded as base64 (audio works on any machine).")
+                print(f"         Buffer A: PNG loaded from local path; Image reads via proxy.")
+                print(f"         Keep {os.path.basename(_png_local)} alongside the JSON for full tracker.")
+            else:
+                print(f"      Image    → NO iChannel3 (pattern data in Common const arrays)")
+                print(f"      Buffer A → NO iChannel3 (pattern data in Common const arrays)")
+        else:
+            print(f"      Sound    → no channels needed")
     print(f"   🖱️  Click anywhere to toggle oscilloscope ↔ spectrum")
 
     if args.downsample > 1:
         print(f"   ⬇️  Downsampled:    {args.downsample}x")
-    print(f"\n💡 ProTracker timing:")
-    print(f"   - Tick-based playback")
-    print(f"   - Notes trigger on tick 0 only")
-    print(f"   - Persistent channel state")
+
+    # (verbose ANGLE/private-var advisory + ProTracker timing notes removed —
+    # they were just noise. Errors/warnings remain in their original sites.)
 
     # --mp3: render the actual ShaderToy Sound tab to an .mp3 (CPU, via the
     # glslang->spirv-cross->clang toolchain). Friendly no-op if tools missing.
