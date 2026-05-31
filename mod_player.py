@@ -2795,7 +2795,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
                 len(getattr(mod, 'samples', []) or []))
     data_source_comment = "Embedded data (no PNG required)" if use_embedded else f"All data in 1024×1024 RGBA PNG: {png_file}"
     common_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.666 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.7 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    COMMON TAB
    Visualizer: {viz_name}
@@ -2851,15 +2851,19 @@ const float MASTER_GAIN = 1.0;
 // a left-heavy mix that sounds clipped/distorted on the loud lead side.
 const float channelPan[32] = float[]({', '.join([
     (
+        # IT: real per-channel pan (0..64: 0=L, 32=center, 64=R; >64 e.g. 100=surround → center).
+        # ITFile.channel_pan was previously dropped, so IT files panned all-left.
+        ((f'{(mod.channel_pan[i] & 0x7F)/64.0:.4f}' if (mod.channel_pan[i] & 0x7F) <= 64 else '0.5')
+         if (getattr(mod, 'channel_pan', None) and i < len(mod.channel_pan))
         # S3M: use file-specified pan when available (channel_settings list
         # exists and contains valid entries: <8=L, 8..15=R, else fall back).
-        ('0.0' if (getattr(mod, 'channel_settings', None) and
+        else ('0.0' if (getattr(mod, 'channel_settings', None) and
                    i < len(mod.channel_settings) and
                    (mod.channel_settings[i] & 0x7F) < 8)
          else '1.0' if (getattr(mod, 'channel_settings', None) and
                         i < len(mod.channel_settings) and
                         8 <= (mod.channel_settings[i] & 0x7F) < 16)
-         else f'{[0.0,1.0,1.0,0.0][i%4]:.1f}')
+         else f'{[0.0,1.0,1.0,0.0][i%4]:.1f}'))
         if i < mod.num_channels else '0.5'
     )
     for i in range(32)
@@ -3001,11 +3005,11 @@ int getPackedSampleByte(int chunkIdx, int localByteIdx) {{
 struct SampleInfo {{
     int start, smpLen, loopStart, loopLen, volume, bwFactor;
 }};
-const SampleInfo samples[31] = SampleInfo[](
+const SampleInfo samples[{_NSMP}] = SampleInfo[](
 """
-    
-    for i, s in enumerate(sample_map[:31]):
-        comma = "," if i < 30 else ""
+
+    for i, s in enumerate(sample_map[:_NSMP]):
+        comma = "," if i < _NSMP - 1 else ""
         vol = mod.samples[i]['volume'] if i < len(mod.samples) else 64
         common_glsl += f"    SampleInfo({s['start']}, {s['length']}, {s['repeat_point']}, {s['repeat_length']}, {vol}, {s.get('bw_factor',1)}){comma}\n"
     
@@ -3024,10 +3028,22 @@ const int periodTable[37] = int[](
 // Folded form is `PERIOD_TO_FREQ_NUM / period` → 1 div.
 // Python computes the constant; emitted as a literal so GLSL doesn't
 // re-do the math at compile time on every shader load.
+// XM linear-frequency mode toggle (0 = Amiga/MOD/S3M; 1 = XM linear).
+// Patched to 1 at build time when the source is an XM with flags & 1.
+#ifndef XM_LINEAR_FREQ
+#define XM_LINEAR_FREQ 0
+#endif
 const float PERIOD_TO_FREQ_NUM = {7093789.2 / (2.0 * downsample)};  // 7093789.2 / (2 * downsample)
 float periodToFreq(int period) {{
+#if XM_LINEAR_FREQ
+    // XM linear-period mode: freq = 8363 * 2^((6*12*16*4 - period) / (12*16*4))
+    // Periods here are XM linear domain, not Amiga. Divide by downsample at end.
+    if (period <= 0) return 0.0;
+    return (8363.0 * exp2(float(6*12*16*4 - period) / float(12*16*4))) / float({downsample});
+#else
     // Amiga PAL clock / (period * 2 * downsampleFactor)  — pre-folded
     return period > 0 ? PERIOD_TO_FREQ_NUM / float(period) : 0.0;
+#endif
 }}
 
 // Note structure
@@ -3219,7 +3235,9 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
                 }} else {{ break; }}
             }}
             Note prev = getNote(scanPat, scanRow, ch);
-            if (prev.instrument > 0 || prev.period > 0) {{
+            // XM key-off cell: instrument >= 128 and period == 0 (key-off marker, not a real note)
+            bool _prevIsKO = (prev.instrument >= 128) && (prev.period <= 0);
+            if (!_prevIsKO && (prev.instrument > 0 || prev.period > 0)) {{
                 trigNote = prev; trigRow = scanRow; trigPat = scanPat;
                 break;
             }}
@@ -3291,28 +3309,58 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     float freq       = periodToFreq(max(1, int(effectivePeriod)));
     float fSamplePos = elapsed * freq / float(smp.bwFactor);  // map to compressed sample space
 
-    if (smp.loopLen > 2) {{
-        if (fSamplePos >= float(smp.loopStart + smp.loopLen))
-            fSamplePos = float(smp.loopStart) + mod(fSamplePos - float(smp.loopStart), float(smp.loopLen));
+    // Bidi (ping-pong) loops are encoded as negative loopLen.
+    // _absLoopLen is always positive and used for all size/boundary checks.
+    int _absLoopLen = abs(smp.loopLen);
+    if (_absLoopLen > 2) {{
+        float _loopEndF = float(smp.loopStart + _absLoopLen);
+        if (fSamplePos >= _loopEndF) {{
+            float _ov = fSamplePos - float(smp.loopStart);
+            if (smp.loopLen < 0) {{
+                float _ph = mod(_ov, float(2 * _absLoopLen));
+                if (_ph >= float(_absLoopLen)) _ph = float(2 * _absLoopLen) - _ph;
+                fSamplePos = float(smp.loopStart) + _ph;
+            }} else {{
+                fSamplePos = float(smp.loopStart) + mod(_ov, float(smp.loopLen));
+            }}
+        }}
     }} else if (fSamplePos >= float(smp.smpLen)) {{
         return 0.0;
     }}
     if (fSamplePos < 0.0) return 0.0;
 
-    float s = getSampleF(smp.start, fSamplePos, smp.smpLen, smp.loopStart, smp.loopLen);
+    float s = getSampleF(smp.start, fSamplePos, smp.smpLen, smp.loopStart, _absLoopLen);
 
     // ── Volume: forward scan trigger→current to honour Cxx cuts & Axx slides ─
     // ProTracker volume slide (Effect A/6) SKIPS tick 0 → applies (SPEED-1) ticks per row.
     int volume = smp.volume;
-    // Trigger-row effect — Cxx takes priority, then IT vol-col, then vol-slide
+    // A00 param memory: running last non-zero Axx rate (XM/MikIT: A00 continues last rate).
+    int _lastAParam = 0;
+    // Trigger-row volume: vol_col (XM/IT note-volume column) sets base volume first,
+    // then Cxx or Axx effect can override/modify on top of it.
+    if (trigNote.vol_col > 0)
+        volume = min(trigNote.vol_col, 64);
+    // Trigger-row effect — Cxx takes priority, then vol-slide (Axx/6xx)
     if (trigNote.effect == 0xC) {{
         volume = min(trigNote.param, 64);
-    }} else if (trigNote.vol_col > 0) {{
-        // IT volume-column note volume (for cells that have both a vol-col and
-        // a non-Cxx effect — encoded in byte 4 of the pattern cell)
-        volume = min(trigNote.vol_col, 64);
     }} else if (trigNote.effect == 0xA || trigNote.effect == 0x6) {{
-        int _su=(trigNote.param>>4)&0xF, _sd=trigNote.param&0xF;
+        // A00 param memory: backward scan for last non-zero Axx param
+        int _vsParam = trigNote.param;
+        if (_vsParam == 0) {{
+            int _bsp = trigPat, _bsr = trigRow - 1;
+            for (int _bi = 0; _bi < 32; _bi++) {{
+                if (_bsr < 0) {{
+                    if (_bsp > 0) {{ _bsp--; _bsr = patStartRow[_bsp] + (patRowOffset[_bsp+1]-patRowOffset[_bsp]) - 1; }}
+                    else {{ break; }}
+                }}
+                if (_bsr < patStartRow[_bsp]) {{ _bsp--; if (_bsp < 0) break; _bsr = patStartRow[_bsp] + (patRowOffset[_bsp+1]-patRowOffset[_bsp]) - 1; }}
+                Note _bsn = getNote(_bsp, _bsr, ch);
+                if ((_bsn.effect == 0xA || _bsn.effect == 0x6) && _bsn.param != 0) {{ _vsParam = _bsn.param; break; }}
+                if (_bsn.period > 0 && _bsn.effect != 0x3 && _bsn.effect != 0x5) break;
+                _bsr--;
+            }}
+        }}
+        int _su=(_vsParam>>4)&0xF, _sd=_vsParam&0xF;
         int _delta;
         if (_su==0xF && _sd>0)       _delta = -_sd;
         else if (_sd==0xF && _su>0)  _delta = _su;
@@ -3325,6 +3373,7 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
             _delta = (_su>0?_su:-_sd) * _tTicks;
         }}
         volume = clamp(volume + _delta, 0, 64);
+        _lastAParam = _vsParam;
     }}
     // Forward scan through non-note rows from trigRow+1 to pos.row-1
     // Effect D can shorten patterns — skip phantom rows by using patRowOffset boundaries
@@ -3357,7 +3406,9 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
             if (_fn.effect==0xC)
                 volume = min(_fn.param, 64);
             else if (_fn.effect==0xA || _fn.effect==0x6) {{
-                int _su=(_fn.param>>4)&0xF, _sd=_fn.param&0xF;
+                if (_fn.param != 0) _lastAParam = _fn.param;
+                int _fnPrm = _lastAParam;
+                int _su=(_fnPrm>>4)&0xF, _sd=_fnPrm&0xF;
                 int _delta;
                 if (_su==0xF && _sd>0)       _delta = -_sd;
                 else if (_sd==0xF && _su>0)  _delta = _su;
@@ -3378,7 +3429,9 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
             if (_cr.effect==0xC)
                 volume = min(_cr.param, 64);
             else if (_cr.effect==0xA || _cr.effect==0x6) {{
-                int _su=(_cr.param>>4)&0xF, _sd=_cr.param&0xF;
+                if (_cr.param != 0) _lastAParam = _cr.param;
+                int _crPrm = _lastAParam;
+                int _su=(_crPrm>>4)&0xF, _sd=_crPrm&0xF;
                 int _delta;
                 if (_su==0xF && _sd>0)       _delta = -_sd;
                 else if (_sd==0xF && _su>0)  _delta = _su;
@@ -3493,7 +3546,7 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     _ap_p0_2, _ap_p1p2_2, _ap_delay_2 = _only3d_coeffs(_ONLY3D_FREQ2)
 
     sound_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.666 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.7 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    SOUND TAB
    Visualizer: {viz_name}
@@ -3550,7 +3603,7 @@ float getMixedMono(float time_offset, Position pos, float rowTime) {{
     float mix = 0.0;
     for (int ch = 0; ch < NUM_CHANNELS; ch++)
         mix += getChannelOutput(ch, time_offset, pos, rowTime);
-    const float normFactor = 5.0 / float(NUM_CHANNELS);  // bumped 2.0→5.0 (~2.5× louder; 6.0 hot for non-PNG with raw-perc)
+    const float normFactor = 3.5 / float(NUM_CHANNELS);  // loud-but-clean (tuned on 2ND_PM). 5.0 distorted ONLY via the former 3 stacked soft-knees; with the single output limiter 3.5 = +2.3dB over the oracle, peak ~0.96, ~0.09% in the gentle knee (transparent)
     return mix * normFactor;
 }}
 
@@ -3672,8 +3725,8 @@ vec2 mainSound(int samp, float time) {{
     
     for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
         float s = getChannelOutput(ch, playbackTime, pos, rowTime);
-        float panR = 0.25 + 0.5 * channelPan[ch];   // 0.25..0.75
-        float panL = 1.0 - panR;                     // 0.75..0.25
+        float panR = {('channelPan[ch]' if getattr(mod, 'is_it', False) else '0.25 + 0.5 * channelPan[ch]')};   // IT: direct pan (MikIT-exact); else 75% Amiga separation
+        float panL = 1.0 - panR;
         int cm = ch % 4;
         int ch1 = cm + 1;  // 1-indexed
         bool isSurr = (ch1 == surr_channels.x || ch1 == surr_channels.y);
@@ -3682,7 +3735,7 @@ vec2 mainSound(int samp, float time) {{
     }}
     
     // OPT: const-qualified — NUM_CHANNELS is a #define.
-    const float normFactor = 5.0 / float(NUM_CHANNELS);  // bumped 2.0→5.0 (~2.5× louder; 6.0 hot for non-PNG with raw-perc)
+    const float normFactor = 3.5 / float(NUM_CHANNELS);  // loud-but-clean (tuned on 2ND_PM). 5.0 distorted ONLY via the former 3 stacked soft-knees; with the single output limiter 3.5 = +2.3dB over the oracle, peak ~0.96, ~0.09% in the gentle knee (transparent)
     surrL *= normFactor; surrR *= normFactor;
     centL *= normFactor; centR *= normFactor;
     
@@ -3777,26 +3830,18 @@ vec2 mainSound(int samp, float time) {{
         _out += _vw * _VELV_WET;
     }}
 
-    // Rational soft-knee BEFORE FAT4X (keeps fat_cs1 arg strictly in [-1,1]).
-    _out = softLimit(_out);
-
     // ── FAT4X harmonic exciter (stateless, vec2) — ported from mod_player.py ─
     // cs1 even-harmonic waveshaper. FAT_AMOUNT 0.5 (+the inner ×0.5) tuned so
-    // bass-heavy mixes don't stack gain past the ceiling.
+    // bass-heavy mixes don't stack gain past the ceiling. A single soft-knee
+    // BEFORE cs1 bounds its argument to [-1,1] (the even-power series goes
+    // non-monotonic past 1.0) — only needed when FAT is on. Otherwise the lone
+    // output limiter is the end-of-chain softLimit at the return; stacking
+    // extra knees only compounds harmonic distortion (the old "too distortingly
+    // loud" path). One limiter — scale the mix with normFactor instead.
     if (enableFAT) {{
+        _out = softLimit(_out);            // bound cs1's input to [-1,1]
         const float FAT_AMOUNT = 0.5;
         _out = _out * (1.0 + 0.5 * fat_cs1(_out) * FAT_AMOUNT);
-    }}
-
-    // ── End-of-chain soft-limit (UNCONDITIONAL) — guarantees |_out| ≤ 1 ────
-    {{
-        vec2 _ax = abs(_out);
-        const float _T = 0.85;
-        const float _C = 1.0;
-        const float _H = _C - _T;
-        vec2 _over    = max(_ax - _T, vec2(0.0));
-        vec2 _reduced = (_H * _over) / (_over + _H);
-        _out = sign(_out) * (min(_ax, vec2(_T)) + _reduced);
     }}
 
     // Hand off to v1.666's comb reverb + buffer-fade (kept active; mod_player.py
@@ -6871,7 +6916,7 @@ vec3 _VizScene(vec2 fragCoord) {
 
 
     image_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.666 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.7 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    IMAGE TAB — iChannel0: alphabet texture (shadertoy.com/view/4sf3RB)
                 iChannel1: Buffer A (audio + FFT + smoothed bands)
@@ -6979,7 +7024,7 @@ makeStr(printBPMVal) {bpm_val_chars} _end
 makeStr(printSpdVal) {spd_val_chars} _end
 
 // ---- Static label strings ----
-makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _6 _6 _6 _ _NUM _NUM _NUM _end
+makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _7 _0 _ _NUM _NUM _NUM _end
 makeStr(printCredit) _COPY _2 _0 _2 _6 _ _O _R _B _L _I _V _I _U _S _end
 makeStr(printLoad)   _L _O _A _D _I _N _G _DOT _DOT _DOT _end
 makeStr(printSpec)   _S _P _E _C _T _R _U _M _end
@@ -7316,14 +7361,20 @@ void mainImage(out vec4 O, vec2 C) {{
     float _trkLeft  = ML + rNW + 8.;
     float _trkRight = iResolution.x - ML;
     float _availW   = _trkRight - _trkLeft;
-    // EVERY cell stretches to the same width: TW = _availW / N. Always fills.
-    // Font stays at 18 px when there's room; shrinks proportionally when not.
     const float _natTCW = 18.;          // natural char width
-    float TW    = _availW / float(NUM_CHANNELS);
-    float TCW   = min(_natTCW, (TW - 6.) / 9.);          // shrink only if cell too narrow
+    const float _natTW  = 9.*_natTCW + 6.;  // natural cell width (168 px)
+    const float _minTW  = 160.;         // MIN cell width — fits "TRACK 12" header with breathing room
+    // Three regimes:
+    //   1. Plenty of room (e.g. 4-ch MOD on 1280 px) → use _natTW, center each cell's text.
+    //   2. Tight but workable → stretch up to fill window (TW = _availW / N).
+    //   3. Too many channels (e.g. 30-ch XM on 1280 px) → clamp at _minTW; the
+    //      group OVERFLOWS off-screen right (better readable + cut off than
+    //      tiny-and-readable-by-nobody).
+    float TW    = clamp(_availW / float(NUM_CHANNELS), _minTW, max(_natTW, _minTW));
+    float TCW   = min(_natTCW, (TW - 6.) / 9.);
     float _textW   = 9. * TCW;
-    float _cellPad = max(0., (TW - _textW - 6.) * 0.5);  // center text in cell
-    float txOff = _trkLeft;
+    float _cellPad = max(0., (TW - _textW - 6.) * 0.5);
+    float txOff = _trkLeft + _scrollX;  // restored: horizontal scroll for overflow (high-ch songs)
     const int NROWS = 12;  // visible tracker rows (best subjective fit; 64 % 12 = 4 stub page)
 
     // Track headers — dynamic loop over all channels, colored by tc%4,
@@ -7361,8 +7412,94 @@ void mainImage(out vec4 O, vec2 C) {{
     // Vertical column separators are now col-based darkening (see divider
     // lines section below), not trk-overlay blue lines.
 
-    float tTop = ty+CH+3.;
+    const float VH  = 8.;         // volume bar strip height (px)
+    float tHdrBot = ty+CH+3.;     // bottom of TRACK header (used for bevel)
+    float tTop = tHdrBot+VH;      // top of tracker rows (shifted down by VH)
     float tBot = tTop+float(NROWS)*CH;
+
+    // ── Per-channel volume bars (between TRACK header and rows) ──────────────
+    {{
+        const vec3 bTCols[4] = vec3[](TC0, TC1, TC2, TC3);
+        float barTop = tHdrBot;
+        if(fp.y >= barTop && fp.y < barTop+VH) {{
+            float sy  = fp.y - barTop;
+            float _xH = fp.x - txOff;
+            if(_xH >= 0.0) {{
+                int tc = int(_xH / TW);
+                float cx = _xH - float(tc)*TW;
+                if(tc >= 0 && tc < NUM_CHANNELS && cx > 1.0 && cx < TW-1.0) {{
+                    int pat0    = songPositions[pos.songPos];
+                    float effVol = 0.0;
+                    for(int rb = 0; rb < 24; rb++) {{
+                        int rr = pos.row - rb;
+                        if(rr < 0) break;
+                        int rg  = pat0 * 64 + rr;
+                        int ni  = rg * NUM_CHANNELS + tc;
+                        int bmb = fetchBitmapByte(ni >> 3);
+                        if(((bmb >> (ni & 7)) & 1) != 0) {{
+                            int rnk  = rowSeekCum(rg);
+                            int s2   = rg * NUM_CHANNELS;
+                            int bIdx = s2 >> 3, sh = s2 & 7;
+                            int rb0  = fetchBitmapByte(bIdx);
+                            int rb1  = fetchBitmapByte(bIdx+1);
+                            int rb2  = fetchBitmapByte(bIdx+2);
+                            int rb3  = fetchBitmapByte(bIdx+3);
+                            int rb4f = fetchBitmapByte(bIdx+4);
+                            int rowB = (rb0>>sh)|(rb1<<(8-sh))|(rb2<<(16-sh))|(rb3<<(24-sh));
+                            if(sh!=0) rowB |= rb4f<<(32-sh);
+                            rowB &= (1<<NUM_CHANNELS)-1;
+                            int rrb  = rowB & ((1<<tc)-1);
+                            rnk += popcount16(rrb&0xFFFF)+popcount16((rrb>>16)&0xFFFF);
+                            int didx = fetchIdxByte(rnk*2)|(fetchIdxByte(rnk*2+1)<<8);
+                            int vcol = fetchDictByte(didx*5+4);
+                            int b2   = fetchDictByte(didx*5+2);
+                            int b3   = fetchDictByte(didx*5+3);
+                            int eff  = b2 & 0x0F;
+                            int par  = b3;
+                            float vol64 = (vcol > 0 && vcol <= 64) ? float(vcol) : 32.0;
+                            if(rb == 0) {{
+                                if(eff == 0xA || eff == 0x6) {{
+                                    int su = (par >> 4) & 0xF;
+                                    int sd = par & 0xF;
+                                    float ticks = max(0.0, pos.tick - 1.0);
+                                    if(su > 0 && sd == 0)
+                                        vol64 = min(64.0, vol64 + float(su)*ticks);
+                                    else if(sd > 0 && su == 0)
+                                        vol64 = max(0.0, vol64 - float(sd)*ticks);
+                                }}
+                                effVol = vol64 / 64.0;
+                            }} else {{
+                                effVol = (vol64 / 64.0) * pow(0.75, float(rb));
+                            }}
+                            break;
+                        }}
+                    }}
+                    vec3 trkCol   = bTCols[tc & 3];
+                    bool topEdge  = sy < 1.0;
+                    bool botEdge  = sy >= VH - 1.0;
+                    bool leftEdge = cx < 2.0;
+                    bool rightEdge= cx >= TW - 2.0;
+                    bool fillZone = sy >= 2.0 && sy < 6.0;
+                    if(topEdge || rightEdge) {{
+                        col = max(col * 0.20, vec3(0.05, 0.02, 0.02));
+                    }} else if(botEdge || leftEdge) {{
+                        col = min(vec3(1.0), col + vec3(0.22, 0.22, 0.32));
+                    }} else if(fillZone) {{
+                        float barW = effVol * (TW - 4.0);
+                        if(cx - 1.0 < barW) {{
+                            float t     = (cx - 1.0) / max(barW, 1.0);
+                            vec3 barCol = mix(trkCol * 1.6, trkCol * 0.5, t);
+                            col = clamp(barCol, vec3(0.0), vec3(1.0));
+                        }} else {{
+                            col *= 0.10;
+                        }}
+                    }} else {{
+                        col *= 0.18;
+                    }}
+                }}
+            }}
+        }}
+    }}
 
     // Page mode: show a fixed page of rows, frame moves line by line within it
     // Page flips when frame hits bottom → jumps to top of next page
@@ -7392,11 +7529,18 @@ void mainImage(out vec4 O, vec2 C) {{
                 float _ctr = float(NUM_CHANNELS - 1) * 0.5;
                 float _d   = abs(float(_tcF) - _ctr) / max(_ctr, 1.0);  // 0 center → 1 edge
                 col *= 1.0 - 0.35 * _d;
+                // Subtle track-color tint: blend the column's track color into
+                // the row background at low opacity so the tracker carries a
+                // hint of the lane's color (matches the header tab).
+                const vec3 _trBgT[4] = vec3[](TC0, TC1, TC2, TC3);
+                col = mix(col, _trBgT[_tcF & 3] * 0.5, 0.14);
             }}
-            // Row-distance fade: rows farther from the playing row dim out.
-            // Classic tracker focus effect — eye drawn to the current row.
+            // Row-distance fade — Phong-style focus: flat near current row,
+            // steeper falloff at edges. f(d) = 1 - d² is concave-down (slope
+            // 0 at d=0, slope −2 at d=1) so close rows stay readable.
             float _rDist = abs(float(ri_z - frameRow)) / max(float(NROWS), 1.0);
-            col *= 1.0 - 0.55 * _rDist;
+            float _rFall = 1.0 - _rDist * _rDist;             // (1 − d²)
+            col *= mix(0.45, 1.0, _rFall);                    // 0.45 floor at edges
         }}
         // 3D bevel: 2px highlight (top + left), 2px shadow (bottom + right)
         bool _hiH = _rowFrac < 2.0;
@@ -7432,22 +7576,24 @@ void mainImage(out vec4 O, vec2 C) {{
                 col = max(col * 0.20, vec3(0.05, 0.02, 0.02));
         }}
         // TRACK #N header row — horizontal bevel + per-column left/right bevel
-        else if(fp.y >= ty && fp.y < tTop) {{
+        else if(fp.y >= ty && fp.y < tHdrBot) {{
             float _xH  = fp.x - txOff;
             float _cFH = _xH >= 0.0 ? mod(_xH, TW) : -1.0;
             bool _hHi  = fp.y < ty + 2.0 || (_xH >= 0.0 && _cFH < 2.0);
-            bool _hSh  = fp.y > tTop - 2.0 || (_xH >= 0.0 && _cFH >= TW - 2.0);
+            bool _hSh  = fp.y > tHdrBot - 2.0 || (_xH >= 0.0 && _cFH >= TW - 2.0);
             if(_hHi)      col = min(vec3(1.0), col + vec3(0.22, 0.22, 0.32));
             else if(_hSh) col = max(col * 0.20, vec3(0.05, 0.02, 0.02));
             else {{
-                // Diagonal gradient REFLECTED around the cell's diagonal axis:
-                // brightest along the diagonal (top-left↔bottom-right), fading
-                // to darker on both off-diagonal corners (top-right & bottom-left).
-                float _gX = (_xH >= 0.0 ? _cFH : 0.0) / max(TW, 1.0);
-                float _gY = (fp.y - ty) / max(tTop - ty, 1.0);
-                float _dToDiag = abs(_gX - _gY);                   // 0 on diag → up to 1 at off-diag corners
-                float _gM = mix(1.66, 0.34, _dToDiag);             // 66% lighter on diag → 66% darker off it
+                // Simple vertical gradient: light at top → darker at bottom
+                float _gY = (fp.y - ty) / max(tHdrBot - ty, 1.0);  // 0=top, 1=bottom
+                float _gM = mix(1.50, 0.65, _gY);
                 col = min(vec3(1.0), col * _gM);
+                // Per-track color tint: mix the track title color into the button background
+                if(_xH >= 0.0) {{
+                    const vec3 _hTCols[4] = vec3[](TC0, TC1, TC2, TC3);
+                    int _htc = int(_xH / TW);
+                    col = mix(col, _hTCols[_htc & 3] * _gM * 0.7, 0.22);
+                }}
             }}
         }}
     }}
@@ -7495,8 +7641,18 @@ void mainImage(out vec4 O, vec2 C) {{
                 int c=nCell(n.period,n.instrument,n.effect,n.param,ci);
                 float _sx = txOff+float(tc)*TW+_cellPad+float(ci)*TCW+3.0;
                 float _sy = tTop+float(ri_abs)*CH;
-                col *= 1.0 - 0.45 * drawCh(c, fp, _sx+1., _sy+1., TCW,CH);
-                float g=drawCh(c, fp, _sx, _sy, TCW,CH);
+                // ── Text alpha — "slow slow then accelerate toward playing row".
+                // Ease-in curve: alpha stays low+stable at edges, ramps up
+                // sharply near frameRow so it visibly "highlights" the current
+                // row. _SHARP controls how aggressive the spotlight is (>1 =
+                // tighter highlight). Floor 0.35 keeps edges still legible.
+                const float _SHARP = 2.0;
+                float _txtD    = abs(float(ri_abs - frameRow)) / max(float(NROWS), 1.0);
+                float _txtFall = pow(max(0.0, 1.0 - _txtD), _SHARP);  // ease-in
+                float _txtFade = (ri_abs == frameRow) ? 1.0
+                                                       : mix(0.35, 1.0, _txtFall);
+                col *= 1.0 - 0.45 * _txtFade * drawCh(c, fp, _sx+1., _sy+1., TCW,CH);
+                float g = _txtFade * drawCh(c, fp, _sx, _sy, TCW,CH);
                 bool isEmpty=(n.period==0&&n.instrument==0&&n.effect==0);
                 const vec3 TCols[4]=vec3[](TC0,TC1,TC2,TC3);
                 vec3 nc;
@@ -7950,7 +8106,7 @@ void mainImage(out vec4 O, vec2 C) {{
     # Setup: Buffer A iChannel0 = Buffer A (self-ref)
     #        Image   iChannel1 = Buffer A output
     buffer_a_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.666 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.7 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    Contact: subband@gmail.com or
             subband@protonmail.com
@@ -10970,6 +11126,45 @@ def _pack_build_into_png(common_path, sound_path, png_path,
     common = open(common_path).read()
     sound  = open(sound_path).read()
 
+    # ── >16-channel pattern-decoder fix ──────────────────────────────────────
+    # The compressed getNote computes the within-row note rank by popcount of
+    # the row bitmap up to `channel`. The original read only 3 bytes (24 bits)
+    # into `combined` and used popcount16 (16 bits) — correct for ≤16 channels,
+    # but a 30-channel XM needs up to 30 bits + 7-bit row shift = 5 bytes and a
+    # 32-bit popcount. Without this, channels >~16 got the WRONG rank → fetched
+    # the wrong dictionary note → high channels played garbage / dropped out
+    # ("not mixing all channels", wrong chord). The 5-byte/popcount32 form is a
+    # superset (identical result for ≤16ch) so it is applied unconditionally.
+    _dec_old = (
+        "    int byte0 = fetchBitmapByte(byte0Idx);\n"
+        "    int byte1 = fetchBitmapByte(byte0Idx + 1);\n"
+        "    int byte2 = fetchBitmapByte(byte0Idx + 2);\n"
+        "    int combined = byte0 | (byte1 << 8) | (byte2 << 16);\n"
+        "    int rowBits = (combined >> shift) & ((1 << NUM_CHANNELS) - 1);\n"
+        "    int mask = (1 << channel) - 1;\n"
+        "    rank += popcount16(rowBits & mask);")
+    _dec_new = (
+        "    int byte0 = fetchBitmapByte(byte0Idx);\n"
+        "    int byte1 = fetchBitmapByte(byte0Idx + 1);\n"
+        "    int byte2 = fetchBitmapByte(byte0Idx + 2);\n"
+        "    int byte3 = fetchBitmapByte(byte0Idx + 3);\n"
+        "    int byte4 = fetchBitmapByte(byte0Idx + 4);\n"
+        "    int rowBits = (byte0 >> shift) | (byte1 << (8 - shift))\n"
+        "                | (byte2 << (16 - shift)) | (byte3 << (24 - shift));\n"
+        "    if (shift != 0) rowBits |= (byte4 << (32 - shift));\n"
+        "    rowBits &= ((1 << NUM_CHANNELS) - 1);\n"
+        "    int mask = (1 << channel) - 1;\n"
+        "    int rb = rowBits & mask;\n"
+        "    rank += popcount16(rb & 0xFFFF) + popcount16((rb >> 16) & 0xFFFF);")
+    _dec_hits = common.count(_dec_old) + sound.count(_dec_old)
+    if _dec_old in common:
+        common = common.replace(_dec_old, _dec_new)
+    if _dec_old in sound:
+        sound = sound.replace(_dec_old, _dec_new)
+    if _dec_hits:
+        _q("   ✓ >16-channel pattern decoder fix applied (%d site(s): "
+              "5-byte rowBits + popcount32)" % _dec_hits)
+
     # ── Cascade-macro fix: extract rowSeekCum + getNote from Common ──────────
     # These functions call fetch*Byte macros which cascade through getByte to
     # fetchPixel. In Common, fetchPixel is the macro stub `0`, so the function
@@ -11026,7 +11221,8 @@ def _pack_build_into_png(common_path, sound_path, png_path,
     # can call the pattern-decode fetch functions that are also in Common.
     # JSON wires iChannel3 to all 3 passes; use local file path (not base64×3)
     # to keep JSON small and avoid the "froze after 1 frame" 1.2MB JSON issue.
-    _KNOWN = {'vqCodes', 'vqCodebook', 'patBitmap', 'patDict', 'patIdx', 'patRowSeek'}
+    _KNOWN = {'vqCodes', 'vqCodebook', 'patBitmap', 'patDict', 'patIdx', 'patRowSeek',
+              'presvPCM'}   # presvPCM = raw (un-VQ'd) --preserve'd PCM, moved to PNG
 
     def _stream(lg):
         out = bytearray()
@@ -11142,7 +11338,8 @@ def _pack_build_into_png(common_path, sound_path, png_path,
                   if lg in arr_chunks and lg in _KNOWN]
     # rowStartTick stays as const ivec4 array in Common — getPosition() reads
     # it every sample; PNG texelFetches on a hot binary-search path = GPU hang.
-    order = _VQ_NAMES + _PAT_NAMES
+    _PRESV_NAMES = [lg for lg in ('presvPCM',) if lg in arr_chunks and lg in _KNOWN]
+    order = _VQ_NAMES + _PAT_NAMES + _PRESV_NAMES
     # Start blob with: [64-byte header][metadata sections][existing ivec4 sections]
     blob = bytearray(_header) + bytearray(_meta_blob)
     off  = dict(_meta_off)   # seed with metadata offsets
@@ -11884,7 +12081,7 @@ def main():
                              "resolution but slower compile. Default: 1024 (or 128 if "
                              "--max-compat without override).")
     parser.add_argument('--max-compat', action='store_true', default=False,
-                        help='[NO-OP — max-compat is now the DEFAULT in v1.40+ (current: v1.666)] '
+                        help='[NO-OP — max-compat is now the DEFAULT in v1.40+ (current: v1.7)] '
                              'This flag previously enabled compatibility mode '
                              'for problematic GPUs/drivers (Windows + Firefox + '
                              'NVIDIA, etc.). The compat preset (--resampler '
@@ -11913,6 +12110,20 @@ def main():
     if args.use_png:
         args.bitrate = 'ultra'
         args.raw_perc = False
+
+    # ── NNA --png fast path (IT) ──────────────────────────────────────────────
+    # IT files with --png get the per-voice NNA blob build: emit per-tick stream
+    # (mikIT) → bake blob → PNG + GLSL → import JSON (with the web-import fixes).
+    # The timeline VQ path is a budget dead-end for NNA-heavy IT (e.g. jeff.it),
+    # so dispatch here and skip it entirely. Output: {base}_shadertoy.json.
+    if (args.use_png and detect_module_format(args.modfile).lower() == 'it'
+            and 'NNA_BYPASS' not in os.environ):
+        import bake_nna as _bnna
+        _nbase = os.path.splitext(os.path.basename(args.modfile))[0]
+        print(f"🎛️  NNA --png build (IT): {args.modfile} → {_nbase}_shadertoy.json")
+        _bnna.build_nna(args.modfile, _nbase)
+        print(f"   ✅ {_nbase}_shadertoy.json   ← ShaderToy ▸ Import")
+        sys.exit(0)
 
     # args.emit_json defaults True; pass --no-json to suppress JSON output.
 
@@ -12138,6 +12349,7 @@ def main():
             'initial_speed':  it.initial_speed,
             'initial_tempo':  it.initial_tempo,
             'channel_settings': list(getattr(it, 'channel_settings', []) or []),
+            'channel_pan':    list(getattr(it, 'channel_pan', []) or []),   # IT 0..64 per-channel pan (was dropped → all-left bug)
             'is_s3m':         False,
             'is_it':          True,
         })()
@@ -12281,6 +12493,7 @@ def main():
             'is_s3m':         False,
             'is_xm':          True,
             'is_it':          False,
+            'linear_freq':    bool(getattr(xm, 'linear_freq', False)),
         })()
         mod._it_timeline_glsl = None
         mod._it_timeline_tps  = None
@@ -13835,7 +14048,7 @@ Generated by MOD2GLSL
                 # glsl_state_dump.py / sound_exec.py inject it themselves.
                 _ct = _ct.replace(
                     "GLSL (The Last) MOD Player v1.42 (c) 2026 Orblivius",
-                    "GLSL (The Last) MOD Player v1.666 (c) 2026 Orblivius", 1)
+                    "GLSL (The Last) MOD Player v1.7 (c) 2026 Orblivius", 1)
                 _ct = _ct.replace("   COMMON TAB\n", f"   COMMON TAB\n   Visualizer: {_vname}\n", 1)
 
                 # Inject visualizer note-synth helpers (waveType[] + _synthWave).
@@ -14096,9 +14309,24 @@ Generated by MOD2GLSL
                             _v = [int(x) for x in _nums]
                             _len = max(0, _v[1])
                             _ls  = min(max(0, _v[2]), _len)            # 0 ≤ loopStart ≤ length
+                            # Bidi loops (XM/S3M stype & 3 == 2) encoded as
+                            # negative loopLen; GLSL uses abs() to recover the
+                            # magnitude and smp.loopLen < 0 to detect ping-pong.
+                            _smp_bidi = False
+                            try:
+                                _bd = (mod.samples[_si_idx]
+                                       if (_si_idx < len(mod.samples)
+                                           and isinstance(mod.samples[_si_idx], dict))
+                                       else {})
+                                _stype_b = int((_bd or {}).get('stype', 0)) & 0x03
+                                _smp_bidi = (_stype_b == 2)
+                            except Exception:
+                                _smp_bidi = False
                             _ll  = max(0, _v[3])
                             if _ls + _ll > _len:                       # loop end ≤ length
                                 _ll = _len - _ls
+                            if _smp_bidi and _ll > 2:
+                                _ll = -_ll  # encode bidi as negative loopLen
                             if (_ls, _ll) != (_v[2], _v[3]):
                                 _n_clamped += 1
                             _v[1], _v[2], _v[3] = _len, _ls, _ll
@@ -14177,8 +14405,15 @@ Generated by MOD2GLSL
                                     _pt = max(0, min(0x1FFFF, int(_pp[0])))
                                     _pv = max(0, min(64, int(_pp[1])))
                                     _env_pts_all.append((_pt << 7) | _pv)
-                                _esus = (int(_esmp.get('env_sus_pt', 0))
-                                         if _esmp.get('env_sus') else -1)
+                                # BOTH XMFile and ITFile set env_sus as a BOOLEAN
+                                # ("sustain enabled" flag). XMFile additionally sets
+                                # env_sus_en = env_sus_pt unconditionally (it's just an
+                                # INDEX, not a flag) — DO NOT OR env_sus_en into the
+                                # gate: it makes every voice with a non-zero sus_pt
+                                # sustain forever (entire song stuck loud, env corr
+                                # 0.19 vs mikit). env_sus alone is the correct gate.
+                                _sus_on = bool(_esmp.get('env_sus'))
+                                _esus = int(_esmp.get('env_sus_pt', 0)) if _sus_on else -1
                                 if _esmp.get('env_loop'):
                                     _elp = ((int(_esmp.get('env_loop_st', 0)) & 0xFF) << 8) \
                                            | (int(_esmp.get('env_loop_en', 0)) & 0xFF)
@@ -14214,12 +14449,60 @@ Generated by MOD2GLSL
                         else:
                             _si_fixed.append(_e)
                     _si_entries = _si_fixed
+                    # ── XM pan-envelope point pool (parallel to _itEPt; FT2
+                    #    dynamic-pan). Built per sample slot, indexed by
+                    #    instrument-1 to match samples[]. XM-ONLY — non-XM emits
+                    #    nothing, keeps static channelPan[] (zero added cost).
+                    _pan_decl = ""
+                    if getattr(mod, 'is_xm', False):
+                        _panEPt = []; _peoff_a = []; _pen_a = []
+                        _pesus_a = []; _pelp_a = []
+                        for _pi in range(_si_n):
+                            _peoff, _pen, _pesus, _pelp = 0, 0, -1, -1
+                            try:
+                                _ps = (mod.samples[_pi]
+                                       if (_pi < len(mod.samples)
+                                           and isinstance(mod.samples[_pi], dict))
+                                       else {})
+                                _ppts = _ps.get('pan_env_pts') or []
+                                if _ppts:
+                                    _peoff = len(_panEPt)
+                                    _pen = min(len(_ppts), 12)
+                                    for _pp in _ppts[:12]:
+                                        _ppt = max(0, min(0x1FFFF, int(_pp[0])))
+                                        _ppv = max(0, min(64, int(_pp[1])))
+                                        _panEPt.append((_ppt << 7) | _ppv)
+                                    _pesus = (int(_ps.get('pan_env_sus_pt', 0))
+                                              if _ps.get('pan_env_sus') else -1)
+                                    if _ps.get('pan_env_loop'):
+                                        _pelp = ((int(_ps.get('pan_env_loop_st', 0)) & 0xFF) << 8) \
+                                                | (int(_ps.get('pan_env_loop_en', 0)) & 0xFF)
+                            except Exception:
+                                _peoff, _pen, _pesus, _pelp = 0, 0, -1, -1
+                            _peoff_a.append(_peoff); _pen_a.append(_pen)
+                            _pesus_a.append(_pesus); _pelp_a.append(_pelp)
+                        if not _panEPt:
+                            _panEPt = [(0 << 7) | 32]
+                        _pan_decl = (
+                            f"const int _itPanEPt[{len(_panEPt)}] = int[]("
+                            + ",".join(str(x) for x in _panEPt) + ");\n"
+                            + f"const int _panEOff[{_si_n}] = int[]("
+                            + ",".join(str(x) for x in _peoff_a) + ");\n"
+                            + f"const int _panEN[{_si_n}] = int[]("
+                            + ",".join(str(x) for x in _pen_a) + ");\n"
+                            + f"const int _panESus[{_si_n}] = int[]("
+                            + ",".join(str(x) for x in _pesus_a) + ");\n"
+                            + f"const int _panELp[{_si_n}] = int[]("
+                            + ",".join(str(x) for x in _pelp_a) + ");\n")
+                        _q(f"   ✓ XM pan envelopes: "
+                              f"{sum(1 for x in _pen_a if x>0)} instruments, "
+                              f"{len(_panEPt)} points (FT2 dynamic pan)")
                     # MOD+ vol-envelope point pool, emitted right before
                     # samples[] (Common is prepended → _gcoBody sees it).
                     _ep = _env_pts_all if _env_pts_all else [0]
                     _itept_decl = (f"const int _itEPt[{len(_ep)}] = int[]("
                                    + ",".join(str(x) for x in _ep) + ");\n")
-                    _si_new = (_itept_decl
+                    _si_new = (_itept_decl + _pan_decl
                                + f"const SampleInfo samples[{_si_n}] = SampleInfo[](\n    "
                                + ",\n    ".join(_si_entries) + "\n);")
                     _ct = _ct[:_m_si.start()] + _si_new + _ct[_m_si.end():]
@@ -14639,6 +14922,49 @@ Generated by MOD2GLSL
                 _sound_src = _sound_src.replace(
                     '// getByte / getPatternByte / getSample / getNote / getChannelOutput are in Common.',
                     '// Sample decoders defined above; pattern/getNote/getChannelOutput in Common.')
+
+                # ── 9xx sample-offset: short declick + clamp offset to sample-end ──
+                # The baseline shader uses a 192-sample smoothstep fade-in
+                # for 9xx-triggered voices ("masks the mid-waveform start
+                # discontinuity"), but at ~4.4ms it audibly soft-attacks
+                # every chop in dense 9xx patterns (maxmlism inst 18
+                # 'harmonic' chops every other row — user reports "inst 18
+                # not playing right; offset isn't working"). HTML uses no
+                # extra fade. Drop to the standard 64-sample linear so the
+                # attack lands at the right moment / loudness, matching
+                # HTML/mikit. Trade-off: one-time mid-waveform click is
+                # audible if the sample happens to be near a zero-crossing,
+                # but in practice the attack-energy mask is the bigger
+                # perceptual issue.
+                # Anchor on the unique 192-sample formula line, replace just
+                # the 2 lines that compute declick (don't try to match the
+                # 5-line comment block — em-dash encoding varies).
+                _so_old_line = (
+                    "        float t = clamp(elapsed * (44100.0 / 192.0), 0.0, 1.0);\n"
+                    "        declick = t * t * (3.0 - 2.0 * t);")
+                _so_new_line = (
+                    "        // PATCHED: was 192-sample smoothstep (4.4ms soft-attack that\n"
+                    "        // audibly smears chop patterns like inst-18 'harmonic' in\n"
+                    "        // maxmlism.xm). HTML uses no extra fade; match it with the\n"
+                    "        // standard 64-sample linear ramp so the chop attack lands.\n"
+                    "        declick = clamp(elapsed * (44100.0 / 64.0), 0.0, 1.0);\n"
+                    "        // (kept block here so block scope stays valid for else branch)")
+                # (9xx declick patch moved to after _pack_build_into_png — the
+                # 192-line lives in the VQ-encoder's doubly-base64'd inner GLSL
+                # template that doesn't write the final shader until that step.)
+
+                # ── 9xx sample-offset: clamp offset to sample-end ──
+                # If 9xx pushes initial fSamplePos past end of a NON-looping
+                # sample, the existing `if (fSamplePos >= smpLen) return 0`
+                # silences the voice immediately. For LOOPING samples (inst
+                # 18: loopStart=11349, loopLen=1981), an offset past
+                # loopStart wraps via mod() — fine. But the user said "the
+                # offset isn't working right" — one possible issue is that
+                # the offset is computed in compressed-sample units AFTER
+                # the bwFactor divide, but with --downsample 1 bwFactor=1
+                # so this is a no-op for the maxmlism build. Skip for now;
+                # leaving the anchor here so we can patch the int-division
+                # if a non-1 bwFactor build needs it.
     
                 # Find insertion point: after the file header /* ... */ and any leading #defines
                 _hdr_end = _sound_src.find('*/')
@@ -14786,6 +15112,164 @@ Generated by MOD2GLSL
                 ]
                 _fs_found = sum(1 for p in _fs_checks if p in _sound_src)
                 _q(f"   ✓ fine vol slide (DF2/D2F) patched at {_fs_found}/5 pattern groups")
+
+                # ── vol_col + vol-slide coexistence fix (XM/IT trigger rows) ──────────
+                # When a trigger row has BOTH vol_col AND a vol-slide effect (Axx/6xx),
+                # the old else-if chain blocked the slide from firing: vol_col branch
+                # fired first → vol slide was never applied (ch25 maxmlism.xm rows 1/3/4
+                # should fade to 0 but stayed at vol_col volume → ghost notes).
+                # Fix: vol_col → VOL_INIT (standalone, no else-if) so slides coexist.
+                _vc_old = (
+                    '    if (trigNote.effect == 0xC) {\n'
+                    '        VOL_SET(min(trigNote.param, 64), _triggerTickF);\n'
+                    '    } else if (trigNote.vol_col > 0) {\n'
+                    '        // IT vol-column override: note-volume set in pattern volume column\n'
+                    '        VOL_SET(min(trigNote.vol_col, 64), _triggerTickF);\n'
+                    '    } else if (trigNote.effect == 0xE) {'
+                )
+                _vc_new = (
+                    '    // vol_col sets the initial note volume (VOL_INIT = no ramp; declick handles\n'
+                    '    // fade-in). Applied BEFORE the effect chain so Axx/6xx vol-slides can coexist\n'
+                    '    // and slide from vol_col (not from smp.volume). Cxx in effect column overrides.\n'
+                    '    if (trigNote.vol_col > 0) {\n'
+                    '        VOL_INIT(min(trigNote.vol_col, 64));\n'
+                    '    }\n'
+                    '    if (trigNote.effect == 0xC) {\n'
+                    '        VOL_SET(min(trigNote.param, 64), _triggerTickF);\n'
+                    '    } else if (trigNote.effect == 0xE) {'
+                )
+                if _vc_old in _sound_src:
+                    _sound_src = _sound_src.replace(_vc_old, _vc_new)
+                    _q(f"   ✓ vol_col + vol-slide coexistence fix applied (trigger row)")
+                else:
+                    _q(f"   ✗ WARNING: vol_col+vol-slide fix: trigger-row pattern not found")
+
+                # ── A00 param memory: XM/MikIT vol-slide param=0 continues last rate ──
+                # A00 (or D00 in S3M) means "continue last non-zero Axx rate", not no-op.
+                # MikIT verified: row 7 ch=25 (A00 vol_col=32) after row 6 (A0F vol_col=32)
+                # produces identical -15/tick fade — same rate, not held at vol_col.
+                # Fix: (1) declare _lastAParam before trigger block so forward scan can use it;
+                # (2) backward scan in trigger Axx block resolves A00 to actual rate;
+                # (3) forward scan Axx handler updates and uses _lastAParam.
+
+                # 1. Declare _lastAParam = 0 before the trigger effects section
+                _a00_decl_old = (
+                    '    // vol_col sets the initial note volume (VOL_INIT = no ramp; declick handles\n'
+                )
+                _a00_decl_new = (
+                    '    // Last resolved Axx param (for A00 param memory: forward scan inherits the\n'
+                    '    // trigger row\'s resolved rate, then updates as it walks past each Axx row).\n'
+                    '    int _lastAParam = 0;\n\n'
+                    '    // vol_col sets the initial note volume (VOL_INIT = no ramp; declick handles\n'
+                )
+                if _a00_decl_old in _sound_src:
+                    _sound_src = _sound_src.replace(_a00_decl_old, _a00_decl_new, 1)
+                    _q(f"   ✓ A00 param memory: _lastAParam=0 declaration added")
+                else:
+                    _q(f"   ✗ WARNING: A00 param memory: _lastAParam decl anchor not found")
+
+                # 2. Replace trigger Axx block with backward-scan version
+                _a00_trig_old = (
+                    '    } else if (trigNote.effect == 0xA || trigNote.effect == 0x6 || trigNote.effect == 0x5) {\n'
+                    '        // 0x5 = tone+vol slide: pitch handled by 0x3-equivalent block, vol param same as 0xA\n'
+                    '        int _su = (trigNote.param>>4)&0xF, _sd = trigNote.param&0xF;\n'
+                    '        bool _fsT = (_su==0xF&&_sd>0)||(_sd==0xF&&_su>0);\n'
+                    '        int _fsTD = _su==0xF&&_sd>0?-_sd:_su;\n'
+                    '        int _step = (_su>0) ? _su : -_sd;\n'
+                    '        if (trigPat == pos.songPos && trigRow == pos.row) {\n'
+                    '            VOL_SET(clamp(_volCurr + (_fsT?_fsTD:_step*_pct), 0, 64), _triggerTickF);\n'
+                    '        } else {\n'
+                    '            int _ts = fetchTick(patTickOffset[trigPat]+(trigRow-patStartRow[trigPat])+1)\n'
+                    '                    - fetchTick(patTickOffset[trigPat]+(trigRow-patStartRow[trigPat]));\n'
+                    '            VOL_SET(clamp(_volCurr + (_fsT?_fsTD:_step*(_ts-1)), 0, 64), _triggerTickF);\n'
+                    '        }\n'
+                    '    }'
+                )
+                _a00_trig_new = (
+                    '    } else if (trigNote.effect == 0xA || trigNote.effect == 0x6 || trigNote.effect == 0x5) {\n'
+                    '        // 0x5 = tone+vol slide: pitch handled by 0x3-equivalent block, vol param same as 0xA\n'
+                    '        // A00 / D00 param memory: XM/MikIT continues the last non-zero Axx rate.\n'
+                    '        // Scan back up to 32 rows on this channel to find the last non-zero param.\n'
+                    '        int _vsParam = trigNote.param;\n'
+                    '        if (_vsParam == 0) {\n'
+                    '            int _bsp = trigPat, _bsr = trigRow - 1;\n'
+                    '            for (int _bi = 0; _bi < 32; _bi++) {\n'
+                    '                if (_bsr < 0) {\n'
+                    '                    if (_bsp > 0) { _bsp--; _bsr = patStartRow[_bsp] + (patRowOffset[_bsp+1]-patRowOffset[_bsp]) - 1; }\n'
+                    '                    else { break; }\n'
+                    '                }\n'
+                    '                if (_bsr < patStartRow[_bsp]) { _bsp--; if (_bsp < 0) break; _bsr = patStartRow[_bsp] + (patRowOffset[_bsp+1]-patRowOffset[_bsp]) - 1; }\n'
+                    '                Note _bsn = getNote(_bsp, _bsr, ch);\n'
+                    '                if ((_bsn.effect == 0xA || _bsn.effect == 0x6 || _bsn.effect == 0x5) && _bsn.param != 0) { _vsParam = _bsn.param; break; }\n'
+                    '                if (_bsn.period > 0 && _bsn.effect != 0x3 && _bsn.effect != 0x5) break; // stop at retrigger\n'
+                    '                _bsr--;\n'
+                    '            }\n'
+                    '        }\n'
+                    '        int _su = (_vsParam>>4)&0xF, _sd = _vsParam&0xF;\n'
+                    '        bool _fsT = (_su==0xF&&_sd>0)||(_sd==0xF&&_su>0);\n'
+                    '        int _fsTD = _su==0xF&&_sd>0?-_sd:_su;\n'
+                    '        int _step = (_su>0) ? _su : -_sd;\n'
+                    '        if (trigPat == pos.songPos && trigRow == pos.row) {\n'
+                    '            VOL_SET(clamp(_volCurr + (_fsT?_fsTD:_step*_pct), 0, 64), _triggerTickF);\n'
+                    '        } else {\n'
+                    '            int _ts = fetchTick(patTickOffset[trigPat]+(trigRow-patStartRow[trigPat])+1)\n'
+                    '                    - fetchTick(patTickOffset[trigPat]+(trigRow-patStartRow[trigPat]));\n'
+                    '            VOL_SET(clamp(_volCurr + (_fsT?_fsTD:_step*(_ts-1)), 0, 64), _triggerTickF);\n'
+                    '        }\n'
+                    '        _lastAParam = _vsParam;  // expose resolved param for forward scan\n'
+                    '    }'
+                )
+                if _a00_trig_old in _sound_src:
+                    _sound_src = _sound_src.replace(_a00_trig_old, _a00_trig_new)
+                    _q(f"   ✓ A00 param memory: trigger Axx block replaced with backward scan")
+                else:
+                    _q(f"   ✗ WARNING: A00 param memory: trigger Axx block not found in _sound_src")
+
+                # 3. Forward scan Axx handler: use _lastAParam (A00 = continue last rate)
+                _a00_fwd_old = (
+                    '            else if (_fn.effect == 0xA || _fn.effect == 0x6) {\n'
+                    '                int _vu = (_fn.param>>4)&0xF, _vd = _fn.param&0xF;\n'
+                    '                VOL_SET(clamp(_volCurr + (_vu==0xF&&_vd>0?-_vd:_vd==0xF&&_vu>0?_vu:(_vu>0?_vu:-_vd)*_full), 0, 64), _fnTickF);\n'
+                    '            }'
+                )
+                _a00_fwd_new = (
+                    '            else if (_fn.effect == 0xA || _fn.effect == 0x6) {\n'
+                    '                // A00 param memory: inherit last non-zero rate from trigger row\n'
+                    '                if (_fn.param != 0) _lastAParam = _fn.param;\n'
+                    '                int _fnPrm = _lastAParam;\n'
+                    '                int _vu = (_fnPrm>>4)&0xF, _vd = _fnPrm&0xF;\n'
+                    '                VOL_SET(clamp(_volCurr + (_vu==0xF&&_vd>0?-_vd:_vd==0xF&&_vu>0?_vu:(_vu>0?_vu:-_vd)*_full), 0, 64), _fnTickF);\n'
+                    '            }'
+                )
+                if _a00_fwd_old in _sound_src:
+                    _sound_src = _sound_src.replace(_a00_fwd_old, _a00_fwd_new)
+                    _q(f"   ✓ A00 param memory: forward scan Axx handler patched")
+                else:
+                    _q(f"   ✗ WARNING: A00 param memory: forward scan Axx pattern not found")
+
+                # 4. Forward scan 5xx vol portion: also uses _lastAParam
+                _a00_fwd5_old = (
+                    '            // 0x5 also applies the volume slide portion (high nibble = up, low = down)\n'
+                    '            if (_fn.effect == 0x5) {\n'
+                    '                int _vu = (_fn.param>>4)&0xF, _vd = _fn.param&0xF;\n'
+                    '                VOL_SET(clamp(_volCurr + (_vu==0xF&&_vd>0?-_vd:_vd==0xF&&_vu>0?_vu:(_vu>0?_vu:-_vd)*_full), 0, 64), _fnTickF);\n'
+                    '            }'
+                )
+                _a00_fwd5_new = (
+                    '            // 0x5 also applies the volume slide portion (high nibble = up, low = down)\n'
+                    '            if (_fn.effect == 0x5) {\n'
+                    '                // A00 param memory: 5xx vol portion inherits last non-zero Axx rate\n'
+                    '                if (_fn.param != 0) _lastAParam = _fn.param;\n'
+                    '                int _fnPrm5 = _lastAParam;\n'
+                    '                int _vu = (_fnPrm5>>4)&0xF, _vd = _fnPrm5&0xF;\n'
+                    '                VOL_SET(clamp(_volCurr + (_vu==0xF&&_vd>0?-_vd:_vd==0xF&&_vu>0?_vu:(_vu>0?_vu:-_vd)*_full), 0, 64), _fnTickF);\n'
+                    '            }'
+                )
+                if _a00_fwd5_old in _sound_src:
+                    _sound_src = _sound_src.replace(_a00_fwd5_old, _a00_fwd5_new)
+                    _q(f"   ✓ A00 param memory: forward scan 5xx vol portion patched")
+                else:
+                    _q(f"   ✗ WARNING: A00 param memory: forward scan 5xx vol pattern not found")
 
                 # ── Instrument-only vol-reset fix (S_nn P0 / XM inst-only rows) ──────
                 # ProTracker: a row with instrument but no period (e.g. S01 P0 A0F) does
@@ -15238,7 +15722,7 @@ Generated by MOD2GLSL
                 _aa_sig = ("float getSampleF(int base, float fpos, "
                            "int smpLen, int loopStart, int loopLen) {")
                 _aa_call_old = ("s = getSampleF(smp.start, fSamplePos, "
-                                "smp.smpLen, smp.loopStart, smp.loopLen);")
+                                "smp.smpLen, smp.loopStart, _absLoopLen);")
                 _aa_si = _sound_src.find(_aa_sig)
                 _aa_ci = _sound_src.count(_aa_call_old)
                 if _aa_si >= 0 and _aa_ci == 1:
@@ -15290,7 +15774,7 @@ Generated by MOD2GLSL
                     _aa_call_new = (
                         "#if AA_RESAMPLE\n"
                         "        s = getSampleAA(smp.start, fSamplePos, "
-                        "smp.smpLen, smp.loopStart, smp.loopLen, "
+                        "smp.smpLen, smp.loopStart, _absLoopLen, "
                         "freq / (44100.0 * float(max(1, smp.bwFactor))));\n"
                         "#else\n"
                         "        " + _aa_call_old + "\n"
@@ -15358,14 +15842,14 @@ Generated by MOD2GLSL
                     "            float _fpp = fSamplePos - float(_fk)*"
                     "_fstride;\n"
                     "            if (_fpp < 0.0) break;\n"
-                    "            if (smp.loopLen > 2 && _fpp >="
-                    " float(smp.loopStart + smp.loopLen))\n"
+                    "            if (_absLoopLen > 2 && _fpp >="
+                    " float(smp.loopStart + _absLoopLen))\n"
                     "                _fpp = float(smp.loopStart)\n"
                     "                     + mod(_fpp - float(smp.loopStart),"
-                    " float(smp.loopLen));\n"
+                    " float(_absLoopLen));\n"
                     "            _facc += _fh * getSampleF(smp.start, _fpp,\n"
                     "                          smp.smpLen, smp.loopStart,"
-                    " smp.loopLen);\n"
+                    " _absLoopLen);\n"
                     "        }\n"
                     "        s = _facc;\n"
                     "    }\n"
@@ -15398,6 +15882,88 @@ Generated by MOD2GLSL
                 # eLp. eN<=0 → returns 1.0 → S3M/MOD/no-env IT byte-
                 # identical (zero cost, always safe to inject). Defined
                 # right before its only caller _gcoBody.
+                # ── XM dynamic panning (FT2: pan-env + 8xx, exact MikIT) ──
+                # _itPanEnv mirrors _itVolEnv but indexed by instrument via the
+                # _panE* arrays (Common), returning the raw 0..64 pan-env value
+                # (32=center). _pan_block computes NP (8xx back-walk, default 32)
+                # + the FT2 headroom formula into _gcoPan. XM-ONLY (the mix patch
+                # below switches panR to _gcoPan only when is_xm); non-XM emits
+                # neither → static channelPan[] unchanged, zero added cost.
+                _pan_is_xm = bool(getattr(mod, 'is_xm', False))
+                _pan_fn = ""
+                _pan_block = ""
+                if _pan_is_xm:
+                    _pan_fn = (
+                        "float _itPanEnv(int idx, float etick, float keyOffEtick){\n"
+                        "  int n = _panEN[idx];\n"
+                        "  if (n <= 0) return 32.0;\n"
+                        "  int o = _panEOff[idx];\n"
+                        "  int eSus = _panESus[idx];\n"
+                        "  int eLp  = _panELp[idx];\n"
+                        "  bool keyOn = keyOffEtick < 0.0 || etick < keyOffEtick;\n"
+                        "  if (eSus >= 0 && eSus < n){\n"
+                        "    float st = float(_itPanEPt[o+eSus] >> 7);\n"
+                        "    if (keyOn){\n"
+                        "      if (eLp >= 0){\n"
+                        "        int ls=(eLp>>8)&255, le=eLp&255;\n"
+                        "        if (le>ls && le<n){\n"
+                        "          float ta=float(_itPanEPt[o+ls]>>7), tb=float(_itPanEPt[o+le]>>7);\n"
+                        "          if (ta<=st && tb>ta){\n"
+                        "            if (etick>tb) etick = ta + mod(etick-ta, tb-ta);\n"
+                        "          } else if (etick>st) etick=st;\n"
+                        "        } else if (etick>st) etick=st;\n"
+                        "      } else if (etick>st) etick=st;\n"
+                        "    } else {\n"
+                        "      if (eLp >= 0){\n"
+                        "        int ls=(eLp>>8)&255, le=eLp&255;\n"
+                        "        if (le>ls && le<n){\n"
+                        "          float ta=float(_itPanEPt[o+ls]>>7), tb=float(_itPanEPt[o+le]>>7);\n"
+                        "          if (ta>st && tb>ta && etick>tb)\n"
+                        "            etick = ta + mod(etick-ta, tb-ta);\n"
+                        "        }\n"
+                        "      }\n"
+                        "    }\n"
+                        "  } else if (eLp >= 0){\n"
+                        "    int ls=(eLp>>8)&255, le=eLp&255;\n"
+                        "    if (le>ls && le<n){\n"
+                        "      float ta=float(_itPanEPt[o+ls]>>7), tb=float(_itPanEPt[o+le]>>7);\n"
+                        "      if (tb>ta && etick>tb) etick = ta + mod(etick-ta, tb-ta);\n"
+                        "    }\n"
+                        "  }\n"
+                        "  if (etick <= float(_itPanEPt[o]>>7)) return float(_itPanEPt[o]&127);\n"
+                        "  for (int i=1;i<13;i++){\n"
+                        "    if (i>=n) break;\n"
+                        "    float t1=float(_itPanEPt[o+i]>>7);\n"
+                        "    if (etick <= t1){\n"
+                        "      float pt0=float(_itPanEPt[o+i-1]>>7);\n"
+                        "      float pv0=float(_itPanEPt[o+i-1]&127), pv1=float(_itPanEPt[o+i]&127);\n"
+                        "      float f=(t1>pt0)?(etick-pt0)/(t1-pt0):0.0;\n"
+                        "      return pv0+(pv1-pv0)*f;\n"
+                        "    }\n"
+                        "  }\n"
+                        "  return float(_itPanEPt[o+n-1]&127);\n"
+                        "}\n"
+                        "float _gcoPan = 0.5;  // dynamic XM pan (0..1): set by _gcoBody, read by mix\n")
+                    _pan_block = (
+                        "    // XM dynamic pan: NP (8xx back-walk, default 32 center)\n"
+                        "    // + pan-env via FT2 headroom formula → 0..255 → /255.\n"
+                        "    {\n"
+                        "        int _NP = 32;\n"
+                        "        int _sR = pos.row, _sP = pos.songPos;\n"
+                        "        for (int _lb = 0; _lb < 128; _lb++) {\n"
+                        "            Note _pn = getNote(_sP, _sR, ch);\n"
+                        "            if (_pn.effect == 0x8) { _NP = _pn.param >> 2; break; }\n"
+                        "            if (_sP == trigPat && _sR == trigRow) break;\n"
+                        "            _sR--;\n"
+                        "            if (_sR < 0) {\n"
+                        "                if (_sP > 0) { _sP--; _sR = patStartRow[_sP] + (patRowOffset[_sP+1] - patRowOffset[_sP]) - 1; }\n"
+                        "                else break;\n"
+                        "            }\n"
+                        "        }\n"
+                        "        float _PEV = _itPanEnv(trigNote.instrument - 1, _etick, keyOffEtick) - 32.0;\n"
+                        "        float _ep = (float(32 - abs(32 - _NP)) * _PEV / 32.0 + float(_NP)) * 4.0;\n"
+                        "        _gcoPan = clamp(_ep, 0.0, 255.0) / 255.0;\n"
+                        "    }\n")
                 _ve_sig  = "float _gcoBody("
                 _ve_old  = "return s * (_effVol / 64.0) * declick * endFade;"
                 # _xmFade[]: raw XM fadeout per instrument (0 = no fade/non-XM).
@@ -15467,7 +16033,8 @@ Generated by MOD2GLSL
                     "    }\n"
                     "  }\n"
                     "  return float(_itEPt[o+n-1]&127)/64.0;\n"
-                    "}\n")
+                    "}\n"
+                    + _pan_fn)   # XM: append _itPanEnv + _gcoPan global (else "")
                 # elapsed (sec since trigger) × TICKS_PER_SEC (Common
                 # #define, BPM-derived player ticks/sec) = elapsed player
                 # ticks — exactly the unit ITFile env_pts ticks are in.
@@ -15477,12 +16044,25 @@ Generated by MOD2GLSL
                 # volFade starts at 65536 → fadeMul = max(0, 1-N*2*fo/65536).
                 _ve_new  = (
                     "float _envMul = _itVolEnv(smp, elapsed * TICKS_PER_SEC, keyOffEtick);\n"
-                    "    float _fadeN = keyOffEtick >= 0.0 ?\n"
-                    "        float(max(0, int(elapsed * TICKS_PER_SEC - keyOffEtick)))\n"
+                    "    // XM/FT2 implicit key-off: when a no-sustain envelope reaches its\n"
+                    "    // last point, mikit/openMPT treat it as an implicit key-off so\n"
+                    "    // per-tick fadeout (_xmFade) begins. Without this, instruments\n"
+                    "    // with fo>0 and short envelopes (e.g. last_tick=4) play forever\n"
+                    "    // instead of fading staccato — heard as 'crazy long envelope'\n"
+                    "    // on the chord that should be short/staccato (user-confirmed).\n"
+                    "    float _etick = elapsed * TICKS_PER_SEC;\n"
+                    "    float _koEff = keyOffEtick;\n"
+                    "    if (_koEff < 0.0 && smp.eN > 0 && smp.eSus < 0) {\n"
+                    "        float _lastT = float(_itEPt[smp.eOff + smp.eN - 1] >> 7);\n"
+                    "        if (_etick > _lastT) _koEff = _lastT;\n"
+                    "    }\n"
+                    "    float _fadeN = _koEff >= 0.0 ?\n"
+                    "        float(max(0, int(_etick - _koEff)))\n"
                     "        : 0.0;\n"
                     "    float _fadeMul = clamp(1.0 - _fadeN * 2.0\n"
                     "        * float(_xmFade[trigNote.instrument - 1]) / 65536.0,\n"
                     "        0.0, 1.0);\n"
+                    + _pan_block +   # XM: compute _gcoPan before return (else "")
                     "    return s * (_effVol / 64.0) * declick * endFade"
                     " * _envMul * _fadeMul;")
                 # SKIP for IT: the NNA envelope-follower port (below)
@@ -15513,6 +16093,26 @@ Generated by MOD2GLSL
                           f"{_sound_src.count(_ve_sig)} ret×"
                           f"{_sound_src.count(_ve_old)}; expected ≥1,1) — "
                           f"envelopes not applied")
+
+                # ── XM dynamic-pan mix wiring ──────────────────────────────
+                # Switch the per-channel base mix from the static channelPan[]
+                # (MOD Amiga LRRL default for XM) to the dynamic _gcoPan that
+                # _gcoBody computed (FT2 pan-env + 8xx). Also adopt MikIT's
+                # linear pan law (rvol=pan/255) by dropping the 0.25+0.5 narrow.
+                # Only when pan fn/block were injected (_ve_ok) AND is_xm; non-XM
+                # and IT keep channelPan[] (this whole block is a no-op there).
+                if _pan_is_xm and _ve_ok:
+                    _pan_mix_old = "float panR = 0.25 + 0.5 * channelPan[ch];"
+                    _pan_mix_new = "float panR = _gcoPan;   // MikIT-exact dynamic XM pan (linear law)"
+                    _pm_n = _sound_src.count(_pan_mix_old)
+                    if _pm_n == 1:
+                        _sound_src = _sound_src.replace(_pan_mix_old, _pan_mix_new, 1)
+                        _q("   ✓ XM dynamic pan wired into mix "
+                              "(panR=_gcoPan; pan-env + 8xx; MikIT linear law)")
+                    else:
+                        print(f"   ⚠ XM dynamic-pan mix patch skipped "
+                              f"(panR anchor ×{_pm_n}, expected 1) — "
+                              f"static channelPan[] retained")
 
                 # ── XM key-off detection (note=97 → bit7 of instrument byte) ──
                 # Three patches needed so _itVolEnv receives keyOffEtick:
@@ -16299,6 +16899,14 @@ Generated by MOD2GLSL
                     _sound_src  = _flagdef(_sound_src,  _sym, _mac)
                 _q("   ✓ enable3D/enableFAT → #define + #if "
                       "(disabled features removed by preprocessor, not just dead-stripped)")
+                # ── XM linear-frequency mode: patch the default #define 0 → 1
+                # when the source is an XM with flags & 1 set. periodToFreq's
+                # #if XM_LINEAR_FREQ branch then activates.
+                # XM linear-frequency: REVERTED — XMFile already converts linear-mode
+                # notes to Amiga-style periods during parse. The default Amiga
+                # periodToFreq formula is correct for BOTH XM modes. Applying linear
+                # math to Amiga periods gave 441 kHz frequencies (ultrasonic / silent).
+                # XM_LINEAR_FREQ macro remains defined as 0 (unused but harmless).
 
                 # ── --preserve / --raw-perc: store instruments RAW (no VQ) ─
                 # getSample(idx) intercepts each preserved instrument's
@@ -16431,6 +17039,16 @@ Generated by MOD2GLSL
                         _rp = min(max(0, _rp), _full)
                         if _rp + _rl > _full:
                             _rl = max(0, _full - _rp)
+                        # Re-apply bidi encoding (XM/S3M stype&3==2 → NEGATIVE
+                        # loopLen). The main SampleInfo rebuild negates it for
+                        # ping-pong loops, but this preserve rewrite recomputes
+                        # _rl from repeat_length (positive) — without this it
+                        # silently downgrades bidi chord samples to forward loops.
+                        try:
+                            if (int((_msd or {}).get('stype', 0)) & 0x03) == 2 and _rl > 2:
+                                _rl = -_rl
+                        except Exception:
+                            pass
                         # Rewrite this instrument's SampleInfo: new base,
                         # full-rate length/loop, bwFactor=1 (→ phase walks
                         # full resolution). Keep volume/finetune/c2sp.
@@ -16472,14 +17090,7 @@ Generated by MOD2GLSL
                         _common_src = (_common_src[:_msi.start()]
                                        + _new_arr + _common_src[_msi.end():])
                     if _prows:
-                        _pk = []
-                        for _i in range(0, len(_ppcm), 4):
-                            _b = [(_ppcm[_i+_k] & 0xFF) if _i+_k < len(_ppcm) else 0
-                                  for _k in range(4)]
-                            _v = _b[0] | (_b[1]<<8) | (_b[2]<<16) | (_b[3]<<24)
-                            if _v >= (1<<31): _v -= (1<<32)
-                            _pk.append(_v)
-                        _decl = (
+                        _presv_head = (
                             "// ── --preserve: raw (un-VQ'd) sample data ──\n"
                             f"const int _PRESV_N = {len(_prows)};\n"
                             f"const int _presvStart[{len(_prows)}] = int[]("
@@ -16487,11 +17098,45 @@ Generated by MOD2GLSL
                             f"const int _presvLen[{len(_prows)}] = int[]("
                             + ",".join(str(r[1]) for r in _prows) + ");\n"
                             f"const int _presvOff[{len(_prows)}] = int[]("
-                            + ",".join(str(r[2]) for r in _prows) + ");\n"
-                            f"const int _presvPCM[{len(_pk)}] = int[]("
-                            + ",".join(str(v) for v in _pk) + ");\n"
-                            "int _presvByte(int i){int w=_presvPCM[i>>2];"
-                            "int b=(w>>((i&3)*8))&0xFF;return b<128?b:b-256;}\n")
+                            + ",".join(str(r[2]) for r in _prows) + ");\n")
+                        if _png_mode:
+                            # --png: store the raw PCM in the PNG (keeps the big
+                            # data off the Sound-tab const-array budget that the
+                            # GPU/ANGLE enforces). BE-pack so the PNG _stream(>i)
+                            # writes bytes in order and getByte() recovers
+                            # _ppcm[i] exactly. Emitted as `const ivec4 presvPCM`
+                            # so _pack_build_into_png auto-moves it to the PNG and
+                            # emits PRESVPCM_PNG_OFF (see _KNOWN/order above).
+                            _pkbe = []
+                            for _i in range(0, len(_ppcm), 4):
+                                _b = [(_ppcm[_i+_k] & 0xFF) if _i+_k < len(_ppcm) else 0
+                                      for _k in range(4)]
+                                _v = (_b[0]<<24) | (_b[1]<<16) | (_b[2]<<8) | _b[3]
+                                if _v >= (1<<31): _v -= (1<<32)
+                                _pkbe.append(_v)
+                            while len(_pkbe) % 4 != 0:
+                                _pkbe.append(0)
+                            _iv = ",".join(
+                                "ivec4(%d,%d,%d,%d)" % tuple(_pkbe[_j:_j+4])
+                                for _j in range(0, len(_pkbe), 4))
+                            _decl = (_presv_head
+                                + f"const ivec4 presvPCM[{len(_pkbe)//4}] = ivec4[]("
+                                + _iv + ");\n"
+                                "int _presvByte(int i){int b=getByte(PRESVPCM_PNG_OFF + i);"
+                                "return b<128?b:b-256;}\n")
+                        else:
+                            _pk = []
+                            for _i in range(0, len(_ppcm), 4):
+                                _b = [(_ppcm[_i+_k] & 0xFF) if _i+_k < len(_ppcm) else 0
+                                      for _k in range(4)]
+                                _v = _b[0] | (_b[1]<<8) | (_b[2]<<16) | (_b[3]<<24)
+                                if _v >= (1<<31): _v -= (1<<32)
+                                _pk.append(_v)
+                            _decl = (_presv_head
+                                + f"const int _presvPCM[{len(_pk)}] = int[]("
+                                + ",".join(str(v) for v in _pk) + ");\n"
+                                "int _presvByte(int i){int w=_presvPCM[i>>2];"
+                                "int b=(w>>((i&3)*8))&0xFF;return b<128?b:b-256;}\n")
                         # Inject _decl with its consumer (getSample) in
                         # SOUND, not Common.  Common has the tight ~130 KB
                         # ShaderToy/ANGLE cap; the raw percussion PCM (short
@@ -16555,6 +17200,124 @@ Generated by MOD2GLSL
             _q(f"   ✓ Pattern arrays in PNG — Common ivec4 budget freed; "
                   f"iChannel3 wired to all 3 passes in JSON")
         args.use_png = True   # restore so JSON wiring + summary reflect PNG mode
+
+        # ── POST-WRITE PATCH: shorten 9xx declick ramp from 192→64 samples ──
+        # The VQ-encoder's embedded shader applies a 192-sample (4.4ms)
+        # smoothstep fade-in to any voice triggered with 9xx sample-offset.
+        # That fade audibly soft-attacks every chop in dense 9xx patterns
+        # (e.g. maxmlism inst 18 "harmonic" chops on every other row → user
+        # reports "inst 18 not playing right; offset isn't working"). HTML
+        # and mikit don't apply any extra fade for 9xx triggers — match
+        # them with the standard 64-sample linear so the chop attack lands
+        # at the right moment/loudness. Applied via regex on the final
+        # written shader file to bypass the doubly-base64'd template.
+        try:
+            import re as _re_so
+            _final_sound = base_name + "_shadertoy_sound.glsl"
+            if _os2.path.exists(_final_sound):
+                with open(_final_sound) as _f: _post = _f.read()
+                _xf_dw = int(getattr(args, 'xfade', 64) or 64)
+                _post_changed = False
+                # ── 9xx branch: 192-sample smoothstep → _xf_dw-sample linear ──
+                _so_pat = _re_so.compile(
+                    r'(\s*)float\s+t\s*=\s*clamp\(elapsed\s*\*\s*\(44100\.0\s*/\s*192\.0\),\s*0\.0,\s*1\.0\);\n'
+                    r'\s*declick\s*=\s*t\s*\*\s*t\s*\*\s*\(3\.0\s*-\s*2\.0\s*\*\s*t\);')
+                _m_so = _so_pat.search(_post)
+                if _m_so:
+                    _ind = _m_so.group(1)
+                    _repl_9xx = (
+                        f"{_ind}// PATCHED 2026-05-27: was 192-sample smoothstep (4.4ms\n"
+                        f"{_ind}// soft-attack that smeared 9xx chop attacks — inst 18\n"
+                        f"{_ind}// 'harmonic' in maxmlism.xm chops every other row and\n"
+                        f"{_ind}// HTML/mikit don't apply any extra fade. Match: standard\n"
+                        f"{_ind}// {_xf_dw}-sample linear ramp so the chop attack lands.\n"
+                        f"{_ind}declick = clamp(elapsed * (44100.0 / {float(_xf_dw)}), 0.0, 1.0);")
+                    _post = _so_pat.sub(_repl_9xx, _post, count=1)
+                    _post_changed = True
+                    print(f"   ✓ 9xx declick shortened 192→{_xf_dw} (HTML-match; "
+                          f"removes inst-18 attack-smear)")
+                else:
+                    print(f"   ⚠ post-write 9xx declick anchor missing — skipped")
+                # ── else branch (non-9xx normal triggers): 64-sample → _xf_dw ──
+                # Keeps declick window equal to the xfade crossfade so the
+                # combined t² attack spans only _xf_dw samples instead of 64.
+                _so_pat2 = _re_so.compile(
+                    r'(\s*)// Sharp 64-sample mikIT default for normal trigger-from-sample-0\.\n'
+                    r'\s*declick\s*=\s*clamp\(elapsed\s*\*\s*\(44100\.0\s*/\s*64\.0\),\s*0\.0,\s*1\.0\);')
+                _m_so2 = _so_pat2.search(_post)
+                if _m_so2:
+                    _ind2 = _m_so2.group(1)
+                    _repl_else = (
+                        f"{_ind2}// Normal trigger declick: {_xf_dw}-sample ramp matches xfade window.\n"
+                        f"{_ind2}declick = clamp(elapsed * (44100.0 / {float(_xf_dw)}), 0.0, 1.0);")
+                    _post = _so_pat2.sub(_repl_else, _post, count=1)
+                    _post_changed = True
+                    print(f"   ✓ non-9xx declick updated to {_xf_dw} samples (matches xfade window)")
+                else:
+                    print(f"   ⚠ post-write non-9xx declick anchor missing — skipped")
+                if _post_changed:
+                    with open(_final_sound, 'w') as _f: _f.write(_post)
+
+                # ── POST-WRITE PATCH: bidi (ping-pong) loop fix ───────────────
+                # Bidi loops are encoded as negative loopLen. The original GLSL
+                # template uses `smp.loopLen > 2` which is FALSE for negative
+                # loopLen (bidi), causing bidi samples to play linearly past the
+                # end of sample and go silent instead of looping. XM songs with
+                # bidi chord samples (e.g. maxmlism pad/Min) sound wrong because
+                # their chord loops immediately die after smpLen samples.
+                # Fix: replace with abs(smp.loopLen) + bidi reflect path.
+                _bidi_old = (
+                    "    if (smp.loopLen > 2) {\n"
+                    "        if (fSamplePos >= float(smp.loopStart + smp.loopLen))\n"
+                    "            fSamplePos = float(smp.loopStart) + mod(fSamplePos"
+                    " - float(smp.loopStart), float(smp.loopLen));\n"
+                    "    } else if (fSamplePos >= float(smp.smpLen)) {\n"
+                    "        return 0.0;\n"
+                    "    }")
+                _bidi_new = (
+                    "    // Bidi (ping-pong) encoded as negative loopLen — use abs.\n"
+                    "    int _absLoopLen = abs(smp.loopLen);\n"
+                    "    if (_absLoopLen > 2) {\n"
+                    "        float _loopEndF = float(smp.loopStart + _absLoopLen);\n"
+                    "        if (fSamplePos >= _loopEndF) {\n"
+                    "            float _ov = fSamplePos - float(smp.loopStart);\n"
+                    "            if (smp.loopLen < 0) {\n"
+                    "                float _ph = mod(_ov, float(2 * _absLoopLen));\n"
+                    "                if (_ph >= float(_absLoopLen))"
+                    " _ph = float(2 * _absLoopLen) - _ph;\n"
+                    "                fSamplePos = float(smp.loopStart) + _ph;\n"
+                    "            } else {\n"
+                    "                fSamplePos = float(smp.loopStart)"
+                    " + mod(_ov, float(_absLoopLen));\n"
+                    "            }\n"
+                    "        }\n"
+                    "    } else if (fSamplePos >= float(smp.smpLen)) {\n"
+                    "        return 0.0;\n"
+                    "    }")
+                # Also fix the downstream getSampleF call and loopLen <= 2 checks
+                _bidi_smpf_old = ("s = getSampleF(smp.start, fSamplePos,"
+                                   " smp.smpLen, smp.loopStart, smp.loopLen);")
+                _bidi_smpf_new = ("s = getSampleF(smp.start, fSamplePos,"
+                                   " smp.smpLen, smp.loopStart, _absLoopLen);")
+                _bidi_endfade_old = "    if (smp.loopLen <= 2) {"
+                _bidi_endfade_new = "    if (_absLoopLen <= 2) {"
+                _bidi_nearend_old = ("    if (smp.loopLen <= 2 && fSamplePos >="
+                                     " float(smp.smpLen) - 1.0) {")
+                _bidi_nearend_new = ("    if (_absLoopLen <= 2 && fSamplePos >="
+                                     " float(smp.smpLen) - 1.0) {")
+                _post2 = _post
+                if _bidi_old in _post2:
+                    _post2 = _post2.replace(_bidi_old, _bidi_new, 1)
+                    _post2 = _post2.replace(_bidi_smpf_old, _bidi_smpf_new, 1)
+                    _post2 = _post2.replace(_bidi_endfade_old, _bidi_endfade_new, 1)
+                    _post2 = _post2.replace(_bidi_nearend_old, _bidi_nearend_new, 1)
+                    with open(_final_sound, 'w') as _f: _f.write(_post2)
+                    print(f"   ✓ bidi loop fix applied (loopLen<0 → ping-pong; "
+                          f"was forward-only, chord pads now sustain correctly)")
+                else:
+                    print(f"   ⚠ bidi loop patch anchor missing — skipped")
+        except Exception as _e_so:
+            print(f"   ⚠ post-write declick patch failed: {_e_so}")
 
     # Summary
     bufA_file_short = base_name + "_shadertoy_bufferA.glsl"
@@ -16626,10 +17389,15 @@ Generated by MOD2GLSL
                       f"JSON Sound iChannel3 keeps absolute filepath")
             # Sound, Buffer A, Image passes: base64 embedded PNG (self-contained).
             # All three need fetchPixel → iChannel3 = PNG texture.
-            _IN_PNG3 = {"channel": 3, "type": "texture", "id": "dataPNG3",
+            # Unique id per PNG content so ShaderToy can't serve a stale cached
+            # texture from a previous build (it caches by id; reusing "dataPNG3"
+            # made every re-import serve the OLD PNG regardless of new base64).
+            import hashlib as _hl
+            _png_id = "dat" + _hl.md5(open(_png_abs,"rb").read()).hexdigest()[:5]
+            _IN_PNG3 = {"channel": 3, "type": "texture", "id": _png_id,
                         "filepath": _png_filepath_sound, "sampler": _SMP_DATA}
             # Image / BufferA passes: local file path only (no base64 duplication)
-            _IN_PNG3_PATH = {"channel": 3, "type": "texture", "id": "dataPNG3",
+            _IN_PNG3_PATH = {"channel": 3, "type": "texture", "id": _png_id,
                              "filepath": _png_abs, "sampler": _SMP_DATA}
             # Buffer B: iChannel3 = its own framebuffer (zeros). Direct iChannel3
             # fetch with no branch (matches Sound/BufferA pattern). _pngOk() returns
@@ -16650,7 +17418,7 @@ Generated by MOD2GLSL
                 "bool _pngOk(){return fetchPixel(0)==((77<<24)|(79<<16)|(68<<8));}\n"
             )
             _st_name = (mod.title.strip() or base_name)[:64]
-            _st_desc = f"{_st_name} — MOD2GLSL v1.666"
+            _st_desc = f"{_st_name} — MOD2GLSL v1.7"
             # Image is placed first so ShaderToy's new-shader first-tab reset only
             # wipes Image code (user re-pastes from *_shadertoy_image.glsl).
             # Image inputs ARE included: channels survive the reset so they are
