@@ -5,6 +5,8 @@
 $${\Large\color{orange}\textsf{GLSL MOD Player v1.75 for ShaderToy and}}$$
 $${\Large\color{orange}\textsf{standalone HTML embedded page}}$$$${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
 
+---
+
 ## $${\color{cyan}\textsf{📖 Overview}}$$
 
 `mod_player.py` converts MOD files of size up to roughly **150–200 KB** into a ShaderToy shader.
