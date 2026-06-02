@@ -44,7 +44,7 @@ $\color{limegreen}\textsf{+}$ &nbsp; **Avanced micro-click removal**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **3D Surround, Velvet Reverb, Phat Bass, Soft Limiter, FAT4X**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **PNG loader is wokring, and tested! (--png) loads from JSON too!**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **RVQ sample compression** — 27.7 dB<br>
-$\color{limegreen}\textsf{+}$ &nbsp; **Mouse control to horizontal scroll tracks**  <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Mouse control to horizontal scroll tracks with rubber banding**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Downsampling integrated with RVQ (--downsample 1, 2 or 4)**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Firefox ShaderToy Unofficial plugin now imports .json tab structure**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Linear, B-Spline, and Lanczos3 resamplers**<br>
