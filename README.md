@@ -27,9 +27,8 @@ $${\Large\color{orange}\textsf{standalone HTML embedded page}}$$$${\small\color{
 🔸 <strong>Full output bundle</strong> — HTML player + 4 ShaderToy tabs + PNG + paste instructions<br />
 🔸 <strong><code>--use-png</code></strong> — fast-compile alternative, raw 8-bit samples via texelFetch<br />
 🔸 <strong><code>--no-rvq2</code></strong> — single-stage RVQ, ~33% smaller Sound, ~4 dB SNR cost<br />
-
 </td></tr></table>
-<br>
+
 ![Version](https://img.shields.io/badge/version-1.75-orange?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.x-blue?style=flat-square&logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-ShaderToy-7e57c2?style=flat-square)
