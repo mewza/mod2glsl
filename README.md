@@ -12,7 +12,7 @@ $${\Large\color{orange}\textsf{standalone HTML embedded page}}$$$${\small\color{
 `mod_player.py` converts MOD files of size up to roughly **150–200 KB** into a ShaderToy shader.
 
 ### Features
-
+<p align="center">
 <img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **2-stage Residual VQ** — K-means sample compression, ~14.7 dB SNR at ~2.1 bits/sample.  
 <img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Per-sample FFT bandwidth analysis** — auto-decimates low-bandwidth samples, preserves HF shimmer.  
 <img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Loop-seam smoothing** — patches post-loop guard so VQ doesn't break loop boundaries.  
@@ -25,7 +25,7 @@ $${\Large\color{orange}\textsf{standalone HTML embedded page}}$$$${\small\color{
 <img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Full output bundle** — HTML player + 4 ShaderToy tabs + PNG + paste instructions.  
 <img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **`--use-png`** — fast-compile alternative, raw 8-bit samples via texelFetch.  
 <img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **`--no-rvq2`** — single-stage RVQ, ~33% smaller Sound, ~4 dB SNR cost.
-
+</p>
 ![Version](https://img.shields.io/badge/version-1.37-orange?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.x-blue?style=flat-square&logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-ShaderToy-7e57c2?style=flat-square)
