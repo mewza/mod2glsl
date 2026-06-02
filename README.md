@@ -15,6 +15,7 @@ $${\Large\color{orange}\textsf{standalone HTML embedded page}}$$$${\small\color{
 You want the block centered on the page but the lines left-aligned inside it. GitHub strips most CSS, so the reliable trick is a centered table with a left-aligned cell:
 html
 
+<div align="left">
 <ul>
 <li>🔸 <strong>2-stage Residual VQ</strong> — K-means sample compression, ~14.7 dB SNR at ~2.1 bits/sample</li>
 <li>🔸 <strong>Per-sample FFT bandwidth analysis</strong> — auto-decimates low-bandwidth samples, preserves HF shimmer</li>
@@ -29,6 +30,7 @@ html
 <li>🔸 <strong><code>--use-png</code></strong> — fast-compile alternative, raw 8-bit samples via texelFetch</li>
 <li>🔸 <strong><code>--no-rvq2</code></strong> — single-stage RVQ, ~33% smaller Sound, ~4 dB SNR cost</li>
 </ul>
+</div>
 
 ![Version](https://img.shields.io/badge/version-1.37-orange?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.x-blue?style=flat-square&logo=python&logoColor=white)
