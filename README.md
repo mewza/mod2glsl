@@ -3,7 +3,7 @@
 # $${\Huge\color{cyan}\textsf{🎵 MOD2GLSL v1.75}}$$
 
 $${\Large\color{orange}\textsf{GLSL IT,XM,S3M,MOD Player for ShaderToy}}$$
-$${\Large\color{orange}\textsf{and a standalone HTML embedded player}}$$$${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
+$${\Large\color{orange}\textsf{+ a standalone HTML embedded player +}}$$$${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
 
 ## $${\color{deepskyblue}\textsf{🎬 Live demo}}$$
 <p align="center">
