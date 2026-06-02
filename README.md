@@ -16,6 +16,7 @@ $${\Large\color{orange}\textsf{plus a standalone HTML embedded self-containin pa
 ## $${\color{cyan}\textsf{📖 Overview}}$$
 
 `mod_player.py` converts MOD files into ShaderToy presentations that you can load with ShaderToy plug-in via JSON. It supports two modes --png embedding a mod into PNG encapsulation or embedded into the code with limited capacity but due to custom sample compression and downsampling fetures able to fit even 400k-500k MODs into the shader.
+</div>
 
 ### Features
 
@@ -41,8 +42,6 @@ $\color{orange}\blacklozenge$ &nbsp; **`--no-rvq2`** — single-stage RVQ, ~33% 
 ![IT](https://img.shields.io/badge/IT-ImpulseTracker-blueviolet?style=flat-square)
 ![XM](https://img.shields.io/badge/XM-FastTracker2-orange?style=flat-square)
 ![S3M](https://img.shields.io/badge/S3M-ScreamTracker3-1ca7c0?style=flat-square)
-
-</div>
 
 
 Convert any MOD, S3M, XM, or IT into a ShaderToy shader, complete with visualization and a note/effect overlay view,
