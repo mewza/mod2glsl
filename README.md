@@ -12,11 +12,11 @@ $${\Large\color{orange}\textsf{plus a standalone HTML embedded player}}$$$${\sma
 <p align="center">
 <samp>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>SATELLITE.S3M</b> • <a href="https://www.shadertoy.com/view/7XjGD3">shadertoy.com/view/7XjGD3</a></samp><br>
 </p>
+</div>
 
 ## $${\color{cyan}\textsf{📖 Overview}}$$
 
 `mod_player.py` converts MOD files into ShaderToy presentations that you can load with ShaderToy plug-in via JSON. It supports two modes --png embedding a mod into PNG encapsulation or embedded into the code with limited capacity but due to custom sample compression and downsampling fetures able to fit even 400k-500k MODs into the shader.
-</div>
 
 ### Features
 
