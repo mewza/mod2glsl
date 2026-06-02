@@ -200,6 +200,180 @@ def _harden_array_oob(src):
     return src
 
 
+def _deunroll_scans(src):
+    """Stop ANGLE unrolling the deep scan loops (`for (… ; v < 128; …)`).
+
+    The trigger searches in getChannelOutput / _gcoBody are nested `128×128`
+    backward walks; ANGLE unrolls them into ~16K-instruction blobs because the
+    bound is the constant 128 — that's the dominant Sound-tab compile cost (the
+    19-24s link freeze). Replacing the bound with `(time < 0. ? 99999 : 128)`
+    keeps it exactly 128 at runtime (time is always ≥ 0) but the optimizer can't
+    prove the *upper* bound, so it must emit a real DYNAMIC loop instead of
+    unrolling. The scans break early, so behavior — and audio — are identical;
+    only the compiled code shrinks (~10× on those sections). `time` is in scope
+    in every function that hosts a `< 128` scan loop.
+
+    The same trick also pays off on the SHORTER getNote-heavy scans in the same
+    functions — they unroll to up to 64 copies of getNote (~50 instr each, i.e.
+    1.6–3.2K instr) and likewise break early, so de-unrolling is runtime-neutral
+    but compiles ~30× smaller:
+       • lb  < 32  — instrument-latch backscan
+       • _bi < 32  — volume-slide param backscan
+       • _vi < 64  — volume forward-scan
+       • _t  < 32  — per-tick pitch accumulators (×3); these break at `speed`
+                     (~6 iters) either way, so de-unrolling is runtime-neutral too
+                     and just removes three more 32× unrolled blocks at compile.
+    """
+    import re as _re_du
+    src = _re_du.sub(r'; (\w+) < 128;',
+                     r'; \1 < (time < 0. ? 99999 : 128);', src)
+    for _v, _b in (('lb', 32), ('_bi', 32), ('_vi', 64), ('_t', 32), ('_bs', 16)):
+        src = _re_du.sub(rf'; {_v} < {_b};',
+                         rf'; {_v} < (time < 0. ? 99999 : {_b});', src)
+    # getPosition (Common): _bs<16 binary search (above) + _i<SONG_LENGTH-1 songPos
+    # linear search — both inlined at the 8 getPosition call sites, small body ×
+    # constant count = the scan-like case ANGLE unrolls. Both break early; `time`
+    # is getPosition's param. (This pass is now applied to Common too so these get
+    # caught — Common otherwise only has these two loops.)
+    src = src.replace(
+        'for (int _i = 0; _i < SONG_LENGTH - 1; _i++)',
+        'for (int _i = 0; _i < (time < 0. ? 99999 : SONG_LENGTH - 1); _i++)')
+
+    # ── DSP channel-mixer loops — the BIG multiplier ────────────────────────
+    # Every `for (ch < NUM_CHANNELS)` inlines the ENTIRE getChannelOutput
+    # NUM_CHANNELS× when ANGLE unrolls it, and there are FOUR (main mix,
+    # getMixedMono for the reverb/PhatBass taps, 3D, comb). Enabling PhatBass
+    # adds another getMixedMono → another 9× mixer inlined → the "loading
+    # forever" / CONTEXT_LOST. De-unroll them so getChannelOutput compiles ONCE
+    # each instead of 9×. `rowTime` is in scope at all four (each forwards it to
+    # getChannelOutput); the bound becomes runtime-unknown so ANGLE can't unroll.
+    # Unlike the scans, these have NO natural early-break, so the never-taken
+    # rowTime<0 → 99999 branch would run getChannelOutput out of channel range
+    # (OOB → the very crash we're avoiding). The `if (ch < NUM_CHANNELS)` body
+    # guard makes it safe AND correct on both branches, and works whether the
+    # loop body is a single statement or a `{…}` block. Runtime-neutral (same 9).
+    src = src.replace(
+        'for (int ch = 0; ch < NUM_CHANNELS; ch++)',
+        'for (int ch = 0; ch < (rowTime < 0. ? 99999 : NUM_CHANNELS); ch++) if (ch < NUM_CHANNELS)')
+
+    # Comb-reverb nested loops (N_COMB × N_ITER) each WRAP the channel loop, so
+    # they re-multiply getChannelOutput (full reverb-size = 4×3 = 12×). Same trick
+    # + body-guard — `_c` indexes _D[]/_pL[]/_pR[], so the guard prevents OOB on
+    # the never-taken branch. rowTime is in scope at both.
+    for _v, _b in (('_c', 'N_COMB'), ('_k', 'N_ITER')):
+        src = src.replace(
+            f'for (int {_v} = 0; {_v} < {_b}; {_v}++)',
+            f'for (int {_v} = 0; {_v} < (rowTime < 0. ? 99999 : {_b}); {_v}++) if ({_v} < {_b})')
+    return src
+
+
+def _deunroll_pixel(src):
+    """De-unroll the heavy constant-bound loops in the Image / Buffer-A (pixel)
+    tabs. The Sound/Common pass uses `time`/`rowTime`, which aren't in scope here;
+    the sentinel here is iResolution.x — a uniform that's ALWAYS > 0 in a pixel
+    tab, so the optimizer can't fold the bound (loop stays dynamic) and the
+    never-taken 99999 branch can't fire. The `if (X < BOUND)` body-guard keeps it
+    OOB-safe regardless. Targets only the HEAVY loops — the FFT DFT and the
+    per-pixel getNote waveform synth + its backscans — not the light visual loops
+    (those unroll cheaply, and de-unrolling them would just add loop overhead).
+    """
+    for hdr, new in (
+        ('for (int n = 0; n < FFT_N; n++)',
+         'for (int n = 0; n < (iResolution.x < 0. ? 99999 : FFT_N); n++) if (n < FFT_N)'),
+        ('for (int ch = 0; ch < NUM_CHANNELS; ch++)',
+         'for (int ch = 0; ch < (iResolution.x < 0. ? 99999 : NUM_CHANNELS); ch++) if (ch < NUM_CHANNELS)'),
+        ('for (int lb = 1; lb < 48; lb++)',
+         'for (int lb = 1; lb < (iResolution.x < 0. ? 99999 : 48); lb++) if (lb < 48)'),
+    ):
+        src = src.replace(hdr, new)
+    return src
+
+
+def _inject_lut(src, mod, num_channels):
+    """--lut: replace the O(128) backward trigger scan with an O(log) lookup into a
+    precomputed per-channel trigger list (binary search). EXPERIMENTAL / opt-in.
+
+    Trades code (the scan loops) for const data (the trigger list) — so it ADDS
+    register pressure. After the de-unroll those loops are already dynamic, so this
+    is mainly useful on SPARSE-trigger songs; on dense songs it's a net loss. Gated
+    behind `#define USE_LUT 1` (set when --lut is passed); flip to 0 in ShaderToy to
+    A/B the scan. Audio-identical when the trigger rule below matches the engine's
+    `period>0 && effect∉{3,5}` (validated by render compare). globalRow = songPos*64
+    + localRow; trigPat passed to _gcoBody is the SONG POSITION, trigRow the local row.
+    """
+    NC = num_channels
+    sp = [p for p in mod.song_positions if p < 254]   # drop S3M +++/--- markers (match getNote)
+    pats = mod.patterns
+    TONE = {7, 12}   # S3M G (porta-to-note)→MOD 0x3, L (porta+vol)→0x5 (NOT triggers)
+    trig = [[] for _ in range(NC)]          # per channel: list of (globalRow, resolvedInst)
+    last_inst = [0] * NC                     # most-recent instrument seen on the channel
+    last_gr   = [-(1 << 30)] * NC            # ...and its globalRow (for the lb2 127-row cap)
+    for songPos, pat_idx in enumerate(sp):
+        pat = pats[pat_idx] if pat_idx < len(pats) else None
+        for row in range(64):
+            gr = songPos * 64 + row
+            for ch in range(NC):
+                cell = pat[row][ch] if (pat and row < len(pat) and ch < len(pat[row])) else None
+                if not isinstance(cell, dict):
+                    continue
+                note = cell.get('note'); cmd = cell.get('command', 0); ins = cell.get('instrument', 0)
+                if (note is not None and 0 < note < 254) and cmd not in TONE:
+                    # A period-only trigger inherits the most-recent instrument, but ONLY
+                    # if it is within 127 rows (matches the engine's inner lb2 scan cap);
+                    # beyond that the scan finds nothing → instrument 0.
+                    ri = ins if ins else (last_inst[ch] if (gr - last_gr[ch]) <= 127 else 0)
+                    trig[ch].append((gr, ri))
+                if ins:   # update AFTER recording (lb2 scans STRICTLY before the trigger row)
+                    last_inst[ch] = ins; last_gr[ch] = gr
+    flat, off = [], [0]
+    for ch in range(NC):
+        for gr, ri in trig[ch]:
+            flat.append((gr << 7) | (ri & 0x7F))    # 11-bit row | 7-bit instrument
+        off.append(len(flat))
+    def _arr(name, a):
+        return f"const int {name}[{max(1,len(a))}] = int[]({', '.join(map(str, a or [0]))});\n"
+    helper = ("\n#if USE_LUT\n"
+              "// ── --lut: per-channel trigger list (sorted), packed (globalRow<<7)|inst ──\n"
+              + _arr("_lutTrig", flat) + _arr("_lutOff", off)
+              + "ivec2 _lutFindTrig(int ch, int maxGR){\n"
+                "    int lo=_lutOff[ch], hi=_lutOff[ch+1], best=-1;\n"
+                "    for(int _bs=0;_bs<24;_bs++){ if(lo>=hi) break; int mid=(lo+hi)>>1;\n"
+                "        if((_lutTrig[mid]>>7)<=maxGR){best=mid;lo=mid+1;} else hi=mid; }\n"
+                "    if(best<0) return ivec2(-1,0);\n"
+                "    return ivec2(_lutTrig[best]>>7, _lutTrig[best]&0x7F);\n}\n#endif\n\n")
+    if "float getChannelOutput(" in src:
+        src = src.replace("float getChannelOutput(", helper + "float getChannelOutput(", 1)
+    # Wire the MAIN trigger block under USE_LUT (crossfade site left on the dynamic
+    # scan — it's gated to the first 64 samples and already de-unrolled).
+    m0 = src.find("    if (_curIsTonePorta) {")
+    m1 = src.find("    // else: full trigger (period + instrument, no 3/5) — trigNote already correct")
+    if m0 != -1 and m1 != -1 and m1 > m0:
+        lut_main = (
+            "#if USE_LUT\n"
+            "    if (_curIsTonePorta) toneSlideTarget = _curRow.period;\n"
+            "    if (_curIsTonePorta || !_curIsRetrig) {\n"
+            "        int _cGR = pos.songPos*64 + pos.row;\n"
+            "        ivec2 _lt = _lutFindTrig(ch, _cGR);\n"
+            "        if (_lt.x >= 0 && (_cGR - _lt.x) < 128) {   // 127-row lookback cap (matches scan)\n"
+            "          trigPat=_lt.x/64; trigRow=_lt.x-trigPat*64;\n"
+            "          trigNote=getNote(trigPat,trigRow,ch);\n"
+            "          if (trigNote.instrument==0) trigNote.instrument=_lt.y; }\n"
+            "    } else if (_curIsRetrig && !_curHasInst) {\n"
+            "        // period-only retrigger: keep the (cheap, single) instrument-fixup scan —\n"
+            "        // the LUT stores only triggers, not every instrument-bearing cell.\n"
+            "        int sR = pos.row, sP = pos.songPos;\n"
+            "        for (int lb = 1; lb < (time < 0. ? 99999 : 128); lb++) {\n"
+            "            sR--;\n"
+            "            if (sR < 0) { if (sP > 0) { sP--; sR = patStartRow[sP] + (patRowOffset[sP+1]-patRowOffset[sP]) - 1; } else break; }\n"
+            "            Note prev = getNote(sP, sR, ch);\n"
+            "            if (prev.instrument > 0) { trigNote.instrument = prev.instrument; break; }\n"
+            "        }\n"
+            "    }\n"
+            "#else\n")
+        src = src[:m0] + lut_main + src[m0:m1] + "#endif\n" + src[m1:]
+    return src
+
+
 def compress_patterns_rle(pattern_data):
     """RLE compress pattern data"""
     compressed = []
@@ -2827,7 +3001,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
                 len(getattr(mod, 'samples', []) or []))
     data_source_comment = "Embedded data (no PNG required)" if use_embedded else f"All data in 1024×1024 RGBA PNG: {png_file}"
     common_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.72 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.75 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    COMMON TAB
    Visualizer: {viz_name}
@@ -3578,7 +3752,7 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     _ap_p0_2, _ap_p1p2_2, _ap_delay_2 = _only3d_coeffs(_ONLY3D_FREQ2)
 
     sound_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.72 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.75 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    SOUND TAB
    Visualizer: {viz_name}
@@ -3825,15 +3999,20 @@ vec2 mainSound(int samp, float time) {{
     // bass is centered so mono is fine, and the downstream soft-limiter catches
     // peaks. Haas widening dropped (it was the 3rd, costliest tap). Ear-verify.
     // LPF cutoff = 1/(2·T). 0.002 s ⇒ ~250 Hz bass focus.
-    const float PHAT_SHELF_T     = 0.002;
+    const float PHAT_SHELF_T     = 0.001;   // 1 ms → ripple dip ~500 Hz (out of deep bass)
     const float PHAT_SHELF_DEPTH = 0.45;    // reduced — less limiter slam / distortion
     vec2 _phatPB = vec2(0.0);
     if (enablePhatBass) {{
         float tA = playbackTime - PHAT_SHELF_T;
         if (tA >= 0.0) {{
             float dryMono = surrL + surrR + centL + centR;   // == getMixedMono(playbackTime), free
-            float lpMono  = 0.5 * (dryMono + getMixedMono(tA, getPosition(tA), rowTime));
-            _phatPB = vec2(lpMono * PHAT_SHELF_DEPTH);       // low-shelf bass → both channels
+            // 1-pole-STYLE low-shelf (stateless): HEAVY dry + LIGHT short-delay.
+            // The old 0.5/0.5 boxcar was a comb filter — a DEEP null at 250 Hz
+            // (and 750/1250…) = the hollow/phasey "reverb-ish" artifact. Weighting
+            // the delayed tap light (0.28) turns those nulls into shallow ~-7 dB
+            // ripple; low-freq gain stays 1.0 so bass weight is unchanged.
+            float lpMono  = 0.72 * dryMono + 0.28 * getMixedMono(tA, getPosition(tA), rowTime);
+            _phatPB = vec2(lpMono * PHAT_SHELF_DEPTH);       // smooth low-shelf → both channels
         }}
     }}
 
@@ -4014,7 +4193,7 @@ vec2 mainSound(int samp, float time) {{
         viz_setup_block = (
             "    vec2 _uv=(C*2.-iResolution.xy)/iResolution.y;\n"
             "    float _scrollX=texelFetch(iChannel1,ivec2(5,2),0).r;\n"
-            "    vec3 col = vec3(0.0);  // --viz 0: no visualizer"
+            "    vec3 col = _VizScene(C);  // --viz 0: Sun Rays god-ray scene (was forced black)"
         )
     elif viz == 3:
         viz_setup_block = (
@@ -7114,7 +7293,7 @@ vec3 _VizScene(vec2 fragCoord) {
 
 
     image_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.72 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.75 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    IMAGE TAB — iChannel0: alphabet texture (shadertoy.com/view/4sf3RB)
                 iChannel1: Buffer A (audio + FFT + smoothed bands)
@@ -7222,7 +7401,7 @@ makeStr(printBPMVal) {bpm_val_chars} _end
 makeStr(printSpdVal) {spd_val_chars} _end
 
 // ---- Static label strings ----
-makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _7 _2 _ _NUM _NUM _NUM _end
+makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _7 _5 _ _NUM _NUM _NUM _end
 makeStr(printCredit) _COPY _2 _0 _2 _6 _ _O _R _B _L _I _V _I _U _S _end
 makeStr(printLoad)   _L _O _A _D _I _N _G _DOT _DOT _DOT _end
 makeStr(printSpec)   _S _P _E _C _T _R _U _M _end
@@ -8278,7 +8457,7 @@ void mainImage(out vec4 O, vec2 C) {{
             "        }\n"
             "        s /= float(NUM_CHANNELS);\n"
             "        // Raw bipolar waveform row. tanh soft-clip: bias 0.5, range ±0.4.\n"
-            "        O = vec4(0.0, 0.0, 0.0, 0.5 + tanh(s * 1.5) * 0.4);\n"
+            "        O = vec4(0.0, 0.0, 0.0, 0.5 + (s*1.5*(27.+2.25*s*s)/(27.+20.25*s*s)) * 0.4);\n"
             "\n"
             "    } else if (py > WAVE_BASE && py < WAVE_BASE + WAVE_ROWS) {\n"
             "        // ── Rows 71-133: scroll — copy row above (one frame younger) ──\n"
@@ -8351,7 +8530,7 @@ void mainImage(out vec4 O, vec2 C) {{
             "        }\n"
             "        s /= float(NUM_CHANNELS);\n"
             "        // Raw bipolar waveform row. tanh soft-clip: bias 0.5, range ±0.4.\n"
-            "        O = vec4(0.0, 0.0, 0.0, 0.5 + tanh(s * 1.5) * 0.4);\n"
+            "        O = vec4(0.0, 0.0, 0.0, 0.5 + (s*1.5*(27.+2.25*s*s)/(27.+20.25*s*s)) * 0.4);\n"
             "\n"
             "    } else if (py > WAVE_BASE && py < WAVE_BASE + WAVE_ROWS) {\n"
             "        // ── Rows 71-133: scroll — copy row above (one frame younger) ──\n"
@@ -8375,7 +8554,7 @@ void mainImage(out vec4 O, vec2 C) {{
     # Setup: Buffer A iChannel0 = Buffer A (self-ref)
     #        Image   iChannel1 = Buffer A output
     buffer_a_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.72 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.75 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    Contact: subband@gmail.com or
             subband@protonmail.com
@@ -8420,9 +8599,18 @@ void mainImage(out vec4 O, vec2 C) {{
     if (iFrame < 16) return;
 
     if (py == 0 && px < FFT_N) {{
-        // ── Row 0: unused. Oscilloscope reads WAVE_BASE row 70 alpha
-        // (same per-pixel synth already running for the Zuvuya curtain).
-        O = vec4(0.0);
+        // ── Row 0: standard audio-texture waveform — for shaders that read the
+        // conventional row-0 audio (e.g. --viz 9 "Music is in the DNA"). Was
+        // zeroed when the oscilloscope moved to WAVE_BASE row 70, which silenced
+        // those vizes. Copy the most-recent FFT_N samples from the WAVE_BASE
+        // scroll (.a, centered 0.5), take |amplitude|, then run a peak-hold ENVELOPE
+        // (instant attack, slow release) so the wiggle doesn't flicker per-frame —
+        // viz-9 DNA pieces jump on transients and RELEASE slowly. Self-feedback on
+        // row 0, same pattern the FFT row uses for its magnitude smoothing.
+        int _wOff = max(0, int(iResolution.x) - FFT_N);
+        float _cur = abs((texelFetch(iChannel0, ivec2(px + _wOff, WAVE_BASE), 0).a - 0.5) * 2.5);
+        float _prv = texelFetch(iChannel0, ivec2(px, 0), 0).r;   // previous frame's row-0 envelope
+        O = vec4(max(_cur, _prv * 0.92), 0.0, 0.0, 1.0);   // 0.92/frame ≈ 0.2s release @60fps — raise toward 1.0 to slow more
 
     }} else if (py == 1 && px < FFT_N / 2) {{
         // ── Row 1: DFT magnitude at LINEAR-spaced frequency bin px ──────────
@@ -8634,7 +8822,7 @@ void mainImage(out vec4 O, vec2 C) {{
             // black streaks behind the main oscilloscope. abs(tanh(...))
             // gives a smoother dynamic and the 0.25 floor + 0.55 range
             // keeps the rows visible without dominating the composition.
-            O = vec4(0., 0., 0., 0.25 + abs(tanh(s * 1.5)) * 0.55);
+            O = vec4(0., 0., 0., 0.25 + abs((s*1.5*(27.+2.25*s*s)/(27.+20.25*s*s))) * 0.55);
         }} else {{
             O = texelFetch(iChannel0, ivec2(px, py - 1), 0);
         }}
@@ -8647,6 +8835,7 @@ void mainImage(out vec4 O, vec2 C) {{
                            .replace('_shadertoy_common.glsl', '_shadertoy_bufferA.glsl')
     if '_shadertoy' not in bufA_file:
         bufA_file = output_file.replace('.glsl', '_shadertoy_bufferA.glsl')
+    buffer_a_glsl = _deunroll_pixel(buffer_a_glsl)   # DFT + per-pixel getNote synth loops
     with open(bufA_file, 'w') as f:
         f.write(buffer_a_glsl)
 
@@ -8722,6 +8911,7 @@ void mainImage(out vec4 O, vec2 C) {
               f"{image_glsl.count(_dlg_anchor)}, expected 1)")
 
     image_glsl = _harden_array_oob(image_glsl)
+    image_glsl = _deunroll_pixel(image_glsl)   # per-pixel getNote synth loops
     with open(output_file.replace('.glsl', '_image.glsl'), 'w') as f:
         f.write(image_glsl)
 
@@ -12161,6 +12351,7 @@ def _pack_build_into_png(common_path, sound_path, png_path,
             r'\1 else if (_es == 0xC) VOL_SET(0, \2);',
             sound)
     sound = _harden_array_oob(sound)
+    sound = _deunroll_scans(sound)
     open(sound_path, 'w').write(sound)
     # Return (data_bytes, offsets_dict, patterns_in_png).
     # patterns_in_png=True means Common now calls getByte(iChannel3) for pattern
@@ -12289,10 +12480,11 @@ def main():
             raise argparse.ArgumentTypeError(
                 "invalid choice: %r (choose from [0..20], 0=sun rays backdrop)" % v)
         return iv
-    parser.add_argument('--viz', type=_viz_arg, default=6, metavar='[0..20]',
-                        help='Image-tab visualizer (choose from [0..20]):\n'
-                             '  0 = Sun Rays          (cabbibo-style — warm/cool god-ray corona)\n'
-                             '  1 = Reactive 001     (PAEz fork — SDF circles + cosmic web)  ← default\n'
+    parser.add_argument('--viz', type=_viz_arg, default=None, metavar='[0..20]',
+                        help='Image-tab visualizer (choose from [0..20]; run --viz with no number to list these). Default:\n'
+                             '0 for non-PNG (embedded) builds, 6 for --png builds.\n'
+                             '  0 = Sun Rays          (cabbibo-style — warm/cool god-ray corona)  ← non-PNG default\n'
+                             '  1 = Reactive 001     (PAEz fork — SDF circles + cosmic web)\n'
                              '  2 = Fluxline Surfer  (mrange — DR2 dodecahedron + glowtracer)\n'
                              '  3 = Zuvuya           (city/stars + audio-reactive curtain)\n'
                              '  4 = Maya             (raymarched fractal tunnel-warp)\n'
@@ -12423,8 +12615,9 @@ def main():
                              'the waveform classifier tags NOISE) UNCOMPRESSED, exactly like '
                              '--preserve but auto-detected. Percussion transients/noise are '
                              'the worst-hit by RVQ, so this keeps drums crisp and matching '
-                             'the HTML player. Percussion samples are short → small size '
-                             'cost. Default ON.')
+                             'the HTML player. Default: OFF for non-PNG (embedded) builds — '
+                             'the raw _presvPCM[] const array is ~30%% of the Sound tab and '
+                             'hurts GPU compile/fit; opt in with --raw-perc. PNG always off.')
     parser.add_argument('--no-raw-perc', dest='raw_perc', action='store_false',
                         help='Disable --raw-perc (let percussion be VQ-compressed too).')
     parser.add_argument('--raw-perc-budget', dest='raw_perc_budget',
@@ -12450,6 +12643,16 @@ def main():
                              'compile, but raw 8-bit samples (no RVQ) so quality differs. ShaderToy setup: '
                              'Image/Common iChannel0 = SONG_player_data.png via the Unofficial Plugin '
                              '"Custom Textures".')
+    parser.add_argument('--lut', dest='lut', action='store_true', default=False,
+                        help='EXPERIMENTAL: replace the O(128) backward trigger SCAN in the Sound '
+                             'tab with an O(log) binary search into a precomputed per-channel '
+                             'trigger-list (emits `#define USE_LUT 1` + gated const tables + helper, '
+                             'and wires the main trigger block). Removes the scan loops but ADDS a '
+                             'const trigger table — i.e. trades compile-time loop unrolling (already '
+                             'fixed by the de-unroll pass) for RUNTIME register pressure. Only a net '
+                             'win on SPARSE-trigger songs; on dense songs (e.g. odenew) it is a net '
+                             'loss and can re-cross the const-budget crash point. Flip USE_LUT to 0 '
+                             'in ShaderToy to A/B against the scan. Audio is identical either way.')
     # ── Individual compat-component knobs (overridable when used with --max-compat) ──
     # Each defaults to None (sentinel "user did not set"), so we can do layered
     # resolution: --max-compat fills None values with compat defaults, then any
@@ -12497,7 +12700,7 @@ def main():
                              "resolution but slower compile. Default: 1024 (or 128 if "
                              "--max-compat without override).")
     parser.add_argument('--max-compat', action='store_true', default=False,
-                        help='[NO-OP — max-compat is now the DEFAULT in v1.40+ (current: v1.72)] '
+                        help='[NO-OP — max-compat is now the DEFAULT in v1.40+ (current: v1.75)] '
                              'This flag previously enabled compatibility mode '
                              'for problematic GPUs/drivers (Windows + Firefox + '
                              'NVIDIA, etc.). The compat preset (--resampler '
@@ -12515,7 +12718,35 @@ def main():
     if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(0)
+    # `--viz` with NO number → print the visualizer list and exit. Done before
+    # parse_args so the input-file requirement isn't enforced (works with no file).
+    if '--viz' in sys.argv:
+        _vi = sys.argv.index('--viz')
+        _vnext = sys.argv[_vi + 1] if _vi + 1 < len(sys.argv) else ''
+        if not _vnext.isdigit():
+            print('Visualizers — pass the number to --viz (e.g. --viz 9):\n')
+            for _a in parser._actions:
+                if '--viz' in getattr(_a, 'option_strings', []):
+                    print(_a.help or ''); break
+            sys.exit(0)
     args = parser.parse_args()
+
+    # --viz default depends on the data path: non-PNG (embedded) builds — the
+    # GPU-constrained shadertoy.com publish target — default to viz 0 (the
+    # lightweight Sun Rays scene, no raymarch); --png builds keep the richer
+    # viz 6. An explicit --viz N always wins (default=None lets us detect it).
+    if args.viz is None:
+        args.viz = 6 if args.use_png else 0
+
+    # --raw-perc default also depends on the data path: non-PNG (embedded) builds
+    # default it OFF, dropping the raw _presvPCM[] const array (~30% of the Sound
+    # tab's const data) → smaller compile + less register pressure for GPU fit.
+    # PNG already force-disables it below. Explicit --raw-perc / --no-raw-perc
+    # still win (checked via argv so the store_true/store_false default — which is
+    # ambiguous for a shared dest — doesn't matter).
+    if ('--raw-perc' not in sys.argv and '--no-raw-perc' not in sys.argv
+            and not args.use_png):
+        args.raw_perc = False
 
     # PNG mode FORCES ultra bitrate — no const-array size pressure, use best
     # quality always. Overrides any explicit --bitrate flag the user passed.
@@ -12597,8 +12828,12 @@ def main():
         # lanczos3 explicitly to opt back in.
         'resampler':              'lanczos3',
         'reverb_size':            'small',     # 2 combs × 2 iters
-        'surround':               False,       # 3D widening off
-        'phatbass':               True,       # ON by default (user) — --no-phatbass to disable; ENABLE_PHATBASS=1
+        'surround':               False,       # 3D widening OFF by default (user: off for non-PNG). --surround turns it on (it's de-unrolled → cheap when enabled).
+        # PhatBass default: ON (user). It WAS off for non-PNG because its extra
+        # getMixedMono tap inlined the full 9× mixer → CONTEXT_LOST on weak GPUs;
+        # the channel-loop de-unroll collapsed that tap to 1× mixer so it fits now,
+        # and it's retuned to a clean low-shelf (no comb null). --no-phatbass drops it.
+        'phatbass':               True,
         'fat4x':                  True,       # ON by default (user) — --no-fat4x to disable; ENABLE_FAT=1
         'fft_n':                  512,
         '_compat_extra_pragmas':  True,        # HLSL [unroll/loop] pragmas
@@ -14541,7 +14776,7 @@ Generated by MOD2GLSL
                 # glsl_state_dump.py / sound_exec.py inject it themselves.
                 _ct = _ct.replace(
                     "GLSL (The Last) MOD Player v1.42 (c) 2026 Orblivius",
-                    "GLSL (The Last) MOD Player v1.72 (c) 2026 Orblivius", 1)
+                    "GLSL (The Last) MOD Player v1.75 (c) 2026 Orblivius", 1)
                 _ct = _ct.replace("   COMMON TAB\n", f"   COMMON TAB\n   Visualizer: {_vname}\n", 1)
 
                 # Inject visualizer note-synth helpers (waveType[] + _synthWave).
@@ -14674,7 +14909,7 @@ Generated by MOD2GLSL
                         'const bool  enableFAT     = true;\n'
                         f'const bool  enablePhatBass     = {_pb_val};\n'
                         'const bool  enableVelvetReverb = false;\n'
-                        'const bool  enableCombReverb   = false;\n'
+                        'const bool  enableCombReverb   = false;\n'   # OFF, period (both PNG + non-PNG)
                         'const float MASTER_GAIN = 1.0;', 1
                     )
                 if _no_fat:
@@ -17693,7 +17928,11 @@ Generated by MOD2GLSL
                         _sound_src)
 
                 _common_src = _harden_array_oob(_common_src)
+                _common_src = _deunroll_scans(_common_src)   # getPosition _bs<16 + _i<SONG_LENGTH-1 (8 inline sites)
                 _sound_src  = _harden_array_oob(_sound_src)
+                _sound_src  = _deunroll_scans(_sound_src)
+                if getattr(args, 'lut', False):
+                    _sound_src = '#define USE_LUT 1\n' + _inject_lut(_sound_src, mod, mod.num_channels)
                 with open(glsl_common_file, 'w') as _f: _f.write(_common_src)
                 with open(_glsl_sound,       'w') as _f: _f.write(_sound_src)
                 _moved_kb = sum(len(a) for a in _arrays) // 1024
