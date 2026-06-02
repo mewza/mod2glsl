@@ -245,7 +245,7 @@ pip install numpy pillow
 ### Basic conversion
 
 ```bash
-python mod_player.py yourfavorite.mod
+bash % python3 mod_player.py yourfavorite.mod
 ```
 
 > [!NOTE]
