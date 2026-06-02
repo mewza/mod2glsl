@@ -29,7 +29,7 @@ $${\Large\color{orange}\textsf{standalone HTML embedded page}}$$$${\small\color{
 🔸 <strong><code>--no-rvq2</code></strong> — single-stage RVQ, ~33% smaller Sound, ~4 dB SNR cost<br />
 
 </td></tr></table>
-<br />
+<br>
 ![Version](https://img.shields.io/badge/version-1.75-orange?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.x-blue?style=flat-square&logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-ShaderToy-7e57c2?style=flat-square)
