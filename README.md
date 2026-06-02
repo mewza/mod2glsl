@@ -6,7 +6,15 @@ $${\Large\color{orange}\textsf{GLSL MOD Player v1.75 for ShaderToy and}}$$
 $${\Large\color{orange}\textsf{standalone HTML embedded page}}$$$${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
 
 ---
+<div align="center">
 
+### 🎬 Live Demo
+
+https://github.com/user-attachments/assets/4c7fe125-086c-410b-bcba-808fc7648984
+
+*BEYOND_MUSIC.MOD rendered through GLSL MOD Player v1.52*
+
+</div>
 ## $${\color{cyan}\textsf{📖 Overview}}$$
 
 `mod_player.py` converts MOD files into ShaderToy presentations that you can load with ShaderToy plug-in via JSON. It supports two modes --png embedding a mod into PNG encapsulation or embedded into the code with limited capacity but due to custom sample compression and downsampling fetures able to fit even 400k-500k MODs into the shader.
@@ -39,15 +47,7 @@ $${\Large\color{orange}\textsf{standalone HTML embedded page}}$$$${\small\color{
 ![S3M](https://img.shields.io/badge/S3M-ScreamTracker3-1ca7c0?style=flat-square)
 
 </div>
-<div align="center">
 
-### 🎬 Live Demo
-
-https://github.com/user-attachments/assets/4c7fe125-086c-410b-bcba-808fc7648984
-
-*BEYOND_MUSIC.MOD rendered through GLSL MOD Player v1.52*
-
-</div>
 
 Convert any MOD, S3M, XM, or IT into a ShaderToy shader, complete with visualization and a note/effect overlay view,
 together with oscilloscope and spectrum rendering, fully customizable however you like!
