@@ -32,7 +32,6 @@ Examples: <br>
 
 ## $${\color{limegreen}\textsf{✨ What's new in v1.75}}$$
 
-$\color{limegreen}\textsf{+}$ &nbsp; **Improved --png and non-png loading, bug fixes, gui improvement**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Optimized load time for png and non-png ShaderToy modes**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Improved GUI, fixed crappy gfx card and driver crashes**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Improved synchronization of visuals to sound**  <br>
