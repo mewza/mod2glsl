@@ -18,9 +18,7 @@ $${\Large\color{orange}\textsf{plus a standalone HTML embedded player}}$$$${\sma
 
 `mod_player.py` converts MOD files into ShaderToy presentations that you can load with ShaderToy plug-in via JSON. It supports two modes --png embedding a mod into PNG encapsulation or embedded into the code with limited capacity but due to custom sample compression and downsampling fetures able to fit even 400k-500k MODs into the shader.
 
-### Features
-
-## $${\color{lightblue}\textsf{✨ Features}}$$
+## $${\color{yellow}\textsf{✨ Features}}$$
 
 $\color{orange}\blacklozenge$ &nbsp; **2-stage Residual VQ** — K-means sample compression, ~14.7 dB SNR at ~2.1 bits/sample<br>
 $\color{orange}\blacklozenge$ &nbsp; **Per-sample FFT bandwidth analysis** — auto-decimates low-bandwidth samples, preserves HF shimmer<br>
