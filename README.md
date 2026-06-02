@@ -35,9 +35,9 @@ $${\Large\color{orange}\textsf{standalone HTML embedded page}}$$$${\small\color{
 ![Platform](https://img.shields.io/badge/platform-ShaderToy-7e57c2?style=flat-square)
 ![License](https://img.shields.io/badge/license-non--commercial-green?style=flat-square)
 ![MOD](https://img.shields.io/badge/MOD-ProTracker-ff69b4?style=flat-square)
-![IT](https://img.shields.io/badge/IT-ImpulseTracker-ff69b4?style=flat-square)
-![XM](https://img.shields.io/badge/XM-FastTracker2-ff69b4?style=flat-square)
-![S3M](https://img.shields.io/badge/S3M-ScreamTracker3-ff69b4?style=flat-square)
+![IT](https://img.shields.io/badge/IT-ImpulseTracker-blueviolet?style=flat-square)
+![XM](https://img.shields.io/badge/XM-FastTracker2-orange?style=flat-square)
+![S3M](https://img.shields.io/badge/S3M-ScreamTracker3-e05d44?style=flat-square)
 
 </div>
 <div align="center">
