@@ -9,7 +9,7 @@ $${\Large\color{orange}\textsf{standalone HTML embedded page}}$$$${\small\color{
 
 ## $${\color{cyan}\textsf{📖 Overview}}$$
 
-`mod_player.py` converts MOD files of size up to roughly **150–200 KB** into a ShaderToy shader.
+`mod_player.py` converts MOD files into ShaderToy presentations that you can load with ShaderToy plug-in via JSON. It supports two modes --png embedding a mod into PNG encapsulation or embedded into the code with limited capacity but due to custom sample compression and downsampling fetures able to fit even 400k-500k MODs into the shader.
 
 ### Features
 
