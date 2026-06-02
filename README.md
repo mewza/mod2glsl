@@ -34,7 +34,7 @@ $${\Large\color{orange}\textsf{standalone HTML embedded page}}$$$${\small\color{
 ![Python](https://img.shields.io/badge/python-3.x-blue?style=flat-square&logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-ShaderToy-7e57c2?style=flat-square)
 ![License](https://img.shields.io/badge/license-non--commercial-green?style=flat-square)
-![Format](https://img.shields.io/badge/IT-XM-S3M-MOD-ProTracker-ff69b4?style=flat-square)
+![Format](https://img.shields.io/badge/MOD-ProTracker-ff69b4?style=flat-square)
 
 </div>
 <div align="center">
