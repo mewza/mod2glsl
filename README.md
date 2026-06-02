@@ -20,6 +20,8 @@ $${\Large\color{orange}\textsf{plus a standalone HTML embedded player}}$$$${\sma
 
 ### Features
 
+## $${\color{lightblue}\textsf{✨ Features}}$$
+
 $\color{orange}\blacklozenge$ &nbsp; **2-stage Residual VQ** — K-means sample compression, ~14.7 dB SNR at ~2.1 bits/sample<br>
 $\color{orange}\blacklozenge$ &nbsp; **Per-sample FFT bandwidth analysis** — auto-decimates low-bandwidth samples, preserves HF shimmer<br>
 $\color{orange}\blacklozenge$ &nbsp; **Loop-seam smoothing** — patches post-loop guard so VQ doesn't break loop boundaries<br>
