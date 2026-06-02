@@ -19,21 +19,19 @@ $${\Large\color{orange}\textsf{plus a standalone HTML embedded self-containin pa
 
 ### Features
 
-<table align="center"><tr><td align="left">
+$\color{orange}\blacklozenge$ &nbsp; **2-stage Residual VQ** — K-means sample compression, ~14.7 dB SNR at ~2.1 bits/sample<br>
+$\color{orange}\blacklozenge$ &nbsp; **Per-sample FFT bandwidth analysis** — auto-decimates low-bandwidth samples, preserves HF shimmer<br>
+$\color{orange}\blacklozenge$ &nbsp; **Loop-seam smoothing** — patches post-loop guard so VQ doesn't break loop boundaries<br>
+$\color{orange}\blacklozenge$ &nbsp; **Configurable resampler** — linear, B-spline, or Lanczos-3<br>
+$\color{orange}\blacklozenge$ &nbsp; **3D Surround, PhatBass, Comb Reverb, FAT** — Hilbert bass enhance + channel-pair widening<br>
+$\color{orange}\blacklozenge$ &nbsp; **RLE pattern compression** — bitmap + dictionary + O(1) row seek<br>
+$\color{orange}\blacklozenge$ &nbsp; **`ivec4` chunked data loader** — 4 bytes per int32, beats GLSL array limits<br>
+$\color{orange}\blacklozenge$ &nbsp; **6 built-in visualizers** — `--viz 0..5`<br>
+$\color{orange}\blacklozenge$ &nbsp; **Tracker-like GUI** — pattern grid, oscilloscope/FFT toggle, BPM/Speed/Position<br>
+$\color{orange}\blacklozenge$ &nbsp; **Full output bundle** — HTML player + 4 ShaderToy tabs + PNG + paste instructions<br>
+$\color{orange}\blacklozenge$ &nbsp; **`--use-png`** — fast-compile alternative, raw 8-bit samples via texelFetch<br>
+$\color{orange}\blacklozenge$ &nbsp; **`--no-rvq2`** — single-stage RVQ, ~33% smaller Sound, ~4 dB SNR cost<br>
 
-🔸 <strong>2-stage Residual VQ</strong> — K-means sample compression, ~14.7 dB SNR at ~2.1 bits/sample<br />
-🔸 <strong>Per-sample FFT bandwidth analysis</strong> — auto-decimates low-bandwidth samples, preserves HF shimmer<br />
-🔸 <strong>Loop-seam smoothing</strong> — patches post-loop guard so VQ doesn't break loop boundaries<br />
-🔸 <strong>Configurable resampler</strong> — linear, B-spline, or Lanczos-3<br />
-🔸 <strong>3D Surround, PhatBass, Comb Reverb, FAT</strong> — Hilbert bass enhance + channel-pair widening<br />
-🔸 <strong>RLE pattern compression</strong> — bitmap + dictionary + O(1) row seek<br />
-🔸 <strong><code>ivec4</code> chunked data loader</strong> — 4 bytes per int32, beats GLSL array limits<br />
-🔸 <strong>6 built-in visualizers</strong> — <code>--viz 0..5</code><br />
-🔸 <strong>Tracker-like GUI</strong> — pattern grid, oscilloscope/FFT toggle, BPM/Speed/Position<br />
-🔸 <strong>Full output bundle</strong> — HTML player + 4 ShaderToy tabs + PNG + paste instructions<br />
-🔸 <strong><code>--use-png</code></strong> — fast-compile alternative, raw 8-bit samples via texelFetch<br />
-🔸 <strong><code>--no-rvq2</code></strong> — single-stage RVQ, ~33% smaller Sound, ~4 dB SNR cost<br />
-</td></tr></table>
 
 ![Version](https://img.shields.io/badge/version-1.75-orange?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.x-blue?style=flat-square&logo=python&logoColor=white)
