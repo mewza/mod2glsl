@@ -37,7 +37,7 @@ $${\Large\color{orange}\textsf{standalone HTML embedded page}}$$$${\small\color{
 ![MOD](https://img.shields.io/badge/MOD-ProTracker-ff69b4?style=flat-square)
 ![IT](https://img.shields.io/badge/IT-ImpulseTracker-blueviolet?style=flat-square)
 ![XM](https://img.shields.io/badge/XM-FastTracker2-orange?style=flat-square)
-![S3M](https://img.shields.io/badge/S3M-ScreamTracker3-e05d44?style=flat-square)
+![S3M](https://img.shields.io/badge/S3M-ScreamTracker3-1ca7c0?style=flat-square)
 
 </div>
 <div align="center">
