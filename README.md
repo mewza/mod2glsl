@@ -86,7 +86,7 @@ $\color{limegreen}\textsf{+}$ &nbsp; Added `--no-rvq2` — faster compile, ~4 dB
 ---
 <div align="center">
 
-### 🎬 Live Demo
+### 🎬 Video capture of resulted shader
 
 https://github.com/user-attachments/assets/4c7fe125-086c-410b-bcba-808fc7648984
 
