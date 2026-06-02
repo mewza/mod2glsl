@@ -35,8 +35,8 @@ Examples: <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Optimized load time for png and non-png ShaderToy modes**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Improved GUI, fixed crappy gfx card and driver crashes**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Improved synchronization of visuals to sound**  <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **Impulse Tracker (IT) w/ NNA support (still some bugs)**  <br>
-$\color{limegreen}\textsf{+}$ &nbsp; **Fast Tracker II (XM) support is working, but not solid!**  <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Impulse Tracker (IT) w/ NNA support (may still have bugs)**  <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Fast Tracker II (XM) support is working solid!**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Scream Tracker 3.xx (S3M) support is solid!**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Amiga ProTracker (MOD) support is solid**<br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Rewritten from scratch with individual format loaders to avoid a big mess**<br>
@@ -53,12 +53,10 @@ $\color{limegreen}\textsf{+}$ &nbsp; **Data packing optimizations**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Loader optimizations**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **8 Visualizers backdrop for ShaderToy builds** <br>
 $\color{limegreen}\textsf{+}$ &nbsp; Added `--help`   <br>
-$\color{limegreen}\textsf{+}$ &nbsp; Added `--use-png` — roll MOD into a PNG for a much faster load<br>
-$\color{limegreen}\textsf{+}$ &nbsp; Added `--viz 0` (no backdrop) plus visualizers `1`–`8`  <br>
-$\color{limegreen}\textsf{+}$ &nbsp; Added `--split` / `--no-split` — `--split` for faster compile  <br>
+$\color{limegreen}\textsf{+}$ &nbsp; Added `--png` — roll MOD into a PNG for a much faster load (not supported by ShaderToy yet)<br>
+$\color{limegreen}\textsf{+}$ &nbsp; Added `--viz 0` (low cost backdrop) plus visualizers `1`–`20`  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; Added `--vec-dim 8` — better results than `--downsample 2`  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; Added `--no-rvq2` — faster compile, ~4 dB SNR cost<br>
-$\color{limegreen}\textsf{+}$ &nbsp; **Fixed most of the pattern playback bugs in S3M and MOD**  <br>
 ---
 
 ## $${\color{deepskyblue}\textsf{🎬 Live demos}}$$
