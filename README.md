@@ -13,18 +13,18 @@ $${\Large\color{orange}\textsf{standalone HTML embedded page}}$$$${\small\color{
 
 ### Features
 <p align="center">
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **2-stage Residual VQ** — K-means sample compression, ~14.7 dB SNR at ~2.1 bits/sample.  
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Per-sample FFT bandwidth analysis** — auto-decimates low-bandwidth samples, preserves HF shimmer.  
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Loop-seam smoothing** — patches post-loop guard so VQ doesn't break loop boundaries.  
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Configurable resampler** — linear, B-spline, or Lanczos-3.  
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **3D Surround, PhatBass, Comb Reverb, FAT** — Hilbert bass enhance + channel-pair widening.  
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **RLE pattern compression** — bitmap + dictionary + O(1) row seek.  
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **`ivec4` chunked data loader** — 4 bytes per int32, beats GLSL array limits.  
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **2-stage Residual VQ** — K-means sample compression, ~14.7 dB SNR at ~2.1 bits/sample <br />
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Per-sample FFT bandwidth analysis** — auto-decimates low-bandwidth samples, preserves HF shimmer<br />
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Loop-seam smoothing** — patches post-loop guard so VQ doesn't break loop boundaries<br />
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Configurable resampler** — linear, B-spline, or Lanczos-3<br />
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **3D Surround, PhatBass, Comb Reverb, FAT** — Hilbert bass enhance + channel-pair widening<br />
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **RLE pattern compression** — bitmap + dictionary + O(1) row seek<br />
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **`ivec4` chunked data loader** — 4 bytes per int32, beats GLSL array limits<br />
 <img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **6 built-in visualizers** — `--viz 0..5`.  
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Tracker-like GUI** — pattern grid, oscilloscope/FFT toggle, BPM/Speed/Position.  
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Full output bundle** — HTML player + 4 ShaderToy tabs + PNG + paste instructions.  
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **`--use-png`** — fast-compile alternative, raw 8-bit samples via texelFetch.  
-<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **`--no-rvq2`** — single-stage RVQ, ~33% smaller Sound, ~4 dB SNR cost.
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Tracker-like GUI** — pattern grid, oscilloscope/FFT toggle, BPM/Speed/Position<br />
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Full output bundle** — HTML player + 4 ShaderToy tabs + PNG + paste instructions<br />
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **`--use-png`** — fast-compile alternative, raw 8-bit samples via texelFetch<br />
+<img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **`--no-rvq2`** — single-stage RVQ, ~33% smaller Sound, ~4 dB SNR cost<br />
 </p>
 ![Version](https://img.shields.io/badge/version-1.37-orange?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.x-blue?style=flat-square&logo=python&logoColor=white)
