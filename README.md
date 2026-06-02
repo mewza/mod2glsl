@@ -26,8 +26,8 @@ Convert any MOD, S3M, XM, or IT into a ShaderToy shader, complete with visualiza
 together with oscilloscope and spectrum rendering, fully customizable however you like!
 
 Examples: <br>
-&nbsp; % python3 mod_player.py beyond.mod --viz 6   --resampler lanczos3<br>
-&nbsp; % python3 mod_player.py Firestorm.it --viz 3 --no-rvq2  --bitrate ultra<br>
+&nbsp; % python3 mod_player.py beyond.mod --png --viz 6<br>
+&nbsp; % python3 mod_player.py Firestorm.it --no-rvq2 --bitrate hi --viz 3<br>
     
 ---
 
