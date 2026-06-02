@@ -13,24 +13,24 @@ $${\Large\color{orange}\textsf{standalone HTML embedded page}}$$$${\small\color{
 
 ### Features
 
-<div align="left">
-<ul>
-<li>🔸 <strong>2-stage Residual VQ</strong> — K-means sample compression, ~14.7 dB SNR at ~2.1 bits/sample</li>
-<li>🔸 <strong>Per-sample FFT bandwidth analysis</strong> — auto-decimates low-bandwidth samples, preserves HF shimmer</li>
-<li>🔸 <strong>Loop-seam smoothing</strong> — patches post-loop guard so VQ doesn't break loop boundaries</li>
-<li>🔸 <strong>Configurable resampler</strong> — linear, B-spline, or Lanczos-3</li>
-<li>🔸 <strong>3D Surround, PhatBass, Comb Reverb, FAT</strong> — Hilbert bass enhance + channel-pair widening</li>
-<li>🔸 <strong>RLE pattern compression</strong> — bitmap + dictionary + O(1) row seek</li>
-<li>🔸 <strong><code>ivec4</code> chunked data loader</strong> — 4 bytes per int32, beats GLSL array limits</li>
-<li>🔸 <strong>6 built-in visualizers</strong> — <code>--viz 0..5</code></li>
-<li>🔸 <strong>Tracker-like GUI</strong> — pattern grid, oscilloscope/FFT toggle, BPM/Speed/Position</li>
-<li>🔸 <strong>Full output bundle</strong> — HTML player + 4 ShaderToy tabs + PNG + paste instructions</li>
-<li>🔸 <strong><code>--use-png</code></strong> — fast-compile alternative, raw 8-bit samples via texelFetch</li>
-<li>🔸 <strong><code>--no-rvq2</code></strong> — single-stage RVQ, ~33% smaller Sound, ~4 dB SNR cost</li>
-</ul>
-</div>
+<table align="center"><tr><td align="left">
 
-![Version](https://img.shields.io/badge/version-1.37-orange?style=flat-square)
+🔸 <strong>2-stage Residual VQ</strong> — K-means sample compression, ~14.7 dB SNR at ~2.1 bits/sample<br />
+🔸 <strong>Per-sample FFT bandwidth analysis</strong> — auto-decimates low-bandwidth samples, preserves HF shimmer<br />
+🔸 <strong>Loop-seam smoothing</strong> — patches post-loop guard so VQ doesn't break loop boundaries<br />
+🔸 <strong>Configurable resampler</strong> — linear, B-spline, or Lanczos-3<br />
+🔸 <strong>3D Surround, PhatBass, Comb Reverb, FAT</strong> — Hilbert bass enhance + channel-pair widening<br />
+🔸 <strong>RLE pattern compression</strong> — bitmap + dictionary + O(1) row seek<br />
+🔸 <strong><code>ivec4</code> chunked data loader</strong> — 4 bytes per int32, beats GLSL array limits<br />
+🔸 <strong>6 built-in visualizers</strong> — <code>--viz 0..5</code><br />
+🔸 <strong>Tracker-like GUI</strong> — pattern grid, oscilloscope/FFT toggle, BPM/Speed/Position<br />
+🔸 <strong>Full output bundle</strong> — HTML player + 4 ShaderToy tabs + PNG + paste instructions<br />
+🔸 <strong><code>--use-png</code></strong> — fast-compile alternative, raw 8-bit samples via texelFetch<br />
+🔸 <strong><code>--no-rvq2</code></strong> — single-stage RVQ, ~33% smaller Sound, ~4 dB SNR cost<br />
+
+</td></tr></table>
+
+![Version](https://img.shields.io/badge/version-1.75-orange?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.x-blue?style=flat-square&logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-ShaderToy-7e57c2?style=flat-square)
 ![License](https://img.shields.io/badge/license-non--commercial-green?style=flat-square)
