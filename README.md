@@ -65,13 +65,7 @@ $\color{limegreen}\textsf{+}$ &nbsp; Added `--no-rvq2` — faster compile, ~4 dB
   <img width="60%" alt="MOD2GLSL screenshot" src="https://github.com/user-attachments/assets/b10632a5-c7a6-47e7-a28e-832251b19e6c" />
 </p>
 <p align="center">
-<samp>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>BEYOND.MOD</b> • <a href="https://www.shadertoy.com/view/s3l3R8">shadertoy.com/view/s3l3R8</a></samp><br>
-<samp>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>GUITAROUS.MOD</b> • <a href="https://www.shadertoy.com/view/N3s3WN">shadertoy.com/view/N3s3WN</a></samp><br>
-<samp>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>SPCDEBRIS.MOD</b> • <a href="https://www.shadertoy.com/view/fXf3D4">shadertoy.com/view/fXf3D4</a></samp><br>
-<samp>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>GADGET.IT</b> • <a href="https://www.shadertoy.com/view/s3sGWM">shadertoy.com/view/s3sGWM</a></samp><br>
-<samp>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>MV-FLUTES.XM</b> • <a href="https://www.shadertoy.com/view/7Xs3WM">shadertoy.com/view/7Xs3WM</a></samp><br>
-<samp>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>HYBRID.XM</b> • <a href="https://www.shadertoy.com/view/7Xs3WM">shadertoy.com/view/7Xs3WM</a></samp><br>
-<samp>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>FIRESTORM.IT</b> • <a href="https://www.shadertoy.com/view/N3lGzj">shadertoy.com/view/N3lGzj</a></samp><br>
+<samp>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>SATELLITE.S3M</b> • <a href="https://www.shadertoy.com/view/7XjGD3">shadertoy.com/view/7XjGD3</a></samp><br>
 </p>
 
 ---
