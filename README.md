@@ -62,7 +62,6 @@ $\color{limegreen}\textsf{+}$ &nbsp; Added `--no-rvq2` — faster compile, ~4 dB
 
 ## $${\color{deepskyblue}\textsf{🎬 Live demos}}$$
 <p align="center">
-  <img width="60%" alt="MOD2GLSL screenshot" src="https://github.com/user-attachments/assets/b10632a5-c7a6-47e7-a28e-832251b19e6c](https://github.com/user-attachments/assets/d3946ce4-436c-4c8d-8029-7ccf18d66d4a" />
     <img width="60%" alt="MOD2GLSL screenshot" src="https://github.com/user-attachments/assets/d3946ce4-436c-4c8d-8029-7ccf18d66d4a" />
 </p>
 <p align="center">
