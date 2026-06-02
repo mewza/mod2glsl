@@ -12,8 +12,6 @@ $${\Large\color{orange}\textsf{standalone HTML embedded page}}$$$${\small\color{
 `mod_player.py` converts MOD files of size up to roughly **150–200 KB** into a ShaderToy shader.
 
 ### Features
-You want the block centered on the page but the lines left-aligned inside it. GitHub strips most CSS, so the reliable trick is a centered table with a left-aligned cell:
-html
 
 <div align="left">
 <ul>
