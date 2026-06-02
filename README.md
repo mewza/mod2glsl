@@ -6,15 +6,14 @@ $${\Large\color{orange}\textsf{GLSL MOD Player v1.75 for ShaderToy and}}$$
 $${\Large\color{orange}\textsf{standalone HTML embedded page}}$$$${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
 
 ---
-<div align="center">
+## $${\color{deepskyblue}\textsf{🎬 Live demos}}$$
+<p align="center">
+    <img width="60%" alt="MOD2GLSL screenshot" src="https://github.com/user-attachments/assets/d3946ce4-436c-4c8d-8029-7ccf18d66d4a" />
+</p>
+<p align="center">
+<samp>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>SATELLITE.S3M</b> • <a href="https://www.shadertoy.com/view/7XjGD3">shadertoy.com/view/7XjGD3</a></samp><br>
+</p>
 
-### 🎬 Live Demo
-
-https://github.com/user-attachments/assets/4c7fe125-086c-410b-bcba-808fc7648984
-
-*BEYOND_MUSIC.MOD rendered through GLSL MOD Player v1.52*
-
-</div>
 ## $${\color{cyan}\textsf{📖 Overview}}$$
 
 `mod_player.py` converts MOD files into ShaderToy presentations that you can load with ShaderToy plug-in via JSON. It supports two modes --png embedding a mod into PNG encapsulation or embedded into the code with limited capacity but due to custom sample compression and downsampling fetures able to fit even 400k-500k MODs into the shader.
@@ -86,15 +85,15 @@ $\color{limegreen}\textsf{+}$ &nbsp; Added `--viz 0` (low cost backdrop) plus vi
 $\color{limegreen}\textsf{+}$ &nbsp; Added `--vec-dim 8` — better results than `--downsample 2`  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; Added `--no-rvq2` — faster compile, ~4 dB SNR cost<br>
 ---
+<div align="center">
 
-## $${\color{deepskyblue}\textsf{🎬 Live demos}}$$
-<p align="center">
-    <img width="60%" alt="MOD2GLSL screenshot" src="https://github.com/user-attachments/assets/d3946ce4-436c-4c8d-8029-7ccf18d66d4a" />
-</p>
-<p align="center">
-<samp>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>SATELLITE.S3M</b> • <a href="https://www.shadertoy.com/view/7XjGD3">shadertoy.com/view/7XjGD3</a></samp><br>
-</p>
+### 🎬 Live Demo
 
+https://github.com/user-attachments/assets/4c7fe125-086c-410b-bcba-808fc7648984
+
+*BEYOND_MUSIC.MOD rendered through GLSL MOD Player v1.52*
+
+</div>
 ---
 
 > [!WARNING]
