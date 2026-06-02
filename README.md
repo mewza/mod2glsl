@@ -35,6 +35,7 @@ Examples: <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Improved --png and non-png loading, bug fixes, gui improvement**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Optimized load time for png and non-png ShaderToy modes**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Improved GUI, fixed crappy gfx card and driver crashes**  <br>
+$\color{limegreen}\textsf{+}$ &nbsp; **Improved synchronization of visuals to sound**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Impulse Tracker (IT) w/ NNA support (still some bugs)**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Fast Tracker II (XM) support is working, but not solid!**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Scream Tracker 3.xx (S3M) support is solid!**<br>
