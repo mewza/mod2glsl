@@ -12,7 +12,7 @@ $${\Large\color{orange}\textsf{standalone HTML embedded page}}$$$${\small\color{
 `mod_player.py` converts MOD files of size up to roughly **150–200 KB** into a ShaderToy shader.
 
 ### Features
-<p align="center">
+<p align="left">
 <img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **2-stage Residual VQ** — K-means sample compression, ~14.7 dB SNR at ~2.1 bits/sample <br />
 <img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Per-sample FFT bandwidth analysis** — auto-decimates low-bandwidth samples, preserves HF shimmer<br />
 <img src="https://github.githubassets.com/images/icons/emoji/unicode/1f538.png" width="20" /> **Loop-seam smoothing** — patches post-loop guard so VQ doesn't break loop boundaries<br />
