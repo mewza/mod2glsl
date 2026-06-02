@@ -5,7 +5,6 @@
 $${\Large\color{orange}\textsf{GLSL MOD Player v1.75 for ShaderToy and}}$$
 $${\Large\color{orange}\textsf{standalone HTML embedded page}}$$$${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
 
----
 ## $${\color{deepskyblue}\textsf{🎬 Live demo}}$$
 <p align="center">
 <img width="60%" alt="MOD2GLSL screenshot" src="https://github.com/user-attachments/assets/d3946ce4-436c-4c8d-8029-7ccf18d66d4a" />
