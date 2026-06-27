@@ -27,9 +27,9 @@ $\color{orange}\blacklozenge$ &nbsp; **Configurable resampler** — linear, B-sp
 $\color{orange}\blacklozenge$ &nbsp; **3D Surround, PhatBass, Comb Reverb, FAT** — Hilbert bass enhance + channel-pair widening<br>
 $\color{orange}\blacklozenge$ &nbsp; **RLE pattern compression** — bitmap + dictionary + O(1) row seek<br>
 $\color{orange}\blacklozenge$ &nbsp; **`ivec4` chunked data loader** — 4 bytes per int32, beats GLSL array limits<br>
-$\color{orange}\blacklozenge$ &nbsp; **6 built-in visualizers** — `--viz 0..5`<br>
-$\color{orange}\blacklozenge$ &nbsp; **Tracker-like GUI** — pattern grid, oscilloscope/FFT toggle, BPM/Speed/Position<br>
-$\color{orange}\blacklozenge$ &nbsp; **Full output bundle** — HTML player + 4 ShaderToy tabs + PNG + paste instructions<br>
+$\color{orange}\blacklozenge$ &nbsp; **21 built-in visualizers** — `--viz 0..5`<br>
+$\color{orange}\blacklozenge$ &nbsp; **Tracker style UI** — pattern grid, oscilloscope/FFT toggle, BPM/Speed/Position<br>
+$\color{orange}\blacklozenge$ &nbsp; **Full output bundle** — HTML player + JSON import w/ ShaderToy plugin or 4 ShaderToy tabs + PNG + paste instructions<br>
 $\color{orange}\blacklozenge$ &nbsp; **`--use-png`** — fast-compile alternative, raw 8-bit samples via texelFetch<br>
 $\color{orange}\blacklozenge$ &nbsp; **`--no-rvq2`** — single-stage RVQ, ~33% smaller Sound, ~4 dB SNR cost<br>
 
