@@ -1,6 +1,6 @@
 <div align="center">
 
-# $${\Huge\color{cyan}\textsf{🎵 MOD2GLSL v1.75}}$$
+# $${\Huge\color{cyan}\textsf{🎵 MOD2GLSL v1.8}}$$
 
 $${\Large\color{orange}\textsf{GLSL IT,XM,S3M,MOD Player for ShaderToy}}$$
 $${\Large\color{orange}\textsf{plus a standalone HTML embedded player}}$$$${\small\color{lightgray}\textsf{© 2026 Orblivius — All rights reserved}}$$
@@ -53,7 +53,7 @@ Examples: <br>
     
 ---
 
-## $${\color{limegreen}\textsf{✨ What's new in v1.75}}$$
+## $${\color{limegreen}\textsf{✨ What's new in v1.8}}$$
 
 $\color{limegreen}\textsf{+}$ &nbsp; **Optimized load time for png and non-png ShaderToy modes**  <br>
 $\color{limegreen}\textsf{+}$ &nbsp; **Improved GUI, fixed crappy gfx card and driver crashes**  <br>
@@ -199,7 +199,7 @@ options:
   --no-dsp              MASTER SWITCH: disable ALL DSP effect processing in the output shaders (3D surround, FAT4X exciter, PhatBass; velvet/comb reverb are already off in v1.666). Forces ENABLE_3D/FAT/PHATBASS/VELVETREVERB/COMBREVERB = 0 and WINS over any individual --surround/--phatbass/--fat4x passed alongside it. This is the lightest Sound-tab path (no DSP private-vars) → best chance of fitting ANGLE's per-GPU private-variable ceiling. Note: AA is a resampler option, NOT part of the DSP chain — control it with --aa (default off). (default: False)
   --fft-n {64,128,256,512,1024,2048}
                         FFT size for Buffer A spectrum. Larger = more frequency resolution but slower compile. Default: 1024 (or 128 if --max-compat without override). (default: None)
-  --max-compat          [NO-OP — max-compat is now the DEFAULT in v1.40+ (current: v1.75)] This flag previously enabled compatibility mode for problematic GPUs/drivers (Windows + Firefox + NVIDIA, etc.). The compat preset (--resampler lanczos3, --reverb-size small, --no-surround, --phatbass, --fft-n 512, FAT4X on, extra HLSL pragmas) is now applied by default since most consumer setups need it and the quality difference is small. To opt OUT of any compat setting, pass the inverse individual flag — e.g. --reverb-size full, --surround. The flag is kept for backward compatibility with old command lines but does nothing. (default: False)
+  --max-compat          [NO-OP — max-compat is now the DEFAULT in v1.40+ (current: v1.8)] This flag previously enabled compatibility mode for problematic GPUs/drivers (Windows + Firefox + NVIDIA, etc.). The compat preset (--resampler lanczos3, --reverb-size small, --no-surround, --phatbass, --fft-n 512, FAT4X on, extra HLSL pragmas) is now applied by default since most consumer setups need it and the quality difference is small. To opt OUT of any compat setting, pass the inverse individual flag — e.g. --reverb-size full, --surround. The flag is kept for backward compatibility with old command lines but does nothing. (default: False)
 
 Examples:
   # Standard ShaderToy build — embedded, no DSP, fits most GPUs:
