@@ -216,7 +216,7 @@ Examples:
   # Audition only order positions 35-36 (speed carried over from earlier):
   python3 mod_player.py SONG.S3M --positions 35-36 --no-dsp
 
-Input formats: .mod  .s3m  .it   (.xm not yet implemented)
+Input formats: .mod  .s3m  .it  .xm
 Outputs:       SONG_player.html, SONG_shadertoy_{common,sound,bufferA,image}.glsl,
                SONG_shadertoy.json (one-click ShaderToy import)
 ```
