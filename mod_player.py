@@ -3071,7 +3071,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
     data_source_comment = "Embedded data (no PNG required)" if use_embedded else f"All data in 1024×1024 RGBA PNG: {png_file}"
     common_glsl = f"""/* ============================================================================
    GLSL (The Last) MOD Player v1.8 (c) 2026 Orblivius
-   4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
+   32 Tracks support, IT(+NNA)/XM/S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    COMMON TAB
    Visualizer: {viz_name}
    Contact: subband@gmail.com or
@@ -3825,7 +3825,7 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
 
     sound_glsl = f"""/* ============================================================================
    GLSL (The Last) MOD Player v1.8 (c) 2026 Orblivius
-   4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
+   32 Tracks support, IT(+NNA)/XM/S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    SOUND TAB
    Visualizer: {viz_name}
    Contact: subband@gmail.com or
@@ -8695,7 +8695,7 @@ float _v21poi_sdBezier(vec2 p, vec2 A, vec2 B, vec2 C) {
 
     image_glsl = f"""/* ============================================================================
    GLSL (The Last) MOD Player v1.8 (c) 2026 Orblivius
-   4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
+   32 Tracks support, IT(+NNA)/XM/S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    IMAGE TAB — iChannel0: alphabet texture (shadertoy.com/view/4sf3RB)
                 iChannel1: Buffer A (audio + FFT + smoothed bands)
                 iChannel2: RGBA Noise Small  ← required for viz 6 smoke turbulence
@@ -10102,7 +10102,7 @@ void mainImage(out vec4 O, vec2 C) {{
     #        Image   iChannel1 = Buffer A output
     buffer_a_glsl = f"""/* ============================================================================
    GLSL (The Last) MOD Player v1.8 (c) 2026 Orblivius
-   4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
+   32 Tracks support, IT(+NNA)/XM/S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    Contact: subband@gmail.com or
             subband@protonmail.com
    GIT:     https://github.com/mewza/mod2glsl
