@@ -7,7 +7,7 @@ $${\Large\color{orange}\textsf{plus a standalone single page HTML player}}$$$${\
 
 ## $${\color{deepskyblue}\textsf{🎬 Live demo}}$$
 <p align="center">
-<img width="60%" alt="MOD2GLSL screenshot" src="https://github.com/user-attachments/assets/d3946ce4-436c-4c8d-8029-7ccf18d66d4a" />
+<img width="60%" alt="image" src="https://github.com/user-attachments/assets/86155e20-4af6-4b49-9fa2-d61f27df76e7" />
 </p>
 <p align="center">
 <samp>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>SATELLITE.S3M</b> • <a href="https://www.shadertoy.com/view/7XjGD3">shadertoy.com/view/7XjGD3</a></samp><br>
