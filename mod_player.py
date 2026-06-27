@@ -459,11 +459,19 @@ def bw_compress_sample(data, sr=44100):
     
     if best_factor == 1:
         return 1, d.astype(np.int8)
-    
+
+    # Capture the pre-emphasis INPUT rms so the decimated output can be
+    # level-matched back to it below.
+    _in_rms = float(np.sqrt(np.mean(d.astype(np.float64) ** 2)))
+
     # Pre-emphasis: y[n] = x[n] - alpha*x[n-1]  (first-order high-shelf boost)
-    # Compensates the anti-alias LPF roll-off baked in by resample_poly.
-    # No de-emphasis on playback → brighter, more present sound.
-    # alpha=0.85 ≈ +6 dB shelf above ~3 kHz; raise to 0.93 for more air.
+    # Brightens the raw-stride-decimated sample (alpha=0.85 ≈ +6 dB shelf above
+    # ~3 kHz; raise to 0.93 for more air). NOTE: on low-freq samples this is a
+    # ~0.15x (−16 dB) amplitude CUT — it was compensating an anti-alias LPF the
+    # raw-stride decimator no longer applies. Left unrestored it caused the
+    # "sudden volume drops" on any decimated (bw>1) sample, so we RESTORE the
+    # level after decimation (see _out_rms below). The brightness/spectral tilt
+    # survives because the restore is a single uniform gain.
     _alpha = 0.85
     d_pre = np.empty_like(d)
     d_pre[0] = d[0]
@@ -473,6 +481,13 @@ def bw_compress_sample(data, sr=44100):
 
     # Raw decimation — no LPF, full HF content preserved
     compressed = d[::best_factor]
+
+    # Level-restore: rescale the decimated signal so its RMS matches the
+    # pre-emphasis input RMS. Keeps the high-shelf timbre, removes the drop.
+    _out_rms = float(np.sqrt(np.mean(compressed.astype(np.float64) ** 2)))
+    if _out_rms > 1e-9:
+        compressed = compressed * (_in_rms / _out_rms)
+
     compressed = np.clip(np.round(compressed).astype(np.int32), -128, 127).astype(np.int8)
     return best_factor, compressed
 
@@ -2644,6 +2659,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
         'fft_n':          512,
         'extra_pragmas':  False,
         'phatbass_mode':  'sample',  # 'auto' | 'sample' | 'mix'
+        'simplegui':      False,     # --simplegui: compact per-track strip instead of scrolling grid
     }
     if compat:
         _compat.update(compat)
@@ -2683,6 +2699,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
        18: "sm0g (diatribes/Shane fork — tri-planar textured SDF box corridors + bump map)",
        19: "LED Band Spectro 3D (Orblivious — pentagon LED tunnel + spectro history)",
        20: "Nebula flight II (Orblivius — star tunnel + spiral-noise nebula + audio-reactive terrain)",
+       21: "Poi Dancer (Orblivius — spinning poi + SDF dancer + smoke; imported from Surrealizer)",
     }
     viz_name = _VIZ_NAMES.get(viz, f"viz{viz}")
 
@@ -2729,7 +2746,46 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
     all_samples = []
     sample_map = []
     
+    def _declick_loop_len(pcm, loop_start, loop_len, N=50):
+        """Nudge a FORWARD loop's END within ±N samples to the sample that best
+        matches the loop-START value (+ slope) → kills the loop-wrap click
+        (monkey_island pat-10 etc.). Returns the adjusted loop_len; unchanged for
+        very short loops (so a near-single-cycle loop is never detuned)."""
+        n = len(pcm); loop_end = loop_start + loop_len
+        if loop_len <= 2 or loop_start + 1 >= n or loop_end >= n or loop_len < 4 * N:
+            return loop_len
+        sv = float(pcm[loop_start]); ss = float(pcm[loop_start + 1]) - sv
+        orig = abs(float(pcm[loop_end]) - sv) + 0.5 * abs((float(pcm[loop_end]) - float(pcm[loop_end - 1])) - ss)
+        if orig < 8.0:                    # loop already clean (int8 units) → leave it EXACTLY as-is
+            return loop_len
+        best_e, best_c = loop_end, orig   # only move if a strictly better match exists
+        for e in range(max(loop_start + 2, loop_end - N), min(n - 1, loop_end + N + 1)):
+            c = abs(float(pcm[e]) - sv) + 0.5 * abs((float(pcm[e]) - float(pcm[e - 1])) - ss)
+            if c < best_c:
+                best_c, best_e = c, e
+        return best_e - loop_start
+
+    def _declick_bidi_len(pcm, loop_start, loop_len, N=50):
+        """Ping-pong loop: the click is a SLOPE corner at the turnaround, not an
+        amplitude jump. Pull the loop END off the sample boundary (loop_end==len
+        reflects into the zero-padding) and onto the nearest |slope|-minimum
+        (peak/trough) within ±N, so the forward→backward turn is smooth."""
+        n = len(pcm)
+        if loop_len < 4 * N or loop_start + 1 >= n:
+            return loop_len
+        le = min(loop_start + loop_len, n - 2)          # pull off the boundary (no padding reflect)
+        def sl(i): return abs(float(pcm[i]) - float(pcm[i - 1]))
+        if sl(le) < 4.0:                                 # turnaround already smooth → just the clamp
+            return le - loop_start
+        best_e, best_s = le, sl(le)
+        for e in range(max(loop_start + 2, le - N), min(n - 2, le + N + 1)):
+            s = sl(e)
+            if s < best_s:
+                best_s, best_e = s, e
+        return best_e - loop_start
+
     _loop_fr = []   # (sample idx, adaptive factor that was overridden → 1)
+    _declicked = 0
     for _smp_i, smp in enumerate(mod.samples):
         start_idx = len(all_samples)
         raw_len = 0
@@ -2748,11 +2804,22 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
             all_samples.extend(compressed.astype(np.float64) / 128.0)
             raw_len = len(compressed)
             all_samples.extend([0.0] * 32)  # zero-padding: pos+1 and pos+2 always safe
+        _rp = smp['repeat_point'] // bw_factor
+        _rl = (smp['repeat_length'] // bw_factor) if smp['repeat_length'] > 2 else smp['repeat_length']
+        # Loop declicker: nudge the loop END ±50 samples to the best match for the
+        # loop-START sample. Skip ping-pong loops (XM stype bit0-1==2 / IT bidi) —
+        # they reflect, so there's no end→start jump to declick.
+        _bidi = (smp.get('stype', 0) & 3) == 2 or smp.get('loop_type', 0) == 2 or smp.get('bidi_loop', False)
+        if _rl > 2 and raw_len > 0:
+            _new = (_declick_bidi_len(compressed, _rp, _rl, 50) if _bidi
+                    else _declick_loop_len(compressed, _rp, _rl, 50))
+            if _new != _rl:
+                _declicked += 1; _rl = _new
         sample_map.append({
             'start':          start_idx,
             'length':         raw_len,
-            'repeat_point':   smp['repeat_point'] // bw_factor,
-            'repeat_length':  smp['repeat_length'] // bw_factor if smp['repeat_length'] > 2 else smp['repeat_length'],
+            'repeat_point':   _rp,
+            'repeat_length':  _rl,
             'bw_factor':      bw_factor,
         })
     if _loop_fr:
@@ -2764,6 +2831,8 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
               f"(was ×{sorted({_f for _,_f in _loop_fr})}; "
               f"+{_extra} raw samples → larger Sound, watch GPU budget). "
               f"Set LOOP_NO_DOWNSAMPLE=False to revert.")
+    if _declicked:
+        print(f"   ✂️  loop-declick: nudged {_declicked} loop end(s) ±50 samples to the nearest loop-start match → fewer wrap clicks")
 
     # Remove old pattern processing - everything goes in PNG now
     
@@ -3001,7 +3070,7 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
                 len(getattr(mod, 'samples', []) or []))
     data_source_comment = "Embedded data (no PNG required)" if use_embedded else f"All data in 1024×1024 RGBA PNG: {png_file}"
     common_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.75 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.8 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    COMMON TAB
    Visualizer: {viz_name}
@@ -3020,6 +3089,9 @@ def create_shadertoy_glsl(mod, output_file, downsample=1, compress=True, compres
 #define SONG_LENGTH {len(mod.song_positions)}
 #define SONG_LOOP_POS {loop_target_songpos}
 #define NUM_CHANNELS {mod.num_channels}
+// NOTE: tracker-row band is render-px [179, 595]  (header=179; 179+NROWS(16)*CH(26)=595).
+// The cursor/scroll/toggle zones below use these literals directly (Common template is
+// split across build paths, so a shared #define isn't reliably visible to Buffer A).
 #define BYTES_PER_ROW {mod.num_channels * 5}
 #define SEEK_TABLE_SIZE {len(seek_table) if seek_table else mod.num_patterns * 64}
 #define BPM {float(mod.initial_tempo)}
@@ -3752,7 +3824,7 @@ float getChannelOutput(int ch, float time, Position pos, float rowTime) {{
     _ap_p0_2, _ap_p1p2_2, _ap_delay_2 = _only3d_coeffs(_ONLY3D_FREQ2)
 
     sound_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.75 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.8 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    SOUND TAB
    Visualizer: {viz_name}
@@ -3809,7 +3881,23 @@ float getMixedMono(float time_offset, Position pos, float rowTime) {{
     float mix = 0.0;
     for (int ch = 0; ch < NUM_CHANNELS; ch++)
         mix += getChannelOutput(ch, time_offset, pos, rowTime);
-    const float normFactor = 3.5 / float(NUM_CHANNELS);  // loud-but-clean (tuned on 2ND_PM). 5.0 distorted ONLY via the former 3 stacked soft-knees; with the single output limiter 3.5 = +2.3dB over the oracle, peak ~0.96, ~0.09% in the gentle knee (transparent)
+    const float normFactor = 3.5 / float(max(NUM_CHANNELS, 8));  // loud-but-clean (tuned on 2ND_PM). 5.0 distorted ONLY via the former 3 stacked soft-knees; with the single output limiter 3.5 = +2.3dB over the oracle, peak ~0.96, ~0.09% in the gentle knee (transparent)
+    return mix * normFactor;
+}}
+
+// Pan-weighted STEREO mix at a time offset. The 3D/surround delayed taps call
+// this instead of an inline per-channel loop, so the whole shader has exactly
+// ONE channel loop per tap (de-unrolled + reused), never N inlined copies.
+// All DSP runs on this summed stereo, never per-channel.
+vec2 getMixedStereo(float time_offset, Position pos, float rowTime) {{
+    vec2 mix = vec2(0.0);
+    for (int ch = 0; ch < (rowTime < 0. ? 99999 : NUM_CHANNELS); ch++) if (ch < NUM_CHANNELS) {{
+        float s = getChannelOutput(ch, time_offset, pos, rowTime);
+        float panR = 0.125 + 0.75 * channelPan[ch];   // 75% separation (matches surround)
+        mix.x += s * (1.0 - panR);
+        mix.y += s * panR;
+    }}
+    const float normFactor = 3.5 / float(max(NUM_CHANNELS, 8));
     return mix * normFactor;
 }}
 
@@ -3921,15 +4009,24 @@ vec2 mainSound(int samp, float time) {{
     // path below is preprocessor-removed for IT (no double-mix, no wasted
     // per-sample pattern walk). v1.666's downstream limiter/FAT/comb still
     // apply to _out.
-    vec2 _out = tlGetOutput(playbackTime);
+    vec2 _out = tlGetOutput(play_samp);   // integer sample index → exact timing (no float32 click)
 #else
     // Split into surround bus (ch0,ch3 = outer LEFT pair → Surround L/R)
     // and center bus (ch1,ch2 = inner RIGHT pair → dry center)
     float surrL = 0.0, surrR = 0.0;
     float centL = 0.0, centR = 0.0;
-    
+
+    // ── SOLO: per-channel flags live in Buffer A (iChannel0) row 2 px 16+ch.
+    // If ANY channel is soloed, mute every non-soloed channel. None soloed →
+    // _soloAny=false → full mix (unchanged). On ShaderToy/at load Buffer A is
+    // zero so nothing is muted.
+    bool _soloAny = false;
+    for (int _sc = 0; _sc < NUM_CHANNELS; _sc++)
+        if (texelFetch(iChannel0, ivec2(16 + _sc, 2), 0).r > 0.5) _soloAny = true;
+
     for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
-        float s = getChannelOutput(ch, playbackTime, pos, rowTime);
+        bool _muted = _soloAny && texelFetch(iChannel0, ivec2(16 + ch, 2), 0).r < 0.5;
+        float s = _muted ? 0.0 : getChannelOutput(ch, playbackTime, pos, rowTime);
         float panR = {('channelPan[ch]' if getattr(mod, 'is_it', False) else '0.25 + 0.5 * channelPan[ch]')};   // IT: direct pan (MikIT-exact); else 75% Amiga separation
         float panL = 1.0 - panR;
         int cm = ch % 4;
@@ -3940,7 +4037,7 @@ vec2 mainSound(int samp, float time) {{
     }}
     
     // OPT: const-qualified — NUM_CHANNELS is a #define.
-    const float normFactor = 3.5 / float(NUM_CHANNELS);  // loud-but-clean (tuned on 2ND_PM). 5.0 distorted ONLY via the former 3 stacked soft-knees; with the single output limiter 3.5 = +2.3dB over the oracle, peak ~0.96, ~0.09% in the gentle knee (transparent)
+    const float normFactor = 3.5 / float(max(NUM_CHANNELS, 8));  // loud-but-clean (tuned on 2ND_PM). 5.0 distorted ONLY via the former 3 stacked soft-knees; with the single output limiter 3.5 = +2.3dB over the oracle, peak ~0.96, ~0.09% in the gentle knee (transparent)
     surrL *= normFactor; surrR *= normFactor;
     centL *= normFactor; centR *= normFactor;
     
@@ -3962,22 +4059,12 @@ vec2 mainSound(int samp, float time) {{
             Position pos1 = getPosition(t.x);
             Position pos2 = getPosition(t.y);
             float diffNow = surrL - surrR;
-            vec2 wL = vec2(0.0);
-            vec2 wR = vec2(0.0);
-            for (int ch = 0; ch < NUM_CHANNELS; ch++) {{
-                int  inst1   = getNote(pos1.songPos, pos1.row, ch).instrument;
-                bool isBass1 = (inst1 >= 1 && inst1 <= {_NSMP}) ? isBass[inst1 - 1] : false;
-                if (isBass1) continue;
-                float panR = 0.125 + 0.75 * channelPan[ch];
-                vec2  pan  = vec2(1.0 - panR, panR);
-                vec2 sxy = vec2(getChannelOutput(ch, t.x, pos1, rowTime),
-                                getChannelOutput(ch, t.y, pos2, rowTime));
-                wL += sxy * pan.x;
-                wR += sxy * pan.y;
-            }}
-            wL *= normFactor;
-            wR *= normFactor;
-            vec2 diffDelayed = wL - wR;
+            // Delayed stereo via the shared de-unrolled getMixedStereo (one channel
+            // loop per tap, reused) — no inline per-channel re-sum. Bass-skip dropped:
+            // DSP runs on the full summed stereo, never per channel.
+            vec2 m1 = getMixedStereo(t.x, pos1, rowTime);
+            vec2 m2 = getMixedStereo(t.y, pos2, rowTime);
+            vec2 diffDelayed = vec2(m1.x - m1.y, m2.x - m2.y);
             vec2 ap = diffNow * AP_P0 + diffDelayed * AP_P1_PLUS_P2;
             // Soft saturation x/sqrt(1+x²·SAT) — inversesqrt is one HW op.
             vec2 dd = ap * inversesqrt(1.0 + ap * ap * SATURATION);
@@ -4055,7 +4142,9 @@ vec2 mainSound(int samp, float time) {{
     if (enableFAT) {{
         _out = softLimit(_out);                    // bounds to [-1,1] for cs1
         vec2 _slr = fat_cs1(_out);                 // even-harmonic waveshaper
-        vec2 _fat = _out * (1.0 + _slr);           // FAT core (FIR≈1.0 stateless)
+        // THROUGH, not additive: /(1+fat_cs1(0)) → unity small-signal gain
+        // (the raw (1+_slr) form boosts +1.44x at DC). FAT4X colors, no boost.
+        vec2 _fat = _out * (1.0 + _slr) / (1.0 + 0.4375);  // FAT core, unity DC
         _out = mix(_out, _fat, 0.85);              // tilt blend (0.85 = slight darken)
     }}
 
@@ -4125,10 +4214,10 @@ vec2 mainSound(int samp, float time) {{
             // bias on samples 0..6 where the source samples are zero.
             if (_tw < 0.0) continue;
             Position _rp = getPosition(_tw);
-            float _m = 0.0;
-            for (int ch = 0; ch < NUM_CHANNELS; ch++)
-                _m += getChannelOutput(ch, _tw, _rp, rowTime);
-            _m *= normFactor * _gk;
+            // Use the shared de-unrolled getMixedMono (the summed output) instead
+            // of an inline per-channel re-sum: identical result, but ANGLE keeps it
+            // one rolled body, so enabling comb reverb can't overflow private-vars.
+            float _m = getMixedMono(_tw, _rp, rowTime) * _gk;
             _wet.x += _pL[_c] * _m;
             _wet.y += _pR[_c] * _m;
         }}
@@ -6631,101 +6720,535 @@ vec3 _VizScene(vec2 C) {
 }
 """
 
-    elif viz == 18:  # sm0g (diatribes fork of Shane's "Offworld Storage Facility")
+    elif viz == 18:  # Skyscraper (Otavio Good, CC0 — procedural city flythrough)
         viz_scene_block = r"""
-// === VIZ 18: sm0g (diatribes / Shane fork) =======================================
-// Tri-planar textured SDF box corridors + bump-mapped normals.
-// iChannel3 (original stone tex) → iChannel2 (RGBA Noise Small, closest available).
-// Original: https://shadertoy.com/view/ffXSRs
-// Adaptations: macros → _v18_ fns; comma-exprs → {}-blocks; iChannel3→iChannel2;
-//   guard sqrt against negatives; explicit 0-init.
+// === VIZ 18: Skyscraper (Otavio Good, CC0) =======================================
+// Procedural city fly-by (SDF ray-march). Adapted for MOD2GLSL:
+//   * all globals/functions prefixed _v18sky_ (avoid Image-tab redefinitions)
+//   * env-cubemap reflection taps dropped (no cubemap available here)
+//   * mainImage/HQ-render folded into _VizScene(C); camera fly-by intact
+// Animation variables
+float _v18sky_localTime = 0.0;
+float _v18sky_seed = 1.0;
+float _v18sky_fade = 1.0;
+vec3 _v18sky_sunDir;
+vec3 _v18sky_sunCol;
+float _v18sky_exposure = 1.0;
+vec3 _v18sky_skyCol, _v18sky_horizonCol;
+float _v18sky_marchCount = 0.0;
 
-vec3 _v18_tex3D(sampler2D tex, in vec3 p, in vec3 n) {
-    n = max(n*n - 0.2, 0.001);
-    n /= dot(n, vec3(1.0));
-    vec3 tx = texture(tex, p.yz).xyz;
-    vec3 ty = texture(tex, p.zx).xyz;
-    vec3 tz = texture(tex, p.xy).xyz;
-    return mat3(tx*tx, ty*ty, tz*tz)*n;
+float _v18sky_v31(vec3 a) { return a.x + a.y * 37.0 + a.z * 521.0; }
+float _v18sky_v21(vec2 a) { return a.x + a.y * 37.0; }
+float _v18sky_Hash11(float a) { return fract(sin(a)*10403.9); }
+float _v18sky_Hash21(vec2 uv) { float f = uv.x + uv.y * 37.0; return fract(sin(f)*104003.9); }
+vec2 _v18sky_Hash22(vec2 uv) { float f = uv.x + uv.y * 37.0; return fract(cos(f)*vec2(10003.579, 37049.7)); }
+vec2 _v18sky_Hash12(float f) { return fract(cos(f)*vec2(10003.579, 37049.7)); }
+float _v18sky_Hash1d(float u) { return fract(sin(u)*143.9); }
+float _v18sky_Hash2d(vec2 uv) { float f = uv.x + uv.y * 37.0; return fract(sin(f)*104003.9); }
+float _v18sky_Hash3d(vec3 uv) { float f = uv.x + uv.y * 37.0 + uv.z * 521.0; return fract(sin(f)*110003.9); }
+float _v18sky_mixP(float f0, float f1, float a) { return mix(f0, f1, a*a*(3.0-2.0*a)); }
+const vec2 _v18sky_zeroOne = vec2(0.0, 1.0);
+float _v18sky_noise2d(vec2 uv)
+{
+    vec2 fr = fract(uv.xy);
+    vec2 fl = floor(uv.xy);
+    float h00 = _v18sky_Hash2d(fl);
+    float h10 = _v18sky_Hash2d(fl + _v18sky_zeroOne.yx);
+    float h01 = _v18sky_Hash2d(fl + _v18sky_zeroOne);
+    float h11 = _v18sky_Hash2d(fl + _v18sky_zeroOne.yy);
+    return _v18sky_mixP(_v18sky_mixP(h00, h10, fr.x), _v18sky_mixP(h01, h11, fr.x), fr.y);
+}
+float _v18sky_noise(vec3 uv)
+{
+    vec3 fr = fract(uv.xyz);
+    vec3 fl = floor(uv.xyz);
+    float h000 = _v18sky_Hash3d(fl);
+    float h100 = _v18sky_Hash3d(fl + _v18sky_zeroOne.yxx);
+    float h010 = _v18sky_Hash3d(fl + _v18sky_zeroOne.xyx);
+    float h110 = _v18sky_Hash3d(fl + _v18sky_zeroOne.yyx);
+    float h001 = _v18sky_Hash3d(fl + _v18sky_zeroOne.xxy);
+    float h101 = _v18sky_Hash3d(fl + _v18sky_zeroOne.yxy);
+    float h011 = _v18sky_Hash3d(fl + _v18sky_zeroOne.xyy);
+    float h111 = _v18sky_Hash3d(fl + _v18sky_zeroOne.yyy);
+    return _v18sky_mixP(
+        _v18sky_mixP(_v18sky_mixP(h000, h100, fr.x), _v18sky_mixP(h010, h110, fr.x), fr.y),
+        _v18sky_mixP(_v18sky_mixP(h001, h101, fr.x), _v18sky_mixP(h011, h111, fr.x), fr.y), fr.z);
 }
 
-vec3 _v18_texBump(sampler2D tx, in vec3 p, in vec3 n, float bf) {
-    const vec2 e = vec2(0.001, 0.0);
-    mat3 m = mat3(_v18_tex3D(tx, p - e.xyy, n),
-                  _v18_tex3D(tx, p - e.yxy, n),
-                  _v18_tex3D(tx, p - e.yyx, n));
-    vec3 g = vec3(0.299, 0.587, 0.114)*m;
-    g = (g - dot(_v18_tex3D(tx, p, n), vec3(0.299, 0.587, 0.114))) / e.x;
-    g -= n*dot(n, g);
-    return normalize(n + g*bf);
+const float _v18sky_PI=3.14159265;
+
+vec3 _v18sky_saturate(vec3 a) { return clamp(a, 0.0, 1.0); }
+vec2 _v18sky_saturate(vec2 a) { return clamp(a, 0.0, 1.0); }
+float _v18sky_saturate(float a) { return clamp(a, 0.0, 1.0); }
+
+vec3 _v18sky_GetSunColorSmall(vec3 rayDir, vec3 _v18sky_sunDir)
+{
+	vec3 localRay = normalize(rayDir);
+	float dist = 1.0 - (dot(localRay, _v18sky_sunDir) * 0.5 + 0.5);
+	float sunIntensity = 0.05 / dist;
+    sunIntensity += exp(-dist*150.0)*7000.0;
+	sunIntensity = min(sunIntensity, 40000.0);
+	return _v18sky_sunCol * sunIntensity*0.025;
 }
 
-mat2 _v18_R(float a) { return mat2(cos(a + vec4(0.,33.,11.,0.))); }
-
-float _v18_box(vec3 p, float i) {
-    p = abs(fract(p/i)*i - i*0.5) - i*0.06;
-    return min(p.x, min(p.y, p.z));
+vec3 _v18sky_GetEnvMap(vec3 rayDir, vec3 _v18sky_sunDir)
+{
+    vec3 finalColor = mix(_v18sky_horizonCol, _v18sky_skyCol, pow(_v18sky_saturate(rayDir.y), 0.47))*0.95;
+    float n = _v18sky_noise2d(rayDir.xz/rayDir.y*1.0);
+    n += _v18sky_noise2d(rayDir.xz/rayDir.y*2.0)*0.5;
+    n += _v18sky_noise2d(rayDir.xz/rayDir.y*4.0)*0.25;
+    n += _v18sky_noise2d(rayDir.xz/rayDir.y*8.0)*0.125;
+    n = pow(abs(n), 3.0);
+    n = mix(n * 0.2, n, _v18sky_saturate(abs(rayDir.y * 8.0)));
+    finalColor = mix(finalColor, (vec3(1.0)+_v18sky_sunCol*10.0)*0.75*_v18sky_saturate((rayDir.y+0.2)*5.0), _v18sky_saturate(n*0.125));
+    finalColor += _v18sky_GetSunColorSmall(rayDir, _v18sky_sunDir);
+    return finalColor;
 }
 
-float _v18_plane(vec3 p, float h, float a, float r) {
-    p.y -= h;
-    p.xz *= _v18_R(a);
-    float d = -9e9, i = 1e1;
-    for (; i > 0.1; i *= 0.3) {
-        p.xz *= _v18_R(i);
-        d = max(d, _v18_box(p, i));
+vec3 _v18sky_GetEnvMapSkyline(vec3 rayDir, vec3 _v18sky_sunDir, float height)
+{
+    vec3 finalColor = _v18sky_GetEnvMap(rayDir, _v18sky_sunDir);
+    float radial = atan(rayDir.z, rayDir.x)*4.0;
+    float skyline = floor((sin(5.3456*radial) + sin(1.234*radial)+ sin(2.177*radial))*0.6);
+    radial *= 4.0;
+    skyline += floor((sin(5.0*radial) + sin(1.234*radial)+ sin(2.177*radial))*0.6)*0.1;
+    float mask = _v18sky_saturate((rayDir.y*8.0 - skyline-2.5+height)*24.0);
+    float vert = sign(sin(radial*32.0))*0.5+0.5;
+    float hor = sign(sin(rayDir.y*256.0))*0.5+0.5;
+    mask = _v18sky_saturate(mask + (1.0-hor*vert)*0.05);
+    finalColor = mix(finalColor * vec3(0.1,0.07,0.05), finalColor, mask);
+	return finalColor;
+}
+
+vec2 _v18sky_matmin(vec2 a, vec2 b) { if (a.x < b.x) return a; else return b; }
+
+float _v18sky_sdBox(vec3 p, vec3 radius)
+{
+  vec3 dist = abs(p) - radius;
+  return min(max(dist.x, max(dist.y, dist.z)), 0.0) + length(max(dist, 0.0));
+}
+
+float _v18sky_cylCap(vec3 p, float r, float lenRad)
+{
+    float a = length(p.xy) - r;
+    a = max(a, abs(p.z) - lenRad);
+    return a;
+}
+
+float _v18sky_smin(float a, float b, float k) { return log2(exp2(k*a)+exp2(k*b))/k; }
+
+float _v18sky_Repeat(float a, float len) { return mod(a, len) - 0.5 * len; }
+
+vec2 _v18sky_Car(vec3 baseCenter, float unique)
+{
+    float car = _v18sky_sdBox(baseCenter + vec3(0.0, -0.008, 0.001), vec3(0.01, 0.00225, 0.0275));
+    car = _v18sky_smin(car, _v18sky_sdBox(baseCenter + vec3(0.0, -0.016, 0.008), vec3(0.005, 0.0005, 0.01)), -160.0);
+    vec3 wMirror = baseCenter + vec3(0.0, -0.005, 0.0);
+    wMirror.z = abs(wMirror.z)-0.02;
+    float wheels = _v18sky_cylCap((wMirror).zyx, 0.004, 0.0135);
+    vec2 distAndMat = vec2(wheels, 3.0);
+    distAndMat = _v18sky_matmin(distAndMat, vec2(car, 100000.0 + unique));
+    return distAndMat;
+}
+
+float _v18sky_voxelPad = 0.2;
+vec2 _v18sky_CityBlock(vec3 p, vec2 pint)
+{
+    vec4 rand;
+    rand.xy = _v18sky_Hash22(pint);
+    rand.zw = _v18sky_Hash22(rand.xy);
+    vec2 rand2 = _v18sky_Hash22(rand.zw);
+    float baseRad = 0.2 + (rand.x) * 0.1;
+    baseRad = floor(baseRad * 20.0+0.5)/20.0;
+    vec3 baseCenter = p - vec3(0.5, 0.0, 0.5);
+    float height = rand.w*rand.z + 0.1;
+    float downtown = _v18sky_saturate(4.0 / length(pint.xy));
+    height *= downtown;
+    height *= 1.5+(baseRad-0.15)*20.0;
+    height += 0.1;
+    height = floor(height*20.0)*0.05;
+	float d = _v18sky_sdBox(baseCenter, vec3(baseRad, height, baseRad));
+    d = min(d, p.y);
+    float height2 = max(0.0, rand.y * 2.0 - 1.0) * downtown;
+    height2 = floor(height2*20.0)*0.05;
+    rand2 = floor(rand2*20.0)*0.05;
+	d = min(d, _v18sky_sdBox(baseCenter - vec3(0.0, height, 0.0), vec3(baseRad, height2 - rand2.y, baseRad*0.4)));
+	d = min(d, _v18sky_sdBox(baseCenter - vec3(0.0, height, 0.0), vec3(baseRad*0.4, height2 - rand2.x, baseRad)));
+    if (rand2.y > 0.25)
+    {
+		d = min(d, _v18sky_sdBox(baseCenter - vec3(0.0, height, 0.0), vec3(baseRad*0.8, height2, baseRad*0.8)));
+        float topWidth = baseRad;
+        if (height2 > 0.0) topWidth = baseRad * 0.8;
+		d = max(d, -_v18sky_sdBox(baseCenter - vec3(0.0, height+height2, 0.0), vec3(topWidth-0.0125, 0.015, topWidth-0.0125)));
     }
-    return max(abs(p.y) - r, d);
+    else
+    {
+		if (height2 > 0.0) d = min(d, _v18sky_cylCap((baseCenter - vec3(0.0, height, 0.0)).xzy, baseRad*0.8, height2));
+    }
+	d = min(d, _v18sky_sdBox(baseCenter - vec3((rand.x-0.5)*baseRad, height+height2, (rand.y-0.5)*baseRad),
+                     vec3(baseRad*0.3*rand.z, 0.1*rand2.y, baseRad*0.3*rand2.x+0.025)));
+    vec3 boxPos = baseCenter - vec3((rand2.x-0.5)*baseRad, height+height2, (rand2.y-0.5)*baseRad);
+    float big = sign(boxPos.x);
+    boxPos.x = abs(boxPos.x)-0.02 - baseRad*0.3*rand.w;
+	d = min(d, _v18sky_sdBox(boxPos, vec3(baseRad*0.3*rand.w, 0.07*rand.y, baseRad*0.2*rand.x + big*0.025)));
+    if (rand.y < 0.04)
+    {
+        d = min(d, length(baseCenter - vec3(0.0, height, 0.0)) - baseRad*0.8);
+    }
+    vec2 distAndMat = vec2(d, 0.0);
+    distAndMat = _v18sky_matmin(distAndMat, vec2(_v18sky_sdBox(baseCenter, vec3(0.35, 0.005, 0.35)), 1.0));
+    return distAndMat;
 }
 
-float _v18_map(vec3 p) {
-    return min(_v18_plane(p,   0.0, 0.0, 1e1),
-           min(_v18_plane(p, -2e1,  1.0, 6.0),
-               _v18_plane(p, -4e1,  2.0, 6.0)));
+vec2 _v18sky_DistanceToObject(vec3 p)
+{
+    vec3 rep = p;
+    rep.xz = fract(p.xz);
+    vec2 distAndMat = _v18sky_CityBlock(rep, floor(p.xz));
+    vec3 p2 = p;
+    rep.xyz = p2;
+    float carTime = _v18sky_localTime*0.2;
+    float crossStreet = 1.0;
+    float repeatDist = 0.25;
+    if (abs(fract(rep.x)-0.5) < 0.35)
+    {
+        p2.x += 0.05;
+        p2.xz = p2.zx * vec2(-1.0,1.0);
+        rep.xz = p2.xz;
+        crossStreet = 0.0;
+        repeatDist = 0.1;
+    }
+    rep.z += floor(p2.x);
+    rep.x = _v18sky_Repeat(p2.x - 0.5, 1.0);
+    rep.z = rep.z*sign(rep.x);
+    rep.x = (rep.x*sign(rep.x))-0.09;
+    rep.z -= carTime * crossStreet;
+    float uniqueID = floor(rep.z/repeatDist);
+    rep.z = _v18sky_Repeat(rep.z, repeatDist);
+    rep.x += (_v18sky_Hash11(uniqueID)*0.075-0.01);
+    float frontBack = _v18sky_Hash11(uniqueID*0.987)*0.18-0.09;
+    frontBack *= sin(_v18sky_localTime*2.0 + uniqueID);
+    rep.z += frontBack * crossStreet;
+    vec2 carDist = _v18sky_Car(rep, uniqueID);
+    distAndMat = _v18sky_matmin(distAndMat, carDist);
+    return distAndMat;
+}
+
+void _v18sky_CalcWindows(vec2 block, vec3 pos, inout vec3 texColor, inout float windowRef, inout vec3 normal)
+{
+    vec3 hue = vec3(_v18sky_Hash21(block)*0.8, _v18sky_Hash21(block*7.89)*0.4, _v18sky_Hash21(block*37.89)*0.5);
+    texColor += hue*0.4;
+    texColor *= 0.75;
+    float window = 0.0;
+    window = max(window, mix(0.2, 1.0, floor(fract(pos.y*20.0-0.35)*2.0+0.1)));
+    if (pos.y < 0.05) window = 1.0;
+    float winWidth = _v18sky_Hash21(block*4.321)*2.0;
+    if ((winWidth < 1.3) && (winWidth >= 1.0)) winWidth = 1.3;
+    window = max(window, mix(0.2, 1.0, floor(fract(pos.x * 40.0+0.05)*winWidth)));
+    window = max(window, mix(0.2, 1.0, floor(fract(pos.z * 40.0+0.05)*winWidth)));
+    if (window < 0.5) { windowRef += 1.0; }
+    window *= _v18sky_Hash21(block*1.123);
+    texColor *= window;
+    float wave = floor(sin((pos.y*40.0-0.1)*_v18sky_PI)*0.505-0.5)+1.0;
+    normal.y -= max(-1.0, min(1.0, -wave*0.5));
+    float pits = min(1.0, abs(sin((pos.z*80.0)*_v18sky_PI))*4.0)-1.0;
+    normal.z += pits*0.25;
+    pits = min(1.0, abs(sin((pos.x*80.0)*_v18sky_PI))*4.0)-1.0;
+    normal.x += pits*0.25;
+}
+
+vec3 _v18sky_RayTrace(in vec2 fragCoord )
+{
+    _v18sky_marchCount = 0.0;
+    _v18sky_sunCol = vec3(258.0, 248.0, 200.0) / 3555.0;
+	_v18sky_sunDir = normalize(vec3(0.93, 1.0, 1.0));
+    _v18sky_horizonCol = vec3(1.0, 0.95, 0.85)*0.9;
+    _v18sky_skyCol = vec3(0.3,0.5,0.95);
+    _v18sky_exposure = 1.0;
+    _v18sky_fade = 1.0;
+
+	vec3 camPos, camUp, camLookat;
+	vec2 uv = fragCoord.xy/iResolution.xy * 2.0 - 1.0;
+    uv /= 2.0;
+
+    const float t0 = 0.0;
+    const float t1 = 16.0;
+    const float t2 = 32.0;
+    const float t3 = 64.0;
+    const float t4 = 128.0;
+    _v18sky_localTime = fract(_v18sky_localTime / t4) * t4;
+    if (_v18sky_localTime < t1)
+    {
+        float time = _v18sky_localTime - t0;
+        float alpha = time / (t1 - t0);
+        _v18sky_fade = _v18sky_saturate(time);
+        _v18sky_fade *= _v18sky_saturate(t1 - _v18sky_localTime);
+        camPos = vec3(13.0, 3.3, -3.5);
+        camPos.x -= smoothstep(0.0, 1.0, alpha) * 4.8;
+        camUp=vec3(0,1,0);
+        camLookat=vec3(0,1.5,1.5);
+    } else if (_v18sky_localTime < t2)
+    {
+        float time = _v18sky_localTime - t1;
+        float alpha = time / (t2 - t1);
+        _v18sky_fade = _v18sky_saturate(time);
+        _v18sky_fade *= _v18sky_saturate(t2 - _v18sky_localTime);
+        camPos = vec3(12.0, 6.3, -0.5);
+        camPos.y -= alpha * 5.5;
+        camPos.x = cos(alpha*1.0) * 5.2;
+        camPos.z = sin(alpha*1.0) * 5.2;
+        camUp=normalize(vec3(0,1,-0.5 + alpha * 0.5));
+        camLookat=vec3(0,1.0,-0.5);
+    } else if (_v18sky_localTime < t3)
+    {
+        float time = _v18sky_localTime - t2;
+        float alpha = time / (t3 - t2);
+        _v18sky_fade = _v18sky_saturate(time);
+        _v18sky_fade *= _v18sky_saturate(t3 - _v18sky_localTime);
+        camPos = vec3(2.15-alpha*0.5, 0.02, -1.0-alpha*0.2);
+        camPos.y += smoothstep(0.0,1.0,alpha*alpha) * 3.4;
+        camUp=normalize(vec3(0,1,0.0));
+        camLookat=vec3(0,0.5+alpha,alpha*5.0);
+    } else if (_v18sky_localTime < t4)
+    {
+        float time = _v18sky_localTime - t3;
+        float alpha = time / (t4 - t3);
+        _v18sky_fade = _v18sky_saturate(time);
+        _v18sky_fade *= _v18sky_saturate(t4 - _v18sky_localTime);
+        camPos = vec3(-2.0, 1.3- alpha*1.2, -10.5-alpha*0.5);
+        camUp=normalize(vec3(0,1,0.0));
+        camLookat=vec3(-2.0,0.3+alpha,-0.0);
+        _v18sky_sunDir = normalize(vec3(0.5-alpha*0.6, 0.3-alpha*0.3, 1.0));
+        _v18sky_sunCol = vec3(258.0, 148.0, 60.0) / 3555.0;
+        _v18sky_localTime *= 16.0;
+        _v18sky_exposure *= 0.4;
+        _v18sky_horizonCol = vec3(1.0, 0.5, 0.35)*2.0;
+        _v18sky_skyCol = vec3(0.75,0.5,0.95);
+    }
+
+	vec3 camVec=normalize(camLookat - camPos);
+	vec3 sideNorm=normalize(cross(camUp, camVec));
+	vec3 upNorm=cross(camVec, sideNorm);
+	vec3 worldFacing=(camPos + camVec);
+	vec3 worldPix = worldFacing + uv.x * sideNorm * (iResolution.x/iResolution.y) + uv.y * upNorm;
+	vec3 rayVec = normalize(worldPix - camPos);
+
+	vec2 distAndMat;
+	float t = 0.05;
+	const float maxDepth = 45.0;
+	vec3 pos = vec3(0.0);
+    const float smallVal = 0.000625;
+    for (int i = 0; i < 100; i++)
+    {
+        _v18sky_marchCount+=1.0;
+        pos = (camPos + rayVec * t);
+        distAndMat = _v18sky_DistanceToObject(pos);
+        float walk = distAndMat.x;
+        float dx = -fract(pos.x);
+        if (rayVec.x > 0.0) dx = fract(-pos.x);
+        float dz = -fract(pos.z);
+        if (rayVec.z > 0.0) dz = fract(-pos.z);
+        float nearestVoxel = min(fract(dx/rayVec.x), fract(dz/rayVec.z))+_v18sky_voxelPad;
+        nearestVoxel = max(_v18sky_voxelPad, nearestVoxel);
+        walk = min(walk, nearestVoxel);
+        t += walk;
+        if ((t > maxDepth) || (abs(distAndMat.x) < smallVal)) break;
+    }
+
+    float alpha = -camPos.y / rayVec.y;
+    if ((t > maxDepth) && (rayVec.y < -0.0))
+    {
+        pos.xz = camPos.xz + rayVec.xz * alpha;
+        pos.y = -0.0;
+        t = alpha;
+        distAndMat.y = 0.0;
+        distAndMat.x = 0.0;
+    }
+	vec3 finalColor = vec3(0.0);
+
+    if ((t <= maxDepth) || (t == alpha))
+	{
+        float dist = distAndMat.x;
+        vec3 smallVec = vec3(smallVal, 0, 0);
+        vec3 normalU = vec3(dist - _v18sky_DistanceToObject(pos - smallVec.xyy).x,
+                           dist - _v18sky_DistanceToObject(pos - smallVec.yxy).x,
+                           dist - _v18sky_DistanceToObject(pos - smallVec.yyx).x);
+        vec3 normal = normalize(normalU);
+
+        float ambientS = 1.0;
+        ambientS *= _v18sky_saturate(_v18sky_DistanceToObject(pos + normal * 0.0125).x*80.0);
+        ambientS *= _v18sky_saturate(_v18sky_DistanceToObject(pos + normal * 0.025).x*40.0);
+        ambientS *= _v18sky_saturate(_v18sky_DistanceToObject(pos + normal * 0.05).x*20.0);
+        ambientS *= _v18sky_saturate(_v18sky_DistanceToObject(pos + normal * 0.1).x*10.0);
+        ambientS *= _v18sky_saturate(_v18sky_DistanceToObject(pos + normal * 0.2).x*5.0);
+        ambientS *= _v18sky_saturate(_v18sky_DistanceToObject(pos + normal * 0.4).x*2.5);
+        float ambient = ambientS;
+        ambient = max(0.025, pow(ambient, 0.5));
+        ambient = _v18sky_saturate(ambient);
+
+        vec3 ref = reflect(rayVec, normal);
+
+        float sunShadow = 1.0;
+        float iter = 0.01;
+        vec3 nudgePos = pos + normal*0.002;
+		for (int i = 0; i < 40; i++)
+        {
+            vec3 shadowPos = nudgePos + _v18sky_sunDir * iter;
+            float tempDist = _v18sky_DistanceToObject(shadowPos).x;
+	        sunShadow *= _v18sky_saturate(tempDist*150.0);
+            if (tempDist <= 0.0) break;
+            float walk = tempDist;
+            float dx = -fract(shadowPos.x);
+            if (_v18sky_sunDir.x > 0.0) dx = fract(-shadowPos.x);
+            float dz = -fract(shadowPos.z);
+            if (_v18sky_sunDir.z > 0.0) dz = fract(-shadowPos.z);
+            float nearestVoxel = min(fract(dx/_v18sky_sunDir.x), fract(dz/_v18sky_sunDir.z))+smallVal;
+            nearestVoxel = max(0.2, nearestVoxel);
+            walk = min(walk, nearestVoxel);
+            iter += max(0.01, walk);
+            if (iter > 4.5) break;
+        }
+        sunShadow = _v18sky_saturate(sunShadow);
+
+        float n =0.0;
+        n += _v18sky_noise(pos*32.0);
+        n += _v18sky_noise(pos*64.0);
+        n += _v18sky_noise(pos*128.0);
+        n += _v18sky_noise(pos*256.0);
+        n += _v18sky_noise(pos*512.0);
+        n = mix(0.7, 0.95, n);
+
+        vec2 block = floor(pos.xz);
+        vec3 texColor = vec3(0.95, 1.0, 1.0);
+        texColor *= 0.8;
+        float windowRef = 0.0;
+        if ((normal.y < 0.1) && (distAndMat.y == 0.0))
+        {
+            vec3 posdx = dFdx(pos);
+            vec3 posdy = dFdy(pos);
+            vec3 posGrad = posdx * _v18sky_Hash21(uv) + posdy * _v18sky_Hash21(uv*7.6543);
+            vec3 colTotal = vec3(0.0);
+            vec3 colTemp = texColor;
+            vec3 nTemp = vec3(0.0);
+            _v18sky_CalcWindows(block, pos, colTemp, windowRef, nTemp);
+            colTotal = colTemp;
+            colTemp = texColor;
+            _v18sky_CalcWindows(block, pos + posdx * 0.666, colTemp, windowRef, nTemp);
+            colTotal += colTemp;
+            colTemp = texColor;
+            _v18sky_CalcWindows(block, pos + posdx * 0.666 + posdy * 0.666, colTemp, windowRef, nTemp);
+            colTotal += colTemp;
+            colTemp = texColor;
+            _v18sky_CalcWindows(block, pos + posdy * 0.666, colTemp, windowRef, nTemp);
+            colTotal += colTemp;
+            colTemp = texColor;
+            _v18sky_CalcWindows(block, pos + posdx * 0.333 + posdy * 0.333, colTemp, windowRef, nTemp);
+            colTotal += colTemp;
+            texColor = colTotal * 0.2;
+            windowRef *= 0.2;
+            normal = normalize(normal + nTemp * 0.2);
+        }
+        else
+        {
+            float xroad = abs(fract(pos.x+0.5)-0.5);
+            float zroad = abs(fract(pos.z+0.5)-0.5);
+            float road = _v18sky_saturate((min(xroad, zroad)-0.143)*480.0);
+            texColor *= 1.0-normal.y*0.95*_v18sky_Hash21(block*9.87)*road;
+            texColor *= mix(0.1, 1.0, road);
+            float yellowLine = _v18sky_saturate(1.0-(min(xroad, zroad)-0.002)*480.0);
+            yellowLine *= _v18sky_saturate((min(xroad, zroad)-0.0005)*480.0);
+            yellowLine *= _v18sky_saturate((xroad*xroad+zroad*zroad-0.05)*880.0);
+            texColor = mix(texColor, vec3(1.0, 0.8, 0.3), yellowLine);
+            float whiteLine = _v18sky_saturate(1.0-(min(xroad, zroad)-0.06)*480.0);
+            whiteLine *= _v18sky_saturate((min(xroad, zroad)-0.056)*480.0);
+            whiteLine *= _v18sky_saturate((xroad*xroad+zroad*zroad-0.05)*880.0);
+            whiteLine *= _v18sky_saturate(1.0-(fract(zroad*8.0)-0.5)*280.0);
+            whiteLine *= _v18sky_saturate(1.0-(fract(xroad*8.0)-0.5)*280.0);
+            texColor = mix(texColor, vec3(0.5), whiteLine);
+            whiteLine = _v18sky_saturate(1.0-(min(xroad, zroad)-0.11)*480.0);
+            whiteLine *= _v18sky_saturate((min(xroad, zroad)-0.106)*480.0);
+            whiteLine *= _v18sky_saturate((xroad*xroad+zroad*zroad-0.06)*880.0);
+            texColor = mix(texColor, vec3(0.5), whiteLine);
+            float crossWalk = _v18sky_saturate(1.0-(fract(xroad*40.0)-0.5)*280.0);
+            crossWalk *= _v18sky_saturate((zroad-0.15)*880.0);
+            crossWalk *= _v18sky_saturate((-zroad+0.21)*880.0)*(1.0-road);
+            crossWalk *= n*n;
+            texColor = mix(texColor, vec3(0.25), crossWalk);
+            crossWalk = _v18sky_saturate(1.0-(fract(zroad*40.0)-0.5)*280.0);
+            crossWalk *= _v18sky_saturate((xroad-0.15)*880.0);
+            crossWalk *= _v18sky_saturate((-xroad+0.21)*880.0)*(1.0-road);
+            crossWalk *= n*n;
+            texColor = mix(texColor, vec3(0.25), crossWalk);
+            {
+                float sidewalk = 1.0;
+                vec2 blockSize = vec2(100.0);
+                if (pos.y > 0.1) blockSize = vec2(10.0, 50);
+                sidewalk *= _v18sky_saturate(abs(sin(pos.z*blockSize.x)*800.0/blockSize.x));
+                sidewalk *= _v18sky_saturate(abs(sin(pos.x*blockSize.y)*800.0/blockSize.y));
+                sidewalk = _v18sky_saturate(mix(0.7, 1.0, sidewalk));
+                sidewalk = _v18sky_saturate((1.0-road) + sidewalk);
+                texColor *= sidewalk;
+            }
+        }
+        if (distAndMat.y == 3.0) { texColor = vec3(0.05); }
+        texColor *= vec3(1.0)*n*0.05;
+        texColor *= 0.7;
+        texColor = _v18sky_saturate(texColor);
+
+        float windowMask = 0.0;
+        if (distAndMat.y >= 100.0)
+        {
+            texColor = vec3(_v18sky_Hash11(distAndMat.y)*1.0, _v18sky_Hash11(distAndMat.y*8.765), _v18sky_Hash11(distAndMat.y*17.731))*0.1;
+            texColor = pow(abs(texColor), vec3(0.2));
+            texColor = max(vec3(0.25), texColor);
+            texColor.z = min(texColor.y, texColor.z);
+            texColor *= _v18sky_Hash11(distAndMat.y*0.789) * 0.15;
+            windowMask = _v18sky_saturate( max(0.0, abs(pos.y - 0.0175)*3800.0)-10.0);
+            vec2 dirNorm = abs(normalize(normal.xz));
+            float pillars = _v18sky_saturate(1.0-max(dirNorm.x, dirNorm.y));
+            pillars = pow(max(0.0, pillars-0.15), 0.125);
+            windowMask = max(windowMask, pillars);
+            texColor *= windowMask;
+        }
+
+        vec3 lightColor = vec3(100.0)*_v18sky_sunCol * _v18sky_saturate(dot(_v18sky_sunDir, normal)) * sunShadow;
+        float ambientAvg = (ambient*3.0 + ambientS) * 0.25;
+        lightColor += (_v18sky_skyCol * _v18sky_saturate(normal.y *0.5+0.5))*pow(ambientAvg, 0.35)*2.5;
+        lightColor *= 4.0;
+
+        finalColor = texColor * lightColor;
+        if (distAndMat.y >= 100.0)
+        {
+            float yfade = max(0.01, min(1.0, ref.y*100.0));
+            yfade *= (_v18sky_saturate(1.0-abs(dFdx(windowMask)*dFdy(windowMask))*250.995));
+            finalColor += _v18sky_GetEnvMapSkyline(ref, _v18sky_sunDir, pos.y-1.5)*0.3*yfade*max(0.4,sunShadow);
+        }
+        if (windowRef != 0.0)
+        {
+            finalColor *= mix(1.0, 0.6, windowRef);
+            float yfade = max(0.01, min(1.0, ref.y*100.0));
+            finalColor += _v18sky_GetEnvMapSkyline(ref, _v18sky_sunDir, pos.y-0.5)*0.6*yfade*max(0.6,sunShadow)*windowRef;
+        }
+        finalColor *= 0.9;
+        vec3 rv2 = rayVec;
+        rv2.y *= _v18sky_saturate(sign(rv2.y));
+        vec3 fogColor = _v18sky_GetEnvMap(rv2, _v18sky_sunDir);
+        fogColor = min(vec3(9.0), fogColor);
+        finalColor = mix(fogColor, finalColor, exp(-t*0.02));
+	}
+    else
+    {
+        finalColor = _v18sky_GetEnvMap(rayVec, _v18sky_sunDir);
+    }
+
+    finalColor *= vec3(1.0) * _v18sky_saturate(1.0 - length(uv/2.5));
+    finalColor *= 1.3*_v18sky_exposure;
+	return vec3(clamp(finalColor, 0.0, 1.0)*_v18sky_saturate(_v18sky_fade+0.2));
 }
 
 vec3 _VizScene(vec2 C) {
-    float T = iTime;
-    vec3 r = iResolution;
-    vec2 u = (C + C - r.xy) / r.y;
-    u.y -= 2.0;
-    u.x += cos(T / 4.0);
-    vec3 p = vec3(0.0), D = normalize(vec3(u, 2.0));
-
-    float s = 0.006, d = 0.0;
-    for (float ii = 0.0; ii < 80.0 && s > 0.005 && d < 4e1; ii++) {
-        p  = D*d;
-        p.y += 14.0;
-        p.z += T;
-        s = _v18_map(p);
-        d += s;
-    }
-
-    // tetrahedron normals
-    const float hn = 0.005;
-    const vec2  k  = vec2(1.0, -1.0);
-    vec3 n = normalize(k.xyy*_v18_map(p + k.xyy*hn) +
-                       k.yyx*_v18_map(p + k.yyx*hn) +
-                       k.yxy*_v18_map(p + k.yxy*hn) +
-                       k.xxx*_v18_map(p + k.xxx*hn));
-
-    // iChannel3 → iChannel2 (RGBA Noise Small)
-    vec3 q = _v18_texBump(iChannel2, p, n, 0.12);
-    vec4 o = vec4(0.0);
-    o.xyz = _v18_tex3D(iChannel2, p*0.25, n);
-    o *= o;
-
-    o /= max(abs(p.y/5e1 + p.x/3e1), 0.001);
-
-    vec3 ld   = normalize(vec3(0.3, 1.0, 0.2));
-    float spec = pow(max(dot(reflect(-ld, q), -D), 0.0), 2e1);
-    o *= max(dot(q, ld), 0.1);
-    o += spec*0.3;
-
-    float fog = min(1.0, d/18.0);
-    o = mix(o, vec4(0.15, 0.18, 0.25, 0.0), fog);
-    o = 2.0*sqrt(max(o, vec4(0.0)))*o;
-    return clamp(o.rgb, 0.0, 1.0);
+    _v18sky_localTime = iTime;
+    return _v18sky_RayTrace(C);
 }
 """
 
@@ -7288,12 +7811,890 @@ vec3 _VizScene(vec2 fragCoord) {
 }
 """
 
+    elif viz == 21:  # Poi Dancer (Orblivius — spinning poi + SDF dancer + smoke)
+        # Volumetric disco scene from the Surrealizer "06_Poi_Dancer" audio
+        # visualizer. Audio reactivity routes through Buffer A's smoothed
+        # loudness bands (iChannel1 row 2 px 2/3/4), exactly like viz 6.
+        # RGBA-noise input is inlined as procedural noise. Prefixed _v21poi_*.
+        viz_scene_block = r"""
+// === VIZ 21: Poi Dancer (Orblivius — "Real Poi", CC non-commercial) ==========
+// Volumetric disco: spinning poi + SDF dancer + smoke cones + lasers.
+// Source: Surrealizer wasm/web/visualizers/06_Poi_Dancer.json (audio Image pass).
+// Adapted for MOD2GLSL:
+//   * ALL globals/functions re-prefixed _v6_ -> _v21poi_ (the source shares
+//     lineage with viz 6); bare BPM/SPEED/sdBezier also _v21poi_-prefixed so
+//     nothing collides with the Image tab's own sdBezier()/mainImage().
+//   * iChannel0 (ShaderToy mic / FFT) reads -> Buffer-A smoothed loudness bands
+//     on iChannel1 row 2 px 2/3/4 (bass/mid/high) — identical source to viz 6.
+//   * iChannel1 (RGBA Noise Small) lookup -> inlined procedural value-noise
+//     (_v21poi_noiseTex), since MOD2GLSL's iChannel1 is Buffer A, not a noise tex.
+//   * iBeatNum -> #define from iTime*BPM/60 (no beat uniform here).
+//   * the shader's own _vizMainImage()/mainImage() are dropped; the Image tab's
+//     wrapper calls _VizScene(vec2) -> vec3 directly (signature already matches).
+// Real Poi (c) 2026 Orblivius
+// LICENSE: Free for non-commercial
+
+#define _v21poi_PI  3.14159265359
+#define _v21poi_TAU 6.28318530718
+
+//#define iBPM 120.0
+
+#define _v21poi_BPM 125.0
+#define _v21poi_SPEED 6
+
+// iBeatNum: MOD2GLSL has no beat uniform; derive beats elapsed from time & BPM.
+#define iBeatNum (iTime * float(_v21poi_BPM) / 60.0)
+
+// ── DISCO INFERNO CONSTANTS (from Lallis' working version) ───────────────────
+const float _v21poi_LIGHT_POW    = 2.;
+const float _v21poi_LIGHT_INTENS = 0.15;
+#define _v21poi_POI_FOG 0.16   // poi smoke brightness (its DENSITY follows the spotlights via _v21poi_LIGHT_INTENS in the depth-march)
+const float _v21poi_FLOOR_Y      = -0.13;
+const float _v21poi_BIG          = 1e30;
+const float _v21poi_EPSILON      = 1e-10;
+const int   _v21poi_SPOTS        = 2;
+const int   _v21poi_MAX_SPOTS    = 9;
+const float _v21poi_NOTHING      = -0.1;
+const float _v21poi_LIGHT_BASE_W = 0.19;
+const float _v21poi_CONE_W       = 0.2;
+const int   _v21poi_MAX_STEPS    = 72;   // perf: 100→72 (~28% fewer worst-case volumetric smoke-march iters; adaptive h*.5 step + scene-exit break keep far-smoke detail acceptable)
+const float _v21poi_MIN_STEP     = 0.0082;
+const float _v21poi_FAR          = 1.;
+
+// ── DANCER CONSTANTS (UFOff dancer, scaled to disco coordinate system) ──────
+// Dancer's local SDF lives in a 4-unit space; scaling to 0.06 maps it to
+// 0.24 world units. Y offset puts feet exactly on FLOOR_Y.
+#define _v21poi_DANCER_SCALE       0.06
+#define _v21poi_DANCER_BASE_Y      (_v21poi_FLOOR_Y + 1.5*_v21poi_DANCER_SCALE)
+// ── Dancer animation rate — TEMPO-DRIVEN ────────────────────────────────────
+// Constants below were tuned at _v21poi_BPM=125; we now scale them by the song's
+// actual _v21poi_BPM so the dance stays in sync regardless of tempo. At 125 _v21poi_BPM
+// the legs swing roughly once per beat and the body sways once per bar
+// (4 beats), and that musical feel persists at any _v21poi_BPM the song uses.
+#define _v21poi_BPM_SCALE          (float(_v21poi_BPM) / 125.0)
+// Slow drift rotation so the dancer faces slightly off-axis over time.
+// Drift rate is also _v21poi_BPM-scaled — 0.3 rad/sec at 125 _v21poi_BPM, scaling with tempo.
+#define _v21poi_DANCER_ROTATE      (_v21poi_PI + 0.4*sin(iTime * 0.3 * _v21poi_BPM_SCALE))
+#define _v21poi_DANCER_CLOCK       (iTime * 32. * _v21poi_BPM_SCALE)
+#define _v21poi_DANCER_HEAD_CLOCK  (iTime * 16. * _v21poi_BPM_SCALE)
+#define _v21poi_LEG_PHASE_OFFSET   _v21poi_PI
+#define _v21poi_TORSO_SWING        0.2
+
+#define _v21poi_SMILE_DOTS    25
+#define _v21poi_SMILE_BEND    (0.01 * 2.*abs(sin(iTime*.2)))
+#define _v21poi_EYE_SIZE      0.03
+#define _v21poi_BODY_LOWER    0.3
+#define _v21poi_BODY_UPPER    0.35
+#define _v21poi_HEAD_SIZE     0.40
+#define _v21poi_NECK_LENGTH   0.5
+#define _v21poi_NECK_SIZE     0.15
+#define _v21poi_ARM_UPPER     0.20
+#define _v21poi_ARM_LOWER     0.10
+#define _v21poi_ARM_HAND      0.13
+#define _v21poi_LEG_UPPER     0.13
+#define _v21poi_LEG_LOWER     0.18
+#define _v21poi_FOOT_SIZE     0.15
+#define _v21poi_WINK_INTERVAL (0.5 + _v21poi_hash(floor(iTime*0.5))*3.5)
+#define _v21poi_EYE_COLOR     vec3(2.05,2.05,0.05)
+#define _v21poi_SMILE_COLOR   vec3(2.05,2.05,0.05)
+
+#define _v21poi_POI_OFF       abs(sin(iTime*.02))
+#define _v21poi_POI_STRING    2.0
+#define _v21poi_POI_CX        0.74
+#define _v21poi_POI_CZ        0.28
+#define _v21poi_POI_STICK_LEN 0.13
+#define _v21poi_POI_STICK_RAD 0.028
+#define _v21poi_POI_STR_RAD   0.018
+// Poi spin rate — also _v21poi_BPM-tied. 7 rev/s at 125 _v21poi_BPM = ~3.4 spins per beat.
+// Same _v21poi_BPM_SCALE so faster songs spin poi proportionally faster.
+#define _v21poi_POI_RPM       (7. * _v21poi_BPM_SCALE)
+#define _v21poi_POI_CLOCK     (iTime*_v21poi_POI_RPM)
+#define _v21poi_POI_COL_R     vec3(0.2,0.8,4.0)
+#define _v21poi_POI_COL_L     vec3(4.0,0.19,2.75)
+
+// ── GLOBALS ──────────────────────────────────────────────────────────────────
+vec3 _v21poi_SPOT_POS[_v21poi_MAX_SPOTS];
+vec4 _v21poi_SPOT_COL[_v21poi_MAX_SPOTS];
+mat3 _v21poi_SPOT_ROT[_v21poi_MAX_SPOTS];
+
+float _v21poi_v3 = 0.;          // debug remnant (kept for fidelity to source)
+float _v21poi_gCloud = 0.0;     // shared smoke/cloud density: computed once, used by the poi haze AND the lasers so the poi lights the SAME smoke
+
+// Audio-driven globals — set at the top of _VizScene from BufferA bands
+float _v21poi_gAudioLevel = 1.0;   // 0..~2, drives dancer energy
+float _v21poi_audioBass   = 0.0;
+float _v21poi_audioMid    = 0.0;
+float _v21poi_audioHigh   = 0.0;
+vec2  _v21poi_gDancerXZ   = vec2(0., 0.30);
+
+struct _v21poi_Ray  { vec3 o; vec3 d; };
+struct _v21poi_Isct { float dist; vec3 normal; };
+struct _v21poi_Res  { _v21poi_Isct start; _v21poi_Isct end; };
+
+// ── ROTATIONS ────────────────────────────────────────────────────────────────
+mat3 _v21poi_rotx(float a){
+    mat3 r;
+    r[0]=vec3(1.,0.,0.);
+    r[1]=vec3(0.,cos(a),-sin(a));
+    r[2]=vec3(0.,sin(a), cos(a));
+    return r;
+}
+mat3 _v21poi_rotz(float a){
+    mat3 r;
+    r[0]=vec3( cos(a),-sin(a),0.);
+    r[1]=vec3( sin(a), cos(a),0.);
+    r[2]=vec3(0.,0.,1.);
+    return r;
+}
+
+// ── SHARED UTILITIES ─────────────────────────────────────────────────────────
+float _v21poi_hash(float n){ return fract(sin(n)*43758.5453); }
+vec3  _v21poi_dRX(vec3 p,float a){vec2 c=vec2(cos(a),sin(a));return vec3(p.x,c.x*p.y-c.y*p.z,c.y*p.y+c.x*p.z);}
+vec3  _v21poi_dRY(vec3 p,float a){vec2 c=vec2(cos(a),sin(a));return vec3(c.x*p.x+c.y*p.z,p.y,c.x*p.z-c.y*p.x);}
+vec3  _v21poi_dRZ(vec3 p,float a){vec2 c=vec2(cos(a),sin(a));return vec3(c.x*p.x+c.y*p.y,c.x*p.y-c.y*p.x,p.z);}
+float _v21poi_dSeg(vec3 p,vec3 a,vec3 b){vec3 pa=p-a,ba=b-a;float h=clamp(dot(pa,ba)/dot(ba,ba),0.,1.);return length(pa-ba*h);}
+float _v21poi_dUnion(float a,float b,inout float m,float nm){m=(b<a)?nm:m;return min(a,b);}
+
+// ── 3D value noise ──────────────────────────────────────────────────────────
+// Original sampled "RGBA Noise Small" on iChannel1. In MOD2GLSL iChannel1 is
+// Buffer A (audio), so we inline a procedural hash that reproduces the same
+// tiling-2D value-noise .r lookup the original relied on.
+float _v21poi_hash12(vec2 p){
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+float _v21poi_noiseTex(vec2 uv){
+    vec2 i = floor(uv), f = fract(uv);
+    f = f*f*(3.-2.*f);
+    float a = _v21poi_hash12(i + vec2(0.0,0.0));
+    float b = _v21poi_hash12(i + vec2(1.0,0.0));
+    float c = _v21poi_hash12(i + vec2(0.0,1.0));
+    float d = _v21poi_hash12(i + vec2(1.0,1.0));
+    return mix(mix(a,b,f.x), mix(c,d,f.x), f.y);
+}
+float _v21poi_noiseZ(in vec3 x){
+    vec3 p = floor(x), f = fract(x);
+    f = f*f*(3.-2.*f);
+    vec2 uv = (p.xy + vec2(37.,17.)*p.z) + f.xy;
+    vec2 rg = 1.5 * vec2(texture(iChannel2, (uv+0.5)/128., 0.).r);
+    return mix(rg.x, rg.y, f.z) - 0.5;
+}
+
+float _v21poi_sdCappedCylinder(vec3 p,vec2 h){
+    vec2 d=abs(vec2(length(p.xz),p.y))-h;
+    return min(max(d.x,d.y),0.)+length(max(d,0.));
+}
+
+// ── Smoke cone SDF — bit-flag IDs (1,2,4) ────────────────────────────────────
+vec2 _v21poi_maplight(vec3 orp){
+    float t_=iTime*.025, minm=1e4, mm=1e4, hit_ids=0.;
+    for(int i=0;i<_v21poi_SPOTS;++i){
+        vec3 rp=orp, _rp=rp;
+        rp+=_v21poi_SPOT_POS[i]; rp*=_v21poi_SPOT_ROT[i];
+        float m_=_v21poi_sdCappedCylinder(rp,vec2(_v21poi_CONE_W,1.))-(-_v21poi_LIGHT_BASE_W+length(rp)*.2);
+        float d_=dot(rp,vec3(0.,-1.,0.));
+        if(m_<0.&&d_>=0.){
+            vec3 uv=_rp+vec3(t_,0.,0.);
+            float n=_v21poi_noiseZ(uv*10.)-.5;
+            uv=_rp+vec3(t_*1.2,0.,0.); n+=_v21poi_noiseZ(uv*22.5)*.5;
+            uv=_rp+vec3(t_*2.,0.,0.);  n+=_v21poi_noiseZ(uv*52.5)*.5;
+            uv=_rp+vec3(t_*2.8,0.,0.); n+=_v21poi_noiseZ(uv*152.5)*.25;
+            mm=min(n,m_); mm=min(mm,-.2);
+            hit_ids+=exp2(float(i));
+        }
+        _v21poi_v3=m_; minm=min(abs(m_),minm);
+    }
+    if(hit_ids>0.) return vec2(mm,hit_ids);
+    return vec2(minm,_v21poi_NOTHING);
+}
+
+void _v21poi_colorize(in vec4 fgc,in vec3 pos,in vec4 spotcol,float musiccolor,inout vec4 color){
+    float flf=inversesqrt(length(pos));
+    flf=pow(flf,_v21poi_LIGHT_POW)*_v21poi_LIGHT_INTENS;
+    color+=fgc*flf*spotcol*musiccolor;
+}
+
+vec3 _v21poi_floorTexture(vec3 pos){
+    pos.z+=pos.x*.25;
+    float diff=fract(pos.x*.1)-fract(pos.z*.1);
+    float fw=fwidth(diff)*1.5;
+    return mix(vec3(.7),vec3(1.),smoothstep(-fw,fw,diff));
+}
+
+_v21poi_Res _v21poi_planeCut(vec3 pos,vec3 normal,_v21poi_Ray ray){
+    ray.o-=pos;
+    float rdn=dot(ray.d,normal),ron=dot(ray.o,normal);
+    _v21poi_Res result; result.start.normal=normal; result.end.normal=normal;
+    if(ron>0.){
+        result.start.dist=_v21poi_BIG; result.end.dist=-_v21poi_BIG;
+        if(abs(rdn)>_v21poi_EPSILON){
+            float d=-ron/rdn;
+            if(d>0.){result.start.dist=d;result.end.dist=_v21poi_BIG;}
+            else{result.start.dist=-_v21poi_BIG;result.end.dist=d;}
+        }
+    }else{
+        result.start.dist=-_v21poi_BIG; result.end.dist=_v21poi_BIG;
+        if(abs(rdn)>_v21poi_EPSILON){
+            float d=-ron/rdn;
+            if(d>0.){result.start.dist=-_v21poi_BIG;result.end.dist=d;}
+            else{result.start.dist=d;result.end.dist=_v21poi_BIG;}
+        }
+    }
+    return result;
+}
+
+// ── Smoke marcher + analytic floor renderer (working analytic-floor pattern) ─
+// musiccolor parameter passed in from _VizScene (was a texture(iChannel0)
+// lookup in standalone — replaced with mid-band audio so the cone smoke
+// pulses with music instead of black/static).
+bool _v21poi_trace(in vec3 ro, in vec3 rd, float musiccolor, inout vec4 color){
+    float tFloor=_v21poi_BIG;
+    if(rd.y<0.) tFloor=(_v21poi_FLOOR_Y-ro.y)/rd.y;
+    vec3 rp=ro; float h=0.;
+    float sg =(sin(iTime)        +1.)*.25;
+    float sg2=(sin(iTime*.5)     +1.)*.25;
+    float sg3=(sin(iTime*.25)    +1.)*.25;
+    vec4 spcol1=_v21poi_SPOT_COL[0]+vec4(0,0,sg,0);
+    vec4 spcol2=_v21poi_SPOT_COL[1]+vec4(0,sg2,0,0);
+    vec4 spcol3=_v21poi_SPOT_COL[2]+vec4(0,0,sg3,0);
+    for(int i=0;i<(iResolution.x<0.?99999:_v21poi_MAX_STEPS);++i) if(i<_v21poi_MAX_STEPS){
+        rp+=rd*max(_v21poi_MIN_STEP,h*.5);
+        vec2 hp=_v21poi_maplight(rp); h=hp.x;
+        if(rp.z>_v21poi_FAR||rp.y<_v21poi_FLOOR_Y) break;
+        if(h<0.){
+            vec4 fgc=vec4(abs(h*.05));
+            int id=int(hp.y+.5);
+            if((id&1)!=0) _v21poi_colorize(fgc,-_v21poi_SPOT_POS[0]-rp,spcol1,musiccolor,color);
+            if((id&2)!=0) _v21poi_colorize(fgc,-_v21poi_SPOT_POS[1]-rp,spcol2,musiccolor,color);
+            if((id&4)!=0) _v21poi_colorize(fgc,-_v21poi_SPOT_POS[2]-rp,spcol3,musiccolor,color);
+        }
+    }
+    if(tFloor<_v21poi_BIG){
+        vec3 floorMarchPos=ro+rd*tFloor;
+        _v21poi_Ray fr; fr.o=ro; fr.d=rd;
+        _v21poi_Res r=_v21poi_planeCut(vec3(0.,-18.,0.),vec3(0.,1.,0.),fr);
+        vec3 pos=ro+rd*r.start.dist;
+        vec4 collo=vec4(-normalize(pos).y*_v21poi_floorTexture(pos),1.);
+        vec4 spotMix=vec4(0.); float wTotal=0.;
+        for(int j=0;j<_v21poi_SPOTS;j++){
+            vec3 cp=floorMarchPos+_v21poi_SPOT_POS[j]; cp*=_v21poi_SPOT_ROT[j];
+            float cm=_v21poi_sdCappedCylinder(cp,vec2(_v21poi_CONE_W,1.))-(-_v21poi_LIGHT_BASE_W+length(cp)*.2);
+            float w=1.-smoothstep(-.04,.02,cm);
+            spotMix+=_v21poi_SPOT_COL[j]*w; wTotal+=w;
+        }
+        if(wTotal>0.){
+            float fts=iTime*.025;   // SAME smoke noise as the airborne cone, so the beam's FLOOR pool is cloudy too (fog doesn't cleanly stop at the floor)
+            float fn=_v21poi_noiseZ((floorMarchPos+vec3(fts,0,0))*10.)-.5; fn+=_v21poi_noiseZ((floorMarchPos+vec3(fts*1.2,0,0))*22.5)*.5; fn+=_v21poi_noiseZ((floorMarchPos+vec3(fts*2.,0,0))*52.5)*.5;
+            float fcloud=clamp(0.55+0.7*fn, 0.2, 1.6);
+            color.rgb=collo.rgb*spotMix.rgb*0.6*fcloud+color.rgb;
+        }
+        else           color.rgb+=collo.rgb*.05;
+        return true;
+    }
+    return false;
+}
+
+// ── IES beam profile (from doc7 / UFOff Dancer) ──────────────────────────────
+// Physically shaped cone beam: bright spike at axis, gentle shoulder halo,
+// then a specular ring at the edge. theta = angle from beam axis in radians.
+float _v21poi_iesProfile(float theta){
+    float b = exp(-theta*theta*40.);
+    float h = exp(-theta*theta*8.) * 0.18;
+    float s = exp(-theta*theta*0.65) * 0.008;
+    float r = exp(-theta*theta*20.) * abs(sin(theta*16.+0.3)) * 0.08;
+    return (b + h + s + r) * cos(theta);
+}
+
+// ── LASER SYSTEM ─────────────────────────────────────────────────────────────
+float _v21poi_rand2(vec2 p){
+    p*=2000.;
+    vec3 p3=fract(vec3(p.xyx)*.1031);
+    p3+=dot(p3,p3.yzx+33.33);
+    return fract((p3.x+p3.y)*p3.z);
+}
+float _v21poi_noise2(vec2 p){
+    vec2 f=smoothstep(0.,1.,fract(p));
+    vec2 i=floor(p);
+    float a=_v21poi_rand2(i),b=_v21poi_rand2(i+vec2(1,0)),c_=_v21poi_rand2(i+vec2(0,1)),d_=_v21poi_rand2(i+vec2(1,1));
+    return mix(mix(a,b,f.x),mix(c_,d_,f.x),f.y);
+}
+float _v21poi_fbm(vec2 p){
+    float a=.5,r_=0.;
+    for(int i=0;i<(iResolution.x<0.?99999:8);i++) if(i<8){r_+=a*_v21poi_noise2(p);a*=.5;p*=2.8;}
+    return r_;
+}
+float _v21poi_laser(vec2 p,int num){
+    float r_=atan(p.x,p.y);
+    float sn=sin(r_*float(num)+iTime*5.);
+    float lzr=pow(.5+.5*sn,500.);
+    float glow=pow(clamp(sn,0.,1.),20.);
+    return lzr+glow;
+}
+#define _v21poi_BEAT_HUE (floor(iBeatNum/16.0)*2.39996)   // lights SNAP to a new hue every 16-beat phrase (golden-angle step) instead of drifting with iTime
+vec3 _v21poi_hueRot(vec3 c, float a){ const vec3 k=vec3(0.57735); float ca=cos(a),sa=sin(a); return c*ca+cross(k,c)*sa+k*dot(k,c)*(1.-ca); }
+#define _v21poi_SPOT_SAT 1.35   // spotlight colour saturation (1.0 = original, higher = more vivid)
+vec3 _v21poi_sat(vec3 c, float s){ float l=dot(c, vec3(0.2126,0.7152,0.0722)); return max(mix(vec3(l), c, s), 0.0); }
+float _v21poi_clouds(vec2 uv){
+    vec2 tv=vec2(0,iTime);
+    float c1=_v21poi_fbm(_v21poi_fbm(uv*3.)*.75+uv*3.+tv/3.);
+    float c2=_v21poi_fbm(_v21poi_fbm(uv*2.)*.5 +uv*7.+tv/3.);
+    float c3=_v21poi_fbm(_v21poi_fbm(uv*10.-tv)*.75+uv*5.+tv/6.);
+    float r_=mix(c1,c2,c3*c3); return r_*r_;
+}
+vec4 _v21poi_laserLayer(vec2 uv){
+    float yScale = 0.2 + 10.*_v21poi_noise2(vec2(iTime/5.));
+    vec2  luv    = vec2(uv.x-0.5, (uv.y-0.42)*yScale+0.01);
+    float l      = (2.+_v21poi_noise2(vec2(10.-iTime)))*_v21poi_laser(luv,35);
+    float c_     = _v21poi_gCloud;
+    float vmask  = smoothstep(0.30, 0.60, uv.y);
+    vec3  _ray   = 0.5 + 0.5*cos(atan(luv.y, luv.x)*2.0 + _v21poi_BEAT_HUE + vec3(0.0, 2.094, 4.188));   // SOLID color per radial ray (constant along the ray) — a laser ray can't have a gradient inside it
+    vec4  col_   = vec4(_ray, 1.0)*(l*vmask*1.4 + vmask*0.65)*c_*0.85;
+    return col_*col_;
+}
+
+// ── DANCER SDF ───────────────────────────────────────────────────────────────
+float _v21poi_dBein(vec3 p,float pose,float swing,inout float m){
+    float d; m=1.;
+    d=_v21poi_dSeg(p,vec3(-0.5,pose,0.),vec3(-(0.625-pose*0.5),0.,0.25))-_v21poi_FOOT_SIZE;
+    d=_v21poi_dUnion(d,_v21poi_dSeg(p,vec3(-0.5,pose,0.),vec3(-0.4,1.+pose,swing))-_v21poi_LEG_UPPER,m,2.);
+    d=_v21poi_dUnion(d,_v21poi_dSeg(p,vec3(-0.4,1.+pose,swing),vec3(-0.3,2.+pose,0.))-_v21poi_LEG_LOWER,m,3.);
+    return d;
+}
+float _v21poi_dOberkoerper(vec3 p,float b,inout float m){
+    float d; m=3.;
+    d=_v21poi_dSeg(p,vec3(0.,2.+b,0.),vec3(0.,2.25+b,-b*0.1))-_v21poi_BODY_LOWER;
+    d=_v21poi_dUnion(d,_v21poi_dSeg(p,vec3(0.,2.25+b,-b*0.1),vec3(0.,3.25+b,0.))-_v21poi_BODY_UPPER,m,4.);
+    return d;
+}
+vec3 _v21poi_poiWrist(float t, float b, float side){
+    float roll = sin(2.0*t) * 0.09;
+    float lean = sin(t)     * 0.06;
+    return vec3(side * (0.27 - lean), 3.00 + b + roll, 0.50);
+}
+void _v21poi_poiHeadDir(float t, out vec3 dir, out vec3 tang){
+    float snt = sin(t), ct = cos(t);
+    float st  = sqrt(snt*snt + 0.08);
+    vec3  raw = vec3(-2.0*_v21poi_POI_CX*snt*st,
+                      2.0*_v21poi_POI_CX*st*ct,
+                      snt*_v21poi_POI_CZ + 0.06);
+    dir = normalize(raw);
+    float ist  = 1.0 / st;
+    float dxdt = -2.0*_v21poi_POI_CX * ct  * (2.0*snt*snt + 0.08) * ist;
+    float dydt =  2.0*_v21poi_POI_CX * snt * (ct*ct - snt*snt - 0.08) * ist;
+    float dzdt =  ct * _v21poi_POI_CZ;
+    tang = normalize(vec3(dxdt, dydt, dzdt) + vec3(0,0,1e-5));
+}
+float _v21poi_dPoiAll(vec3 p, float b, inout float m){
+    float tR = _v21poi_POI_CLOCK;
+    float tL = _v21poi_POI_CLOCK + _v21poi_PI*abs(sin(iTime*.5))*_v21poi_POI_OFF + _v21poi_PI*abs(cos(iTime*.5))*(1.-_v21poi_POI_OFF);
+    vec3 wR = _v21poi_poiWrist(tR, b, +1.0);
+    vec3 wL = _v21poi_poiWrist(tL, b, -1.0);
+    vec3 sR = vec3(+0.375, 3.25+b, 0.0);
+    vec3 sL = vec3(-0.375, 3.25+b, 0.0);
+    vec3 eR = (sR+wR)*0.5 + vec3(+0.05, -0.09, 0.13);
+    vec3 eL = (sL+wL)*0.5 + vec3(-0.05, -0.09, 0.13);
+    vec3 tipR = wR + normalize(wR - eR) * 0.14;
+    vec3 tipL = wL + normalize(wL - eL) * 0.14;
+    float d = _v21poi_dSeg(p, sR, eR)   - _v21poi_ARM_UPPER;  m = 4.;
+    d = _v21poi_dUnion(d, _v21poi_dSeg(p, eR, wR)   - _v21poi_ARM_LOWER, m, 2.);
+    d = _v21poi_dUnion(d, _v21poi_dSeg(p, wR, tipR) - _v21poi_ARM_HAND,  m, 2.);
+    d = _v21poi_dUnion(d, _v21poi_dSeg(p, sL, eL)   - _v21poi_ARM_UPPER, m, 4.);
+    d = _v21poi_dUnion(d, _v21poi_dSeg(p, eL, wL)   - _v21poi_ARM_LOWER, m, 2.);
+    d = _v21poi_dUnion(d, _v21poi_dSeg(p, wL, tipL) - _v21poi_ARM_HAND,  m, 2.);
+    vec3 dirR, tanR, dirL, tanL;
+    _v21poi_poiHeadDir(tR, dirR, tanR);
+    _v21poi_poiHeadDir(tL, dirL, tanL);
+    vec3 hdR = wR + dirR * _v21poi_POI_STRING;
+    vec3 hdL = wL + dirL * _v21poi_POI_STRING;
+    d = _v21poi_dUnion(d, _v21poi_dSeg(p, wR, hdR) - _v21poi_POI_STR_RAD, m, 11.);
+    d = _v21poi_dUnion(d, _v21poi_dSeg(p, wL, hdL) - _v21poi_POI_STR_RAD, m, 11.);
+    d = _v21poi_dUnion(d, _v21poi_dSeg(p, hdR-tanR*(_v21poi_POI_STICK_LEN*.5), hdR+tanR*(_v21poi_POI_STICK_LEN*.5)) - _v21poi_POI_STICK_RAD, m,  9.);
+    d = _v21poi_dUnion(d, _v21poi_dSeg(p, hdL-tanL*(_v21poi_POI_STICK_LEN*.5), hdL+tanL*(_v21poi_POI_STICK_LEN*.5)) - _v21poi_POI_STICK_RAD, m, 10.);
+    return d;
+}
+float _v21poi_dKopf(vec3 p,float b,inout float m){
+    float d;
+    float tcz=_v21poi_DANCER_HEAD_CLOCK;
+    float al = _v21poi_gAudioLevel;
+    vec3 bv=vec3(0.,3.25+b+_v21poi_NECK_LENGTH,0.); m=1.;
+    d=_v21poi_dSeg(p,vec3(0.,3.25+b,0.),bv)-_v21poi_NECK_SIZE;
+    p-=bv;
+    p=_v21poi_dRY(p,(b*0.25)+(sin(tcz/32.*_v21poi_PI)*_v21poi_PI*0.1*al));
+    p=_v21poi_dRZ(p,(b*0.125)+(sin(tcz/64.*_v21poi_PI)*_v21poi_PI*0.1*al));
+    p=_v21poi_dRX(p,(b*0.75)+(sin(tcz/8.*_v21poi_PI)*_v21poi_PI*0.1*al));
+    p+=bv;
+    float hf=_v21poi_HEAD_SIZE;
+    vec3 hc=vec3(0.,3.25+b+_v21poi_NECK_LENGTH+hf*0.5,0.);
+    d=_v21poi_dUnion(d,length(p-hc)-hf,m,2.);
+    float winkT=mod(iTime,_v21poi_WINK_INTERVAL);
+    float blink=smoothstep(0.0,0.12,winkT)*(1.0-smoothstep(0.12,0.35,winkT));
+    float eyeR=mix(_v21poi_EYE_SIZE,0.005,blink);
+    d=_v21poi_dUnion(d,length(p-vec3(hc.x-0.38*hf,hc.y+0.26*hf,hc.z+0.88*hf))-eyeR,m,6.);
+    d=_v21poi_dUnion(d,length(p-vec3(hc.x+0.38*hf,hc.y+0.26*hf,hc.z+0.88*hf))-eyeR,m,6.);
+    for(int i=0;i<(iResolution.x<0.?99999:_v21poi_SMILE_DOTS);i++) if(i<_v21poi_SMILE_DOTS){
+        float t=float(i)/float(_v21poi_SMILE_DOTS-1)-0.5;
+        d=_v21poi_dUnion(d,length(p-vec3(hc.x+t*0.44*hf, hc.y-0.20*hf+t*t*_v21poi_SMILE_BEND, hc.z+hf*0.95))-max(0.03*hf,0.018),m,7.);
+    }
+    float hatBrimY = hc.y + hf * 0.6;
+    float brimR    = hf * 1.18;
+    float brimH    = hf * 0.05;
+    float crownR   = hf * 0.70;
+    float crownH   = hf * 0.35;
+    vec3 pb = p - vec3(hc.x, hatBrimY, hc.z);
+    vec2 dbr = abs(vec2(length(pb.xz), pb.y)) - vec2(brimR, brimH);
+    float dHat = min(max(dbr.x, dbr.y), 0.0) + length(max(dbr, 0.0));
+    vec3 pc = p - vec3(hc.x, hatBrimY + brimH + crownH, hc.z);
+    vec2 dcr = abs(vec2(length(pc.xz), pc.y)) - vec2(crownR, crownH);
+    float dCrown = min(max(dcr.x, dcr.y), 0.0) + length(max(dcr, 0.0));
+    dHat = min(dHat, dCrown);
+    vec3 pDent = p - vec3(hc.x, hatBrimY + brimH + crownH * 1.82, hc.z);
+    float dDent = length(pDent) - crownR * 0.60;
+    dHat = max(dHat, -dDent);
+    d = _v21poi_dUnion(d, dHat, m, 8.);
+    return d;
+}
+
+vec2 _v21poi_dancerSDF(vec3 p){
+    float tcz = _v21poi_DANCER_CLOCK;
+    float al  = _v21poi_gAudioLevel;
+    // Beat bounce: _v21poi_BPM-driven sine pulse, bass-kick boosted. The pulse
+    // shape pow(|sin|,3) gives a sharp attack and exponential decay
+    // — that's what makes the dancer "land" on each beat instead of
+    // smoothly oscillating. Bass boost (1 + bass*1.5) means real kicks
+    // PUNCH the bounce above the metronome floor.
+    float beatSharp = pow(abs(sin(iTime*(float(_v21poi_BPM)/60.)*_v21poi_PI)), 3.0)
+                    * (1.0 + _v21poi_audioBass * 1.5);
+    beatSharp = clamp(beatSharp, 0.0, 1.5);
+
+    float pose   = ((sin((tcz/32.)*_v21poi_PI)*0.5)+0.5)*0.25 * al;
+    float swingR = sin((tcz/8.)*_v21poi_PI)*0.25 * al;
+    float swingL = sin((tcz/8.)*_v21poi_PI+_v21poi_LEG_PHASE_OFFSET)*0.25 * al;
+
+    float m=1., m2=0.;
+    p+=vec3(0., 1.5 + beatSharp*0.18*al, 0.);
+    float dR=_v21poi_dBein(vec3(-abs(p.x),p.yz),pose,swingR,m);
+    float dL=_v21poi_dBein(vec3(-abs(p.x),p.yz),pose,swingL,m2);
+    float d = (p.x>0.0)?dR:dL;
+    float d2;
+    m = m2;
+    d2=_v21poi_dOberkoerper(p,swingR*_v21poi_TORSO_SWING,m2); d=_v21poi_dUnion(d,d2,m,m2);
+    d2=_v21poi_dKopf(p,pose,m2);   d=_v21poi_dUnion(d,d2,m,m2);
+    d2=_v21poi_dPoiAll(p,pose,m2); d=_v21poi_dUnion(d,d2,m,m2);
+    return vec2(d,m);
+}
+
+vec3 _v21poi_toLocal(vec3 wp){
+    vec3 p=wp-vec3(_v21poi_gDancerXZ.x,_v21poi_DANCER_BASE_Y,_v21poi_gDancerXZ.y);
+    float c=cos(-_v21poi_DANCER_ROTATE),s=sin(-_v21poi_DANCER_ROTATE);
+    p=vec3(c*p.x+s*p.z,p.y,-s*p.x+c*p.z);
+    return p/_v21poi_DANCER_SCALE;
+}
+vec3 _v21poi_toWorld(vec3 lp){
+    lp*=_v21poi_DANCER_SCALE;
+    float c=cos(_v21poi_DANCER_ROTATE),s=sin(_v21poi_DANCER_ROTATE);
+    lp=vec3(c*lp.x+s*lp.z,lp.y,-s*lp.x+c*lp.z);
+    return lp+vec3(_v21poi_gDancerXZ.x,_v21poi_DANCER_BASE_Y,_v21poi_gDancerXZ.y);
+}
+vec3 _v21poi_dancerNormal(vec3 wp){
+    float e=1e-4/_v21poi_DANCER_SCALE; vec3 lp=_v21poi_toLocal(wp);
+    float d=_v21poi_dancerSDF(lp).x;
+    return normalize(vec3(_v21poi_dancerSDF(lp+vec3(e,0,0)).x-d,
+                          _v21poi_dancerSDF(lp+vec3(0,e,0)).x-d,
+                          _v21poi_dancerSDF(lp+vec3(0,0,e)).x-d));
+}
+float _v21poi_marchDancer(vec3 ro,vec3 rd,out float matId){
+    float tLimit=length(ro-vec3(_v21poi_gDancerXZ.x,_v21poi_DANCER_BASE_Y,_v21poi_gDancerXZ.y))+4.0;
+    float t=0.01;
+    const float HIT = 4e-4;
+    // Perf: the dancer is a small object; most screen rays never come near
+    // it.  Cull rays whose infinite line misses a generous (R=2.0) bounding
+    // sphere around the dancer BEFORE the 55-step SDF march (exact — the
+    // dancer + poi reach is well inside R; h<0 means the line never enters
+    // the sphere so it cannot hit the dancer; forward-only rays unaffected).
+    {
+        vec3 _v21poi_oc = ro - vec3(_v21poi_gDancerXZ.x,_v21poi_DANCER_BASE_Y,_v21poi_gDancerXZ.y);
+        float _v21poi_bq = dot(_v21poi_oc, rd);
+        if (_v21poi_bq*_v21poi_bq - (dot(_v21poi_oc,_v21poi_oc) - 4.0) < 0.0) {
+            matId = -1.; return -1.;
+        }
+    }
+    for(int i=0;i<(iResolution.x<0.?99999:55);i++) if(i<55){
+        vec2 res=_v21poi_dancerSDF(_v21poi_toLocal(ro+rd*t));
+        float d=res.x*_v21poi_DANCER_SCALE;
+        if(d<HIT){matId=res.y;return t;}
+        if(t>tLimit) break;
+        t+=max(d*0.75,HIT);
+    }
+    matId=-1.; return -1.;
+}
+vec3 _v21poi_dancerMatColor(float m){
+    if(m<1.5) return vec3(0.25);
+    if(m<2.5) return vec3(0.125);
+    if(m<3.5) return vec3(0.75,0.6,0.06);
+    if(m<4.5) return vec3(0.12,0.12,0.75);
+    if(m<5.5) return vec3(1.,1.,1.);
+    if(m<6.5) return _v21poi_EYE_COLOR;
+    if(m<7.5) return _v21poi_SMILE_COLOR;
+    if(m<8.5) return vec3(1.,0.25,0.12);
+    if(m<9.5) return _v21poi_POI_COL_R * 0.25;
+    if(m<10.5) return _v21poi_POI_COL_L * 0.25;
+    return vec3(0.14, 0.14, 0.18);
+}
+
+// ── Main scene assembly ──────────────────────────────────────────────────────
+vec3 _VizScene(vec2 fragCoord){
+    vec2  uv     = fragCoord.xy / iResolution.xy;
+    _v21poi_gCloud   = _v21poi_clouds(uv);   // sample the smoke once for this pixel (haze + lasers share it)
+    float aspect = iResolution.x / iResolution.y;
+
+    // ── Audio hooks: read once per frame, populate globals ───────────────────
+    // BufferA row 2 px 2-4 are the IIR-smoothed loudness bands (200ms attack /
+    // 700ms release). Reading them here means the dancer's energy follows the
+    // audio envelope smoothly without flickering at frame rate.
+    // px 2 = bass (~0..200Hz), px 3 = mid (~200..2kHz), px 4 = high (~2..8kHz).
+    if (iChannelResolution[1].x > 1.0) {
+        // iChannel0 (ShaderToy mic) has no MOD2GLSL equivalent. Route to the same
+        // Buffer-A smoothed loudness bands viz 6 reads: iChannel1 row 2 px 2/3/4
+        // (px2=bass ~0..200Hz, px3=mid ~200..2kHz, px4=high ~2..8kHz; IIR-smoothed).
+        _v21poi_audioBass = texelFetch(iChannel1, ivec2(2, 2), 0).r;
+        _v21poi_audioMid  = texelFetch(iChannel1, ivec2(3, 2), 0).r;
+        _v21poi_audioHigh = texelFetch(iChannel1, ivec2(4, 2), 0).r;
+    }
+    // Weighted sum → dancer energy. Bass dominant (the kick drives body),
+    // mids contribute, highs less so. 0.6 baseline keeps him moving even in
+    // silence; cap at ~2.0 so loud passages don't break the IK.
+    float loudness = _v21poi_audioBass*1.0 + _v21poi_audioMid*0.6 + _v21poi_audioHigh*0.3;
+    _v21poi_gAudioLevel = clamp(0.6 + loudness * 1.4, 0.5, 2.0);
+
+    // musiccolor for cone smoke: pulses with the mid band so the volumetric
+    // cone glow brightens on melody/snare/synth content. Floor 0.15 keeps
+    // smoke visible during silence; mid-band scaling is generous (×1.4)
+    // because pre-smoothed bands rarely exceed 1.0.
+    float musiccolor = _v21poi_audioMid * 1.4 + 0.4;
+
+    // ── Spotlight setup (from Lallis' working version) ───────────────────────
+    vec3 spotpos     = vec3(0.35, -0.25, 0.15);
+    _v21poi_SPOT_POS[0]  = spotpos;
+    _v21poi_SPOT_POS[1]  = vec3(spotpos.x*-1., spotpos.y, spotpos.z);
+    _v21poi_SPOT_POS[2]  = vec3(spotpos.x*-1.5+.5, spotpos.y, spotpos.z);
+    _v21poi_SPOT_COL[0]  = vec4(_v21poi_hueRot(_v21poi_sat(vec3(0.076, 0.443, 0.392), _v21poi_SPOT_SAT), _v21poi_BEAT_HUE), 0.);  // teal base, hue snaps each 16-beat phrase
+    _v21poi_SPOT_COL[1]  = vec4(_v21poi_hueRot(_v21poi_sat(vec3(0.753, 0.584, 0.220), _v21poi_SPOT_SAT), _v21poi_BEAT_HUE), 0.);  // amber base, hue snaps each 16-beat phrase
+    _v21poi_SPOT_COL[2]  = vec4(0.569, 0.235, 0.294, 0.);  // magenta
+
+    float xrot = -.5 + cos(iTime - .75) * .25;
+    float yrot =  .5 + sin(iTime)        * .35;
+    _v21poi_SPOT_ROT[0] = _v21poi_rotx(xrot)*_v21poi_rotz(-yrot);
+    _v21poi_SPOT_ROT[1] = _v21poi_rotx(xrot)*_v21poi_rotz( yrot);
+    _v21poi_SPOT_ROT[2] = _v21poi_rotx(xrot)*_v21poi_rotz(-yrot*2.+_v21poi_PI/4.);
+
+    // ── Cone-trace ray ───────────────────────────────────────────────────────
+    vec3 rd = vec3(uv - vec2(.5), 1.);
+    rd.y /= aspect;
+    rd = normalize(rd);
+    vec3 ro = vec3(0., 0., -1.);
+
+    vec4 col = vec4(0.0);
+    _v21poi_trace(ro, rd, musiccolor, col);
+
+    // Dancer placement.  z=0.0 puts him right between camera (z=-1) and the
+    // spot world-origins (z=-0.15), with the cones converging on him from
+    // above — matches Lallis' updated dancer GLSL exactly.
+    // X-drift rate is _v21poi_BPM-scaled so the side-to-side groove tracks the song.
+    // bassSway adds a tiny extra step on bass kicks so he visibly "feels" them.
+    float bassSway = _v21poi_audioBass * 0.04;
+    _v21poi_gDancerXZ = vec2(sin(iTime * 0.18 * _v21poi_BPM_SCALE) * 0.10 + bassSway, 0.0);
+
+    float dMat;
+    float tDancer = _v21poi_marchDancer(ro, rd, dMat);
+    float dancerMask = 0.0;
+    if (tDancer > 0.0) {
+        float tFloor = (rd.y < -1e-4) ? (_v21poi_FLOOR_Y - ro.y) / rd.y : 1e9;
+        if (tDancer < tFloor) {
+            vec3 hp = ro + rd * tDancer;
+            // dancerNormal returns gradient in dancer-LOCAL space.
+            // toLocal rotates world by -DANCER_ROTATE around Y, so the
+            // inverse is +DANCER_ROTATE — apply that to get world-space normal.
+            vec3 dnL = _v21poi_dancerNormal(hp);
+            float cDR = cos(_v21poi_DANCER_ROTATE), sDR = sin(_v21poi_DANCER_ROTATE);
+            vec3 dn = vec3(cDR*dnL.x - sDR*dnL.z,
+                           dnL.y,
+                           sDR*dnL.x + cDR*dnL.z);
+            vec3 dc;
+            if (dMat > 8.5 && dMat < 9.5) {
+                // Right poi head — emissive, brightens on bass
+                dc = _v21poi_POI_COL_R * (1.8 + _v21poi_audioBass * 0.8);
+            } else if (dMat > 9.5 && dMat < 10.5) {
+                // Left poi head — emissive, brightens on highs
+                dc = _v21poi_POI_COL_L * (1.8 + _v21poi_audioHigh * 0.8);
+            } else {
+                vec3 matCol = _v21poi_dancerMatColor(dMat);
+
+                // ── COLORED FILL ────────────────────────────────────────────────
+                // Sum each spot's color, weighted only by 1/dist² — independent of
+                // beam direction.  This is the omnidirectional "wash" that tints
+                // the dancer with whatever lights are nearest him, so side- and
+                // back-facing surfaces are no longer pure ambient gray.
+                vec3 fill = vec3(0.0);
+                for (int j = 0; j < _v21poi_SPOTS; j++) {
+                    vec3 lpos = -_v21poi_SPOT_POS[j];
+                    float dd = length(hp - lpos);
+                    fill += _v21poi_SPOT_COL[j].rgb / (0.25 + dd * dd * 0.5);
+                }
+                dc = matCol * (0.04 + fill * 0.18);
+
+                // View vector — reused for specular and fresnel
+                vec3 V = normalize(ro - hp);
+                float fres = pow(1.0 - max(0.0, dot(dn, V)), 3.0);
+
+                // ── DIRECT SPOT LIGHTING + half-Lambert wrap + colored rim ──────
+                for (int j = 0; j < _v21poi_SPOTS; j++) {
+                    vec3 lpos = -_v21poi_SPOT_POS[j];
+                    vec3 toP  = hp - lpos;
+                    float dist = length(toP);
+                    if (dist < 0.001) continue;
+                    vec3 ldir = -_v21poi_SPOT_ROT[j][1]; 
+                    float cosT = dot(ldir, toP / dist);
+                    if (cosT <= 0.0) continue;
+                    vec3 lc = _v21poi_SPOT_COL[j].rgb * 30.0
+                              * _v21poi_iesProfile(acos(clamp(cosT, 0.0, 1.0)))
+                              / (0.2 + dist * dist * 0.14);
+
+                    vec3  toL     = normalize(lpos - hp);
+                    float lambert = dot(dn, toL);
+                    float diff    = max(0.0, lambert);
+                    // Half-Lambert: (·*0.5+0.5)² is 0..1 everywhere.  Mixed in at
+                    // 35% so the dark side gets colored but the terminator that
+                    // defines the dancer's silhouette is still visible.
+                    float wrap    = lambert * 0.5 + 0.5;
+                    float diffMix = mix(diff, wrap * wrap, 0.35);
+                    float spec    = pow(max(0.0, dot(reflect(-toL, dn), V)), 32.0);
+
+                    dc += matCol * lc * diffMix / _v21poi_PI + lc * spec * 0.15;
+                    // Colored rim — light's hue blooms at the silhouette.  When
+                    // two spots overlap on the same edge their hues add here, so
+                    // teal+magenta reads as a violet rim, amber+teal as warm white.
+                    dc += lc * fres * 0.12;
+                }
+            }
+            col.rgb = mix(col.rgb, dc, .95);
+            dancerMask = 1.0;
+        }
+    }
+
+    // ── Poi PLASMA trail — sub-sample fire (replaces point halos) ───────────────
+    {
+        const int   _v21poi_FIRE_N  = 14;
+        const float _v21poi_FIRE_DT = 0.012;
+        const int   _v21poi_FIRE_S  = 3;
+
+        vec3  _pRW = vec3(0.0), _pLW = vec3(0.0);
+        float _pcrR = 0.0, _parR = 0.0;
+        float _pcrL = 0.0, _parL = 0.0;
+
+        for (int i = 0; i < (iResolution.x < 0. ? 99999 : _v21poi_FIRE_N); i++) if (i < _v21poi_FIRE_N) {
+            float pastTime = iTime - float(i) * _v21poi_FIRE_DT;
+
+            float ptR = pastTime * _v21poi_POI_RPM;
+            float ptL = pastTime * _v21poi_POI_RPM
+                      + _v21poi_PI*abs(sin(pastTime*.5))*_v21poi_POI_OFF
+                      + _v21poi_PI*abs(cos(pastTime*.5))*(1.-_v21poi_POI_OFF);
+            float ppose   = ((sin(pastTime * _v21poi_BPM_SCALE * _v21poi_PI)*0.5)+0.5)*0.25 * _v21poi_gAudioLevel;
+            float pbs     = pow(abs(sin(pastTime*(float(_v21poi_BPM)/60.)*_v21poi_PI)), 3.0);
+            float pyShift = 1.5 + pbs * 0.18 * _v21poi_gAudioLevel;
+
+            vec3 pwR = _v21poi_poiWrist(ptR, ppose, +1.0);
+            vec3 pwL = _v21poi_poiWrist(ptL, ppose, -1.0);
+            vec3 pdR, ptanR, pdL, ptanL;
+            _v21poi_poiHeadDir(ptR, pdR, ptanR);
+            _v21poi_poiHeadDir(ptL, pdL, ptanL);
+
+            vec3 phR = pwR + pdR * _v21poi_POI_STRING;
+            vec3 phL = pwL + pdL * _v21poi_POI_STRING;
+            phR.y -= pyShift;
+            phL.y -= pyShift;
+
+            float baseAge = float(i) / float(_v21poi_FIRE_N);
+            phR.y += baseAge * 0.014;
+            phL.y += baseAge * 0.014;
+
+            vec3 phRW = _v21poi_toWorld(phR);
+            vec3 phLW = _v21poi_toWorld(phL);
+
+            vec3 nposR = phRW * 80. + vec3(iTime*4., -iTime*8., iTime*2.);
+            vec3 nposL = phLW * 80. + vec3(iTime*4., -iTime*8., iTime*2.);
+            float n1R = 0.5 + 0.5*_v21poi_noiseZ(nposR);
+            float n2R = 0.5 + 0.5*_v21poi_noiseZ(nposR*2.5 + vec3(50.));
+            float n3R = 0.5 + 0.5*_v21poi_noiseZ(nposR*7.0 + vec3(100.));
+            float n1L = 0.5 + 0.5*_v21poi_noiseZ(nposL);
+            float n2L = 0.5 + 0.5*_v21poi_noiseZ(nposL*2.5 + vec3(50.));
+            float n3L = 0.5 + 0.5*_v21poi_noiseZ(nposL*7.0 + vec3(100.));
+            float crR_n = n1R*0.55 + n2R*0.30 + n3R*0.15;
+            float crL_n = n1L*0.55 + n2L*0.30 + n3L*0.15;
+            float arR_n = pow(n2R, 6.0) * pow(n3R, 4.0) * 12.0;
+            float arL_n = pow(n2L, 6.0) * pow(n3L, 4.0) * 12.0;
+
+            if (i == 0) { _pRW=phRW; _pLW=phLW; _pcrR=crR_n; _parR=arR_n; _pcrL=crL_n; _parL=arL_n; }
+
+            float sw = 1.0 / float(_v21poi_FIRE_S);
+            for (int k = 0; k < _v21poi_FIRE_S; k++) {
+                float kt  = float(k) / float(_v21poi_FIRE_S);
+                vec3  sR  = mix(_pRW, phRW, kt);
+                vec3  sL  = mix(_pLW, phLW, kt);
+                float age = clamp((float(i) - 1.0 + kt) / float(_v21poi_FIRE_N), 0.0, 1.0);
+                float crR = mix(_pcrR, crR_n, kt);
+                float crL = mix(_pcrL, crL_n, kt);
+                float arR = mix(_parR, arR_n, kt);
+                float arL = mix(_parL, arL_n, kt);
+
+                float dR = length(cross(rd, sR - ro));
+                float dL = length(cross(rd, sL - ro));
+                float fR = step(0.0, dot(sR - ro, rd));
+                float fL = step(0.0, dot(sL - ro, rd));
+
+                float sparkR=1./(0.002+dR*dR*8000.), coreR=1./(0.010+dR*dR*8500.);
+                float bodyR =1./(0.006+dR*dR*1800.), haloR=1./(0.012+dR*dR* 600.);
+                float sparkL=1./(0.002+dL*dL*8000.), coreL=1./(0.010+dL*dL*8500.);
+                float bodyL =1./(0.006+dL*dL*1800.), haloL=1./(0.012+dL*dL* 600.);
+
+                vec3 cCR=vec3(2.8), cBR=_v21poi_POI_COL_R*1.4+vec3(0.2);
+                vec3 cHR=_v21poi_POI_COL_R*0.5, cAR=_v21poi_POI_COL_R*1.8+vec3(0.5);
+                vec3 cCL=vec3(2.8), cBL=_v21poi_POI_COL_L*1.4+vec3(0.2);
+                vec3 cHL=_v21poi_POI_COL_L*0.5, cAL=_v21poi_POI_COL_L*1.8+vec3(0.5);
+
+                float inten = pow(1.0-age, 1.8) * (0.7 + 0.6*_v21poi_gAudioLevel);
+                vec3 colo = vec3(0);
+                colo += cCR*sparkR*inten*0.008*sw*fR + cCR*coreR*inten*0.020*sw*fR;
+                colo += cBR*bodyR*inten*crR*0.022*sw*fR + cHR*haloR*inten*0.022*sw*fR;
+                colo += cAR*sparkR*inten*arR*0.004*sw*fR;
+                colo += cCL*sparkL*inten*0.008*sw*fL + cCL*coreL*inten*0.020*sw*fL;
+                colo += cBL*bodyL*inten*crL*0.022*sw*fL + cHL*haloL*inten*0.022*sw*fL;
+                colo += cAL*sparkL*inten*arL*0.004*sw*fL;
+                col.rgb += .5 * tanh(colo);
+            }
+
+            _pRW=phRW; _pLW=phLW; _pcrR=crR_n; _parR=arR_n; _pcrL=crL_n; _parL=arL_n;
+        }
+    }
+
+    // ── Laser layer (background, masked by dancer silhouette) ────────────────
+    // ── Spinning fire poi: airborne HAZE glow (everywhere) + a LOCALIZED floor reflection ──
+    {
+        float rptR = iTime * _v21poi_POI_RPM;
+        float rptL = iTime * _v21poi_POI_RPM + _v21poi_PI*abs(sin(iTime*.5))*_v21poi_POI_OFF + _v21poi_PI*abs(cos(iTime*.5))*(1.-_v21poi_POI_OFF);
+        float rpose = ((sin(iTime*_v21poi_BPM_SCALE*_v21poi_PI)*0.5)+0.5)*0.25 * _v21poi_gAudioLevel;
+        float rpyS = 1.5 + pow(abs(sin(iTime*(float(_v21poi_BPM)/60.)*_v21poi_PI)),3.0)*0.18*_v21poi_gAudioLevel;
+        vec3 rdR, rtR, rdL, rtL;
+        _v21poi_poiHeadDir(rptR, rdR, rtR); _v21poi_poiHeadDir(rptL, rdL, rtL);
+        vec3 rphR = _v21poi_poiWrist(rptR, rpose, 1.0) + rdR*_v21poi_POI_STRING; rphR.y -= rpyS;
+        vec3 rphL = _v21poi_poiWrist(rptL, rpose,-1.0) + rdL*_v21poi_POI_STRING; rphL.y -= rpyS;
+        vec3 bwR = _v21poi_toWorld(rphR), bwL = _v21poi_toWorld(rphL);
+        float aud = 0.6 + 0.5*_v21poi_gAudioLevel;
+        // ── Volumetric poi smoke: depth-integrated like the spotlight cone smoke (_v21poi_trace) — for the ball
+        //    + recent fire-arc points, accumulate noise-density * (_v21poi_LIGHT_INTENS/dist) over a few depth taps.
+        //    No smooth glow term -> thin ATMOSPHERIC smoke matching the spotlights, not a flat cloud. ──
+        float ts = iTime*.025;
+        vec3 acc = vec3(0.);
+        for (int sgi = 0; sgi <= 4; sgi++) {
+            float back = float(sgi) * 0.6;   // step back through the spin -> recent positions the flame already passed
+            float fade = 1.0 - float(sgi)*0.17;   // gentle fade so the lit smoke LINGERS as a trail (delayed illumination)
+            vec3 adR, atR2, adL, atL2;
+            _v21poi_poiHeadDir(rptR - back, adR, atR2);
+            _v21poi_poiHeadDir(rptL - back, adL, atL2);
+            vec3 eR = _v21poi_toWorld(_v21poi_poiWrist(rptR - back, rpose, 1.0) + adR*_v21poi_POI_STRING - vec3(0.,rpyS,0.));
+            vec3 eL = _v21poi_toWorld(_v21poi_poiWrist(rptL - back, rpose,-1.0) + adL*_v21poi_POI_STRING - vec3(0.,rpyS,0.));
+            float tcR = dot(eR - ro, rd), tcL = dot(eL - ro, rd);
+            for (int m = 0; m < 3; m++) {
+                float off = (float(m) - 1.0) * 0.55;
+                float ttR = tcR + off;
+                if (ttR > _v21poi_MIN_STEP) { vec3 mp = ro + rd*ttR; float dB = length(mp - eR);
+                    if (dB < 0.85) { float n = _v21poi_noiseZ((mp+vec3(ts,0,0))*10.)-.5; n += _v21poi_noiseZ((mp+vec3(ts*1.7,0,0))*34.)*.5;
+                        float dens = min(1.9, max(0.0, n + 0.42 - dB*1.9));
+                        acc += _v21poi_POI_COL_R * dens * (_v21poi_LIGHT_INTENS/max(0.7,dB)) * fade; } }
+                float ttL = tcL + off;
+                if (ttL > _v21poi_MIN_STEP) { vec3 mp = ro + rd*ttL; float dB = length(mp - eL);
+                    if (dB < 0.85) { float n = _v21poi_noiseZ((mp+vec3(ts,0,0))*10.)-.5; n += _v21poi_noiseZ((mp+vec3(ts*1.7,0,0))*34.)*.5;
+                        float dens = min(1.9, max(0.0, n + 0.42 - dB*1.9));
+                        acc += _v21poi_POI_COL_L * dens * (_v21poi_LIGHT_INTENS/max(0.7,dB)) * fade; } }
+            }
+        }
+        col.rgb += acc * musiccolor * _v21poi_POI_FOG;
+        // localized floor reflection (floor pixels only) — tighter falloff (6 -> 16) so it doesn't spread as far
+        if (rd.y < -1e-4 && dancerMask < 0.5) {
+            float tFl = (_v21poi_FLOOR_Y - ro.y) / rd.y;
+            if (tFl > 0.0) {
+                vec3 fh = ro + rd * tFl;
+                float rhR = max(0.18, bwR.y - _v21poi_FLOOR_Y), rhL = max(0.18, bwL.y - _v21poi_FLOOR_Y);
+                vec2 rdrR = fh.xz - bwR.xz, rdrL = fh.xz - bwL.xz;
+                float rgR = (0.025/rhR) / (1.0 + dot(rdrR,rdrR)*16.0/rhR);
+                float rgL = (0.025/rhL) / (1.0 + dot(rdrL,rdrL)*16.0/rhL);
+                col.rgb += (_v21poi_POI_COL_R*rgR + _v21poi_POI_COL_L*rgL) * aud;
+            }
+        }
+    }
+    vec4 lzr = _v21poi_laserLayer(uv);
+    col.rgb += lzr.rgb * (1.0 - dancerMask);
+
+    // NaN guard
+    col.rgb = mix(vec3(0.0), col.rgb, vec3(equal(col.rgb, col.rgb)));
+    col.rgb = clamp(col.rgb, 0.0, 4.0);
+    return col.rgb;
+}
+
+
+
+// Unsigned distance from p to a quadratic Bézier (A=start, B=control,
+// C=end). Closed-form cubic solve (Inigo Quilez,
+// https://iquilezles.org/articles/distfunctions2d). Used by the
+// oscilloscope to draw a smooth curve through the audio samples.
+float _v21poi_sdBezier(vec2 p, vec2 A, vec2 B, vec2 C) {
+    vec2 a = B - A;
+    vec2 b = A - 2.0*B + C;
+    vec2 c = a * 2.0;
+    vec2 d = A - p;
+    float bb = dot(b,b);
+    if (bb < 1e-6) {
+        // Degenerate (collinear control point) → straight segment.
+        vec2 ba = C - A;
+        float hh = clamp(dot(p-A,ba) / max(dot(ba,ba),1e-6), 0.0, 1.0);
+        return length(p - A - ba*hh);
+    }
+    float kk = 1.0 / bb;
+    float kx = kk * dot(a,b);
+    float ky = kk * (2.0*dot(a,a)+dot(d,b)) / 3.0;
+    float kz = kk * dot(d,a);
+    float res;
+    float pq = ky - kx*kx;
+    float pq3 = pq*pq*pq;
+    float q = kx*(2.0*kx*kx - 3.0*ky) + kz;
+    float h = q*q + 4.0*pq3;
+    if (h >= 0.0) {
+        h = sqrt(h);
+        vec2 x = (vec2(h,-h) - q) * 0.5;
+        vec2 uv = sign(x) * pow(abs(x), vec2(1.0/3.0));
+        float t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
+        vec2 qd = d + (c + b*t)*t;
+        res = dot(qd, qd);
+    } else {
+        float z = sqrt(-pq);
+        float v = acos(q / (pq*z*2.0)) / 3.0;
+        float m = cos(v), n = sin(v)*1.732050808;
+        vec3 t = clamp(vec3(m+m, -n-m, n-m)*z - kx, 0.0, 1.0);
+        vec2 q0 = d + (c + b*t.x)*t.x;
+        vec2 q1 = d + (c + b*t.y)*t.y;
+        res = min(dot(q0,q0), dot(q1,q1));
+    }
+    return sqrt(res);
+}
+
+"""
+
     else:
         viz_scene_block = "\n// viz not recognized — black backdrop\n"
 
 
     image_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.75 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.8 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    IMAGE TAB — iChannel0: alphabet texture (shadertoy.com/view/4sf3RB)
                 iChannel1: Buffer A (audio + FFT + smoothed bands)
@@ -7309,6 +8710,13 @@ vec3 _VizScene(vec2 fragCoord) {
 // here you MUST change it in Buffer A too (see #define FFT_SR there).
 #define FFT_N  {_compat["fft_n"]}
 #define FFT_SR 8192.0
+
+// --simplegui: compact per-track note+effect strip + vol meter instead of the
+// scrolling tracker grid. Defined HERE (image tab) so it survives Common's
+// curated define-block rewrite; #ifndef-guarded in case Common also carries it.
+#ifndef SIMPLE_GUI
+#define SIMPLE_GUI {1 if _compat.get('simplegui', False) else 0}
+#endif
 
 
 // ============================================================
@@ -7401,7 +8809,7 @@ makeStr(printBPMVal) {bpm_val_chars} _end
 makeStr(printSpdVal) {spd_val_chars} _end
 
 // ---- Static label strings ----
-makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _7 _5 _ _NUM _NUM _NUM _end
+makeStr(printHdr)   _NUM _NUM _NUM _ _G _L _S _L _ _M _O _D _ _P _L _A _Y _E _R _ _V _1 _DOT _8 _0 _ _NUM _NUM _NUM _end
 makeStr(printCredit) _COPY _2 _0 _2 _6 _ _O _R _B _L _I _V _I _U _S _end
 makeStr(printLoad)   _L _O _A _D _I _N _G _DOT _DOT _DOT _end
 makeStr(printSpec)   _S _P _E _C _T _R _U _M _end
@@ -7606,7 +9014,7 @@ void mainImage(out vec4 O, vec2 C) {{
     const vec3 TC7    = vec3(1.00,0.30,0.45);   // coral
     const vec3 TCols[8] = vec3[](TC0,TC1,TC2,TC3,TC4,TC5,TC6,TC7);
 
-    const float CH=31., CW=25., ML=10.;
+    const float CH=26., CW=25., ML=10.;
     // 90 frames @ 60Hz = 1.5s — long enough that the loading dialog is
     // actually readable. Anything under ~30 frames flashes by too fast to
     // register; over ~150 starts to feel like the page is broken.
@@ -7774,6 +9182,7 @@ void mainImage(out vec4 O, vec2 C) {{
                            // 64 % 10 = 4-row stub page (clean). Lower this further to
                            // make the scope taller still.
 
+#if !SIMPLE_GUI
     // Track headers — dynamic loop over all channels, colored by tc%4,
     // scrolled with _scrollX so wide songs scroll horizontally.
     {{
@@ -7801,6 +9210,7 @@ void mainImage(out vec4 O, vec2 C) {{
             }}
         }}
     }}
+#endif
 
     // Vertical separators — bounded to end at the bottom hline (tBot+3),
     // not extending below into the spectrum/oscilloscope area.
@@ -7812,6 +9222,7 @@ void mainImage(out vec4 O, vec2 C) {{
     float tTop = tHdrBot+VH;      // top of tracker rows (shifted down by VH)
     float tBot = tTop+float(NROWS)*CH;
 
+#if !SIMPLE_GUI
     // ── Per-channel volume bars (between TRACK header and rows) ──────────────
     {{
         // TCols[] declared at top — use & 3 for bounds safety
@@ -7943,6 +9354,7 @@ void mainImage(out vec4 O, vec2 C) {{
             col = mix(col, vec3(0.0), 0.45);
         }}
     }}
+#endif
 
     // ── Panel bevels: 3D raised border on every major UI strip ─────────────
     // Header strip, info strip, and TRACK-header row all get the same
@@ -7965,17 +9377,24 @@ void mainImage(out vec4 O, vec2 C) {{
             else if(fp.y > _hL2 - 2.0)
                 col = max(col * 0.20, vec3(0.05, 0.02, 0.02));
         }}
+#if !SIMPLE_GUI
         // TRACK #N header row — horizontal bevel + per-column left/right bevel
         else if(fp.y >= ty && fp.y < tHdrBot) {{
             float _xH  = fp.x - txOff;
             float _cFH = _xH >= 0.0 ? mod(_xH, TW) : -1.0;
+            // SOLO: a soloed channel's TRACK button renders PRESSED-IN (inverted
+            // bevel). Flags live in Buffer A row 2 px 16+ch (iChannel1 here).
+            bool _solo = false;
+            if(_xH >= 0.0) {{ int _stc = int(_xH / TW); if(_stc >= 0 && _stc < NUM_CHANNELS) _solo = texelFetch(iChannel1, ivec2(16 + _stc, 2), 0).r > 0.5; }}
             bool _hHi  = fp.y < ty + 2.0 || (_xH >= 0.0 && _cFH < 2.0);
             bool _hSh  = fp.y > tHdrBot - 2.0 || (_xH >= 0.0 && _cFH >= TW - 2.0);
+            if(_solo) {{ bool _sw = _hHi; _hHi = _hSh; _hSh = _sw; }}  // swap hi/shadow → pushed-in
             if(_hHi)      col = min(vec3(1.0), col + vec3(0.22, 0.22, 0.32));
             else if(_hSh) col = max(col * 0.20, vec3(0.05, 0.02, 0.02));
             else {{
                 // Simple vertical gradient: light at top → darker at bottom
                 float _gY = (fp.y - ty) / max(tHdrBot - ty, 1.0);  // 0=top, 1=bottom
+                if(_solo) _gY = 1.0 - _gY;  // invert gradient too when pressed in
                 float _gM = mix(1.50, 0.65, _gY);
                 col = min(vec3(1.0), col * _gM);
                 // Per-track color tint: mix the track title color into the button background
@@ -7985,21 +9404,21 @@ void mainImage(out vec4 O, vec2 C) {{
                 }}
             }}
         }}
+#endif
     }}
 
     // ── Divider lines: darken the background scene (no blue color) ─────────
     // Horizontal panel separators at their exact y pixel.
     {{
-        float _dH1 = CH*2.+13., _dH2 = iy2+CH+4., _dHB = tBot+5.;
-        if((fp.y >= _dH1 && fp.y < _dH1+1.) ||
-           (fp.y >= _dH2 && fp.y < _dH2+1.) ||
-           (fp.y >= _dHB && fp.y < _dHB+1.))
+        float _dH1 = CH*2.+13.;   // _dH2 removed: y=iy2+CH+4 lands ON the progress bar = rogue black line. _dHB removed earlier (landed in scope).
+        if(fp.y >= _dH1 && fp.y < _dH1+1.)
             col *= 0.15;
         // Vertical column separators: handled by per-cell bevel
         // (shadow at colFrac=TW-1 immediately adjacent to highlight at colFrac=0)
         // No extra divider line needed — it caused a visible gap between dark and light.
     }}
 
+#if !SIMPLE_GUI
     if(fp.y>=tTop && fp.y<tBot) {{
         int ri_abs=int((fp.y-tTop)/CH);
         int ri=ri_abs - frameRow;
@@ -8056,6 +9475,124 @@ void mainImage(out vec4 O, vec2 C) {{
             }}
         }}
     }}
+#endif
+
+#if SIMPLE_GUI
+    // ============ COMPACT GUI STRIP ============
+    // One line per track laid out left→right across the width: "N: NOTE EFF"
+    // (current row's note+effect, via getNote/nCell/drawCh — same as the grid),
+    // with that track's volume meter directly beneath its cell. Docked inside
+    // the tracker band [tTop, tBot] so it stays ABOVE the oscilloscope (which
+    // starts at oy=tBot below). Replaces the scrolling NROWS×tracks grid.
+    {{
+        float _sCellW = _availW / float(NUM_CHANNELS);   // stretch cells to fill width
+        // Cell text = up to "NN: " (4) + 9 note chars = ~13.5 char cells.
+        float _sCW    = min(CW, (_sCellW - 6.0) / 13.5);
+        float _sCH    = min(CH, _sCellW / 6.0);          // keep glyphs legible, not huge
+        float _sScopeTop = (iResolution.y - 4.0) - (tBot - tTop)*0.375;  // top of bottom-docked scope
+        float _sBarY  = _sScopeTop - 9.0;                // vol meter just above the oscilloscope
+        float _sTextY = _sBarY - _sCH - 3.0;             // note+effect text just above it
+        const float _sBarH = 7.0;
+        float _sXin   = fp.x - _trkLeft;
+        if(_sXin >= 0.0 && _sXin < _availW) {{
+            int _stc = int(_sXin / _sCellW);
+            if(_stc >= 0 && _stc < NUM_CHANNELS) {{
+                float _cellX = _trkLeft + float(_stc)*_sCellW;
+                float _cx    = _sXin - float(_stc)*_sCellW;   // px inside cell
+                vec3  _tCol  = TCols[_stc & 7];
+                Note  _n     = getNote(pos.songPos, pos.row, _stc);
+
+                // ── Text row: "N: " label then the 9 note/effect chars ──────
+                if(fp.y >= _sTextY && fp.y < _sTextY + _sCH) {{
+                    int _ndig = (_stc+1 >= 10) ? 2 : 1;
+                    float _numX = _cellX + 2.0;                       // left of cell
+                    // track index digits (1-based)
+                    col *= 1.0 - 0.45 * drawNum(_stc+1, _ndig, _numX + float(_ndig-1)*_sCW + 1., _sTextY+1., _sCW, _sCH, fp);
+                    trk += _tCol  * drawNum(_stc+1, _ndig, _numX + float(_ndig-1)*_sCW,        _sTextY,    _sCW, _sCH, fp);
+                    // ':' right after the digits
+                    float _colonX = _numX + float(_ndig)*_sCW;
+                    col *= 1.0 - 0.45 * drawCh(58, fp, _colonX+1., _sTextY+1., _sCW, _sCH);
+                    trk += _tCol  * drawCh(58, fp, _colonX,    _sTextY,    _sCW, _sCH);
+                    // note+effect cells (ci 0..8) after "N: " (digits + colon + space)
+                    float _txt0 = _colonX + 1.5*_sCW;                 // start of note text
+                    float _xInTxt = fp.x - _txt0;
+                    if(_xInTxt >= 0.0) {{
+                        int _ci = int(_xInTxt / _sCW);
+                        if(_ci >= 0 && _ci < 9) {{
+                            int _c = nCell(_n.period, _n.instrument, _n.effect, _n.param, _ci);
+                            float _gx = _txt0 + float(_ci)*_sCW;
+                            bool _empty = (_n.period==0 && _n.instrument==0 && _n.effect==0);
+                            vec3 _nc = _empty ? DIM*1.6 : _tCol;
+                            col *= 1.0 - 0.45 * drawCh(_c, fp, _gx+1., _sTextY+1., _sCW, _sCH);
+                            trk += _nc * drawCh(_c, fp, _gx, _sTextY, _sCW, _sCH);
+                        }}
+                    }}
+                }}
+
+                // ── Vol meter under the cell (same effVol scan as the grid) ──
+                if(fp.y >= _sBarY && fp.y < _sBarY + _sBarH && _cx > 1.0 && _cx < _sCellW-1.0) {{
+                    float _sy2 = fp.y - _sBarY;
+                    int   _pat0  = songPositions[pos.songPos];
+                    float _effVol = 0.0;
+                    for(int rb = 0; rb < 24; rb++) {{
+                        int rr = pos.row - rb;
+                        if(rr < 0) break;
+                        int rg  = _pat0 * 64 + rr;
+                        int ni  = rg * NUM_CHANNELS + _stc;
+                        int bmb = fetchBitmapByte(ni >> 3);
+                        if(((bmb >> (ni & 7)) & 1) != 0) {{
+                            int rnk  = rowSeekCum(rg);
+                            int s2   = rg * NUM_CHANNELS;
+                            int bIdx = s2 >> 3, sh = s2 & 7;
+                            int rowB = (fetchBitmapByte(bIdx)|(fetchBitmapByte(bIdx+1)<<8)|(fetchBitmapByte(bIdx+2)<<16)|(fetchBitmapByte(bIdx+3)<<24)) >> sh;
+                            if(sh!=0) rowB |= fetchBitmapByte(bIdx+4)<<(32-sh);
+                            rowB &= (1<<NUM_CHANNELS)-1;
+                            int rrb  = rowB & ((1<<_stc)-1);
+                            rnk += popcount16(rrb&0xFFFF)+popcount16(rrb>>16);
+                            int didx = fetchIdxByte(rnk*2)|(fetchIdxByte(rnk*2+1)<<8);
+                            int vcol = fetchDictByte(didx*5+4);
+                            int b2   = fetchDictByte(didx*5+2);
+                            int b3   = fetchDictByte(didx*5+3);
+                            int eff  = b2 & 0x0F;
+                            int par  = b3;
+                            float vol64 = (vcol > 0 && vcol <= 64) ? float(vcol) : 32.0;
+                            if(rb == 0) {{
+                                if(eff == 0xA || eff == 0x6) {{
+                                    int su = (par >> 4) & 0xF;
+                                    int sd = par & 0xF;
+                                    float ticks = max(0.0, pos.tick - 1.0);
+                                    if(su > 0 && sd == 0)
+                                        vol64 = min(64.0, vol64 + float(su)*ticks);
+                                    else if(sd > 0 && su == 0)
+                                        vol64 = max(0.0, vol64 - float(sd)*ticks);
+                                }}
+                                _effVol = vol64 / 64.0;
+                            }} else {{
+                                _effVol = (vol64 / 64.0) * pow(0.75, float(rb));
+                            }}
+                            break;
+                        }}
+                    }}
+                    bool _topE = _sy2 < 1.0, _botE = _sy2 >= _sBarH-1.0;
+                    bool _lE   = _cx < 2.0,  _rE   = _cx >= _sCellW-2.0;
+                    if(_topE || _rE) {{
+                        col = max(col * 0.20, vec3(0.05, 0.02, 0.02));
+                    }} else if(_botE || _lE) {{
+                        col = min(vec3(1.0), col + vec3(0.22, 0.22, 0.32));
+                    }} else {{
+                        float barW = _effVol * (_sCellW - 4.0);
+                        if(_cx - 1.0 < barW) {{
+                            float t = (_cx - 1.0) / max(barW, 1.0);
+                            col = clamp(mix(_tCol*1.6, _tCol*0.5, t), vec3(0.0), vec3(1.0));
+                        }} else {{
+                            col *= 0.35;
+                        }}
+                    }}
+                }}
+            }}
+        }}
+    }}
+#endif
     // ── Composite: PREMULTIPLIED ALPHA-OVER ────────────────────────────────
     // The previous `col = mix(col, trk, trkA)` was squaring the glyph value:
     // for a YELLOW glyph at AA opacity 0.85, trk was YELLOW*0.85 (already
@@ -8076,9 +9613,9 @@ void mainImage(out vec4 O, vec2 C) {{
     // bottom extends ALL the way to the frame's bottom border so bars
     // are flush with it. The frame's 2px-thick band overrides the last
     // 2px of bar at by1, giving a clean visual where bars touch frame.
-    float oy=tBot+4.;
-    float by1 = iResolution.y - 4.;
-    float oh  = max(0., by1 - oy);
+    float oh  = (tBot - tTop) * 0.375;          // oscilloscope strip height
+    float by1 = iResolution.y - 4.0;            // dock at the very BOTTOM of the rendered screen
+    float oy  = by1 - oh;                        // scope top = bottom minus height
     // specMode persisted in Buffer A row 2, px 0 (click to toggle)
     bool specMode = (iChannelResolution[1].x > 1.0)
                     ? texelFetch(iChannel1, ivec2(0, 2), 0).r > 0.5
@@ -8091,8 +9628,11 @@ void mainImage(out vec4 O, vec2 C) {{
     // ── Pre-compute rounded-rect SDF early so the strip render can
     // gate itself against the curve at the bottom corners.
     const float CR_pre = 10.0;
-    vec2 _rectCenter_pre = vec2(iResolution.x * 0.5, by1 * 0.5);
-    vec2 _rectHalf_pre   = vec2(iResolution.x * 0.5, by1 * 0.5);
+    // Window frame/clip = FULL canvas (NOT by1) so the visualizer fills the whole
+    // screen below the thin scope strip; only the scope WAVEFORM is limited to by1.
+    float _frameBot = iResolution.y - 4.;
+    vec2 _rectCenter_pre = vec2(iResolution.x * 0.5, _frameBot * 0.5);
+    vec2 _rectHalf_pre   = vec2(iResolution.x * 0.5, _frameBot * 0.5);
     vec2 _q_pre = abs(fp - _rectCenter_pre) - _rectHalf_pre + vec2(CR_pre);
     float _sdf_pre = min(max(_q_pre.x, _q_pre.y), 0.0) + length(max(_q_pre, vec2(0.0))) - CR_pre;
 
@@ -8187,10 +9727,12 @@ void mainImage(out vec4 O, vec2 C) {{
                     // 1 at edges — used to mix bright center color toward
                     // the edge color.
                     float dist_from_center = abs(sy - oh*0.5) / (oh*0.5);
-                    vec3 traceCenter = vec3(1.0, 0.00, 0.0);   // pure red core
-                    vec3 traceEdge   = vec3(2.0, 1.00, 0.0);   // HDR orange edges
+                    // Vertical gradient, mirrored about the strip's centre:
+                    // RED at centre (dist 0) → ORANGE at top & bottom edges (dist 1).
+                    vec3 traceCenter = vec3(1.2, 0.00, 0.0);   // bright red at the centre line
+                    vec3 traceEdge   = vec3(1.5, 0.45, 0.0);   // bright ORANGE at the edges (was 2.0,1.0,0 → clamped to yellow-white, no visible orange)
                     vec3 traceCol = mix(traceCenter, traceEdge, dist_from_center);
-                    col = mix(col, traceCol, aa);
+                    col = mix(col, traceCol * 0.9, aa);
                 }}
             }} else {{
                 // zero-crossing line removed
@@ -8253,7 +9795,7 @@ void mainImage(out vec4 O, vec2 C) {{
                 // Bars reach to 95% of strip height at peak — leaves a small
                 // 5% margin so peaks don't clip flat against the very top
                 // line. User wanted bars closer to the top.
-                float barH     = clamp(mag * 1.4, 0.0, 1.0) * oh * 0.95;
+                float barH     = tanh(mag * 2.5) * oh * 0.95;  // SOFT limiter on peaks (was hard clamp → flat-topped/oversaturated peaks pinned red at the top); tanh rolls peaks off smoothly + tones down the per-bin scaling
                 float barY = oh - barH;
                 // Tighter 1px smoothstep on top edge — combined with the
                 // horizontal oversampling, gives crisp but smooth bar tops.
@@ -8283,7 +9825,7 @@ void mainImage(out vec4 O, vec2 C) {{
                     }} else {{
                         specCol = mix(topBlue, bottomBG, (strip_t - 0.40) / 0.60);
                     }}
-                    col = mix(col, specCol, edge);
+                    col = mix(col, specCol * 0.85, edge);
                 }}
                 // Mode label at TOP-RIGHT of the strip, slightly bigger
                 // (CH*1.0 = 28px tall, was CH*0.8). SPECTRUM = 8 chars at
@@ -8370,13 +9912,18 @@ void mainImage(out vec4 O, vec2 C) {{
         }}
         // 3D raised-bevel border around the entire strip:
         // top+left 1px = highlight, bottom+right 1px = shadow
-        bool _sTop = fp.y < oy + 1.5;
-        bool _sBot = fp.y > by1 - 1.5;
+        bool _sTop = false;   // oscilloscope horizontal box lines removed (user request)
+        bool _sBotHi = false;
+        bool _sBotLo = false;
         bool _sLft = fp.x < 3.5;
         bool _sRgt = fp.x > iResolution.x - 3.5;
         if(_sTop || _sLft) {{
             col = min(vec3(1.0), col + vec3(0.22, 0.22, 0.32));
-        }} else if(_sBot || _sRgt) {{
+        }} else if(_sBotHi) {{
+            col = min(vec3(1.0), col + vec3(0.22, 0.22, 0.32));  // lite line — matches top/left bevel
+        }} else if(_sBotLo) {{
+            col = max(col * 0.20, vec3(0.05, 0.02, 0.02));        // darker line — matches right bevel
+        }} else if(_sRgt) {{
             col = max(col * 0.20, vec3(0.05, 0.02, 0.02));
         }}
     }}
@@ -8451,7 +9998,7 @@ void mainImage(out vec4 O, vec2 C) {{
             "            int trigSgr = patTickOffset[tpat] + (trow - patStartRow[tpat]);\n"
             "            float trigT = float(fetchTick(trigSgr)) / TICKS_PER_SEC;\n"
             "            float age   = max(0.0, t - trigT);\n"
-            "            float env   = exp(-age * 3.5);\n"
+            "            float env   = max(0.35, exp(-age * 3.5));\n"
             "            int wt = waveType[tn.instrument - 1];\n"
             "            s += amp * env * _synthWave(wt, f, t);\n"
             "        }\n"
@@ -8524,7 +10071,7 @@ void mainImage(out vec4 O, vec2 C) {{
             "            int trigSgr = patTickOffset[tpat] + (trow - patStartRow[tpat]);\n"
             "            float trigT = float(fetchTick(trigSgr)) / TICKS_PER_SEC;\n"
             "            float age   = max(0.0, t - trigT);\n"
-            "            float env   = exp(-age * 3.5);\n"
+            "            float env   = max(0.35, exp(-age * 3.5));\n"
             "            int wt = waveType[tn.instrument - 1];\n"
             "            s += amp * env * _synthWave(wt, f, t);\n"
             "        }\n"
@@ -8554,7 +10101,7 @@ void mainImage(out vec4 O, vec2 C) {{
     # Setup: Buffer A iChannel0 = Buffer A (self-ref)
     #        Image   iChannel1 = Buffer A output
     buffer_a_glsl = f"""/* ============================================================================
-   GLSL (The Last) MOD Player v1.75 (c) 2026 Orblivius
+   GLSL (The Last) MOD Player v1.8 (c) 2026 Orblivius
    4+ Tracks support, S3M/MOD loader, 3D Surround, PhatBass, Comb Reverb, FAT, RVQ sample compression, configurable resampler
    Contact: subband@gmail.com or
             subband@protonmail.com
@@ -8687,7 +10234,12 @@ void mainImage(out vec4 O, vec2 C) {{
             // This prevents tracker drags from ever toggling the view.
             bool pressed    = iMouse.z > 0.0;
             bool newClick   = pressed && (prevPressed < 0.5);
-            float _oy       = iResolution.y - 475.0;
+            float _oy       = iResolution.y - 595.0;  // tracker bottom
+            // Toggle on ANY click BELOW the tracker (the osc strip + the whole
+            // visualizer) — the old code restricted to a thin 78px strip the user
+            // never hit, so "click to toggle" looked dead. Both the click AND its
+            // press-origin must be below the tracker so tracker drag-scroll never
+            // toggles; the >0.5 guard ignores an uninitialised y=0.
             bool inOscArea  = iMouse.y > 0.5 && iMouse.y < _oy
                            && abs(iMouse.w) > 0.5 && abs(iMouse.w) < _oy;
             O = vec4((newClick && inOscArea) ? 1.0 - prevMode : prevMode, 0., 0., 1.);
@@ -8739,12 +10291,12 @@ void mainImage(out vec4 O, vec2 C) {{
             float scrollAnchor = texelFetch(iChannel0, ivec2(6, 2), 0).r;
             float dragActive   = texelFetch(iChannel0, ivec2(8, 2), 0).r;
             float currPressed  = iMouse.z > 0.0 ? 1.0 : 0.0;
-            bool inBounds = iMouse.y > iResolution.y - 471.0 && iMouse.y < iResolution.y - 65.0;
+            bool inBounds = iMouse.y > iResolution.y - 595.0 && iMouse.y < iResolution.y - 179.0;
             float TW_PX = 9.0 * 18.0 + 6.0;
             float MAX_SCROLL = max(0.0, ceil((float(NUM_CHANNELS)*TW_PX - (iResolution.x-68.0)) / TW_PX) * TW_PX);
             if (dragActive > 0.5 && currPressed > 0.5 && inBounds) {{
                 // Rubber band: 30% resistance past each edge
-                float raw = scrollAnchor + (iMouse.x - abs(iMouse.z));
+                float raw = scrollAnchor + (iMouse.x - abs(iMouse.z));   // drag direction (un-flipped now that Paint mouse args are correct)
                 if      (raw > 0.0)          scrollOffset = raw * 0.3;
                 else if (raw < -MAX_SCROLL)  scrollOffset = -MAX_SCROLL + (raw + MAX_SCROLL) * 0.3;
                 else                         scrollOffset = raw;
@@ -8761,7 +10313,7 @@ void mainImage(out vec4 O, vec2 C) {{
             float scrollOffset = texelFetch(iChannel0, ivec2(5, 2), 0).r;
             float prevPressed  = texelFetch(iChannel0, ivec2(7, 2), 0).r;
             float currPressed  = iMouse.z > 0.0 ? 1.0 : 0.0;
-            bool inBounds = iMouse.y > iResolution.y - 471.0 && iMouse.y < iResolution.y - 65.0;
+            bool inBounds = iMouse.y > iResolution.y - 595.0 && iMouse.y < iResolution.y - 179.0;
             if (currPressed > 0.5 && prevPressed < 0.5 && inBounds)
                 scrollAnchor = scrollOffset;
             O = vec4(scrollAnchor, 0., 0., 1.);
@@ -8773,10 +10325,29 @@ void mainImage(out vec4 O, vec2 C) {{
             float dragActive  = texelFetch(iChannel0, ivec2(8, 2), 0).r;
             float prevPressed = texelFetch(iChannel0, ivec2(7, 2), 0).r;
             float currPressed  = iMouse.z > 0.0 ? 1.0 : 0.0;
-            bool inBounds = iMouse.y > iResolution.y - 471.0 && iMouse.y < iResolution.y - 65.0;
+            bool inBounds = iMouse.y > iResolution.y - 595.0 && iMouse.y < iResolution.y - 179.0;
             if (currPressed > 0.5 && prevPressed < 0.5 && inBounds) dragActive = 1.0;
             if (currPressed < 0.5) dragActive = 0.0;  // released: kill
             O = vec4(dragActive, 0., 0., 1.);
+        }} else if (px >= 16 && px < 16 + NUM_CHANNELS) {{
+            // ── Per-channel SOLO flags (toggled by clicking a TRACK header) ──────
+            // Stored on row 2 at px 16+ch. Click a "TRACK N" header button to flip
+            // channel N's solo. The header zone is the thin strip ABOVE the tracker
+            // rows (top-rel y 142..171); it never overlaps the scroll-drag rows zone
+            // (resY-595..resY-179), so solo-click and scroll-drag never fight.
+            int   _solCh     = px - 16;
+            float _prevSolo  = texelFetch(iChannel0, ivec2(px, 2), 0).r;
+            float _prevPress = texelFetch(iChannel0, ivec2(7, 2), 0).r;
+            bool  _newClick  = (iMouse.z > 0.0) && (_prevPress < 0.5);
+            bool  _inHdr     = iMouse.y > iResolution.y - 171.0 && iMouse.y < iResolution.y - 142.0;
+            float _scrollX   = texelFetch(iChannel0, ivec2(5, 2), 0).r;
+            float _TWs       = max(160.0, (iResolution.x - 78.0) / float(NUM_CHANNELS));  // mirrors Image TW
+            float _xrel      = iMouse.x - (68.0 + _scrollX);   // 68 = ML(10)+2*CW(50)+8 = trkLeft
+            int   _hitCh     = -1;
+            if (_xrel >= 0.0) {{ int _c = int(_xrel / _TWs); if (_c >= 0 && _c < NUM_CHANNELS) _hitCh = _c; }}
+            float _solo = _prevSolo;
+            if (_newClick && _inHdr && _hitCh == _solCh) _solo = 1.0 - _prevSolo;  // toggle
+            O = vec4(_solo, 0., 0., 1.);
         }}
 
     }} else if (py >= HIST_BASE && py < HIST_BASE + HIST_ROWS && px < NUM_CHANNELS) {{
@@ -8812,7 +10383,7 @@ void mainImage(out vec4 O, vec2 C) {{
                 int trigSgr = patTickOffset[tpat] + (trow - patStartRow[tpat]);
                 float trigT = float(fetchTick(trigSgr)) / TICKS_PER_SEC;
                 float age   = max(0.0, iTime - trigT);
-                float env   = exp(-age * 3.5);
+                float env   = max(0.35, exp(-age * 3.5));
                 int wt = waveType[tn.instrument - 1];
                 s = amp * env * _synthWave(wt, f, iTime);
             }}
@@ -11809,6 +13380,10 @@ def _pack_build_into_png(common_path, sound_path, png_path,
     _struct.pack_into('>H', _header, 10, _song_len_val & 0xFFFF)
     _header[12] = len(_smp_data) & 0xFF
     _header[13] = len(_smpfields) & 0xFF
+    # SOLO mask (bytes 40-43, big-endian): one bit per track, 1 = play. Default
+    # 0xFFFFFFFF = all tracks play. The HTML player rewrites these 4 bytes (and
+    # re-bakes) when a track header is clicked; tlGetOutput reads it via _pI32(40).
+    _struct.pack_into('>i', _header, 40, -1)
     _HDR_SLOTS = {
         '_sampleInfo': 16, 'songPositions': 20,
         'patRowOffset': 24, 'patStartRow': 28, 'patTickOffset': 32,
@@ -11834,6 +13409,29 @@ def _pack_build_into_png(common_path, sound_path, png_path,
     for lg in order:
         off[lg] = len(blob); blob += _stream(lg)
 
+    # ── Segment-player timeline ivec4 arrays → PNG ───────────────────────────
+    # tlSegI (one ivec4 per piece, up to ~25k) as a const array busts ANGLE's
+    # private-variable limit (dynamic index → materialized in private storage).
+    # Pack them into the PNG blob (BE int32 x→y→z→w) like every other section;
+    # the const declarations are stripped and accesses rewritten to _tlVec()
+    # below. tlLoop/tlSlide are small but go the same route for uniformity.
+    _tl_present = []
+    for _tn in ('tlSegI', 'tlLoop', 'tlSlide'):
+        _tm = _re.search(r'const ivec4 ' + _tn + r'\[\d+\]\s*=\s*ivec4\[\]\((.*?)\);',
+                         sound, _re.S)
+        if not _tm:
+            continue
+        # 4-byte align so each packed int lands on its own RGBA pixel — lets
+        # _tlVec read a whole int as one fetchPixel (no per-byte shift/mask).
+        while len(blob) % 4 != 0:
+            blob += b'\x00'
+        off[_tn] = len(blob)
+        for _v in _re.findall(r'ivec4\(\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\)',
+                              _tm.group(1)):
+            for _c in _v:
+                blob += _struct.pack('>i', int(_c))
+        _tl_present.append(_tn)
+
     # 2. Write the PNG: [magic 'MOD',0][blob] into a 1024x1024 RGBA texture.
     TEX = 1024; cap = TEX * TEX * 4
     data = bytes([77, 79, 68, 0]) + bytes(blob)   # getByte() skips the 4-byte magic
@@ -11850,6 +13448,9 @@ def _pack_build_into_png(common_path, sound_path, png_path,
     #    This lets the SAME compiled GLSL work with any song's PNG (generic shader).
     def _defname(lg): return lg.upper() + '_PNG_OFF'
     defines = "".join(f"#define {_defname(lg):24s} {off[lg]}\n" for lg in order)
+    # Segment-player timeline section offsets (byte offsets into the PNG blob).
+    defines += "".join(f"#define {_tn.upper()+'_PNG_OFF':24s} {off[_tn]}\n"
+                       for _tn in _tl_present)
     # Image reads from Buffer A (iChannel1) directly — no PNG proxy needed.
     # NOTE: SAMPLEINFO/SONGPOS/PATROWOFF/PATSTARTROW/PATTICKOFF are NOT #defined here.
     # Their section offsets are stored in the PNG header (bytes 16-35) and read at
@@ -11977,6 +13578,17 @@ def _pack_build_into_png(common_path, sound_path, png_path,
         getbyte += "#define _gPSRow(_i) (_pI32(fetchPixel(8)+(_i)*4))\n"
     if 'patTickOffset' in off:
         getbyte += "#define _gPTickOff(_i) (_pI32(fetchPixel(9)+(_i)*4))\n"
+    # Segment-player timeline: read one ivec4 (16 BE bytes = 4 aligned RGBA
+    # pixels) from the PNG blob. Each int IS one pixel (fetchPixel returns the
+    # big-endian pixel int = exactly the packed int), so we fetch 4 pixels with
+    # ZERO shift/mask — the per-byte _pI32 path would cost 16 getByte + 28 ALU
+    # ops per ivec4 on tlGetOutput's hot per-sample loop. Aligned in the blob.
+    # MUST be a macro (not a function): like getByte/_pI32 it cascade-resolves
+    # fetchPixel at the per-tab call site (Common stubs fetchPixel→0).
+    if _tl_present:
+        getbyte += ("#define _tlVec(_b) ivec4(fetchPixel(((_b)+4)>>2),"
+                    " fetchPixel(((_b)+8)>>2), fetchPixel(((_b)+12)>>2),"
+                    " fetchPixel(((_b)+16)>>2))\n")
 
     # 5. Map each byte-fetcher to its logical array, and rewrite its body.
     fmap = {'fetchDictByte': 'patDict', 'fetchBitmapByte': 'patBitmap',
@@ -12177,6 +13789,15 @@ def _pack_build_into_png(common_path, sound_path, png_path,
         return src
     common = _rewrite_accesses(common)
     sound  = _rewrite_accesses(sound)
+    # Segment-player timeline: strip the const ivec4 declarations (now in PNG)
+    # then rewrite tlSegI[i]/tlLoop[s]/tlSlide[k] → _tlVec(NAME_PNG_OFF + (i)*16).
+    # Strip BEFORE access-rewrite so the `[N]` in the declaration isn't rewritten.
+    for _tn in _tl_present:
+        sound = _re.sub(r'[ \t]*const ivec4 ' + _tn + r'\[\d+\]\s*=\s*ivec4\[\]\(.*?\);\s*\n?',
+                        '', sound, flags=_re.S)
+        sound = _re.sub(r'\b' + _tn + r'\[([^\]]+)\]',
+                        lambda m, tn=_tn: '_tlVec(' + tn.upper() + '_PNG_OFF + (' + m.group(1) + ')*16)',
+                        sound)
     # PNG_SONG_SAMPS: full-song sample count computed once here, used both in the
     # image-tab iTime loop patch below and in the Sound modulo + defines injection.
     # Match GLSL's own TICKS_PER_SEC = SR/((125*SR)//(50*BPM)), so samples_per_tick
@@ -12401,9 +14022,146 @@ def _emit_html_player(mod, html_file, downsample, vec_dim):
         print(f"   ✗ autoplay injection skipped: {_e}")
 
 
+def _emit_fullsong_png_player(out_base, passthru, background=False):
+    """Full-song HTML player for the auto-split (>180s) non-PNG path.
+
+    The HTML player must ALWAYS be the real emit_player engine (gzip-embedded
+    ShaderToy renderer running the actual GLSL + Image-tab visualizer), never the
+    archived JS softsynth. The full-song INLINE GLSL is too big to compile as one
+    shader (it's why ShaderToy is split into parts), so we run ONE --png child
+    build: --png packs the data into a PNG texture → small GLSL → fits one shader
+    → a single full-song player. We then promote that child's _player.html and
+    drop its PNG ShaderToy tabs; the parent's inline-VQ ShaderToy part-tabs (for
+    PNG-free ShaderToy import) are left untouched. Returns True on success.
+    """
+    import subprocess as _sp, glob as _gl
+    _cbase = f"{out_base}_fullpng"
+    # Reuse the parent's passthru argv (modfile + --sf/--earwax/--surround/--viz/
+    # --vec-dim/--bitrate/...), minus the flags we must control for the child.
+    _drop = ('--no-html', '--no-json', '--png', '--no-png', '--background')
+    _argv = [_t for _t in passthru if _t not in _drop]
+    # Non-PNG parent → IT filter defaults OFF; this full-song HTML child IS a --png
+    # build (where the filter would default ON), so pass --no-filters too to keep the
+    # whole non-PNG build filter-consistent (off everywhere).
+    _cmd = [sys.executable, sys.argv[0]] + _argv + ['--png', '--no-filters', '--output-base', _cbase]
+    if background:
+        _cmd.append('--background')
+    print(f"      building full-song --png player (one shader, whole song)…")
+    try:
+        if _sp.run(_cmd, capture_output=True, text=True).returncode != 0:
+            return False
+    except Exception:
+        return False
+    _src = f"{_cbase}_background.html" if background else f"{_cbase}_player.html"
+    _dst = f"{out_base}_background.html" if background else f"{out_base}_player.html"
+    if not os.path.exists(_src):
+        return False
+    os.replace(_src, _dst)
+    # Drop the --png child's ShaderToy tabs / json / standalone PNG: the parent's
+    # authoritative ShaderToy outputs are the inline-VQ parts, and the PNG is
+    # base64-embedded inside the promoted (self-contained) HTML.
+    for _f in _gl.glob(f"{_cbase}_*"):
+        try: os.remove(_f)
+        except OSError: pass
+    return True
+
+
 def _q(*a, **k):
     """Silenced verbose patch log; set NOISY=1 in env to restore."""
     pass
+
+
+def _build_it_mod(modfile):
+    """Load an IT file into a MOD-compatible `mod` object WITH the variable-row
+    pattern split applied (the jeff.it 128-row fix), returning (mod, it).
+
+    Factored out of the normal IT build path so the hard-won split lives in one
+    named place — keep it here only, never duplicate it."""
+    import os as _os_it, sys as _sys_it
+    _here_it = _os_it.path.dirname(_os_it.path.abspath(__file__))
+    if _here_it not in _sys_it.path:
+        _sys_it.path.insert(0, _here_it)
+    import mod_player_archived as _mp_it
+    it = _mp_it.ITFile(modfile)
+    print(f"🎵 {it.title}")
+    print(f"   Patterns: {it.num_patterns}, Channels: {it.num_channels}")
+    print(f"   Speed: {it.initial_speed}, Tempo: {it.initial_tempo}")
+    print("   ⚠️  IT support (reused from mod_player.py): IT-packed "
+          "samples decoded, effects IT→MOD at parse.")
+    mod = type('obj', (object,), {
+        'title':          it.title,
+        'samples':        it.samples,
+        'num_patterns':   it.num_patterns,
+        'song_length':    len(it.song_positions),
+        'song_positions': it.song_positions,
+        'orders':         it.song_positions,
+        'patterns':       it.patterns,          # MOD-numbered effects
+        'num_channels':   it.num_channels,
+        'initial_speed':  it.initial_speed,
+        'initial_tempo':  it.initial_tempo,
+        'channel_settings': list(getattr(it, 'channel_settings', []) or []),
+        'channel_pan':    list(getattr(it, 'channel_pan', []) or []),   # IT 0..64 per-channel pan (was dropped → all-left bug)
+        'is_s3m':         False,
+        'is_it':          True,
+    })()
+    mod._it_inst_table = getattr(it, 'inst_table', None)
+    # ── Variable-row pattern split (jeff.it 128-row root-cause fix) ────────
+    # ITFile keeps the legacy 64-row truncated form in `it.patterns`; IT files
+    # whose patterns are NOT 64 rows had rows 64+ silently DELETED → whole-song
+    # desync. SPLIT each >64-row pattern into ceil(R/64) ≤64-row sub-patterns,
+    # EXPAND the order list, and put a synthetic 0x0D pattern-break on the last
+    # real row of any short chunk so the engine advances exactly.
+    _PF = getattr(it, 'patterns_full', None)
+    _PR = getattr(it, 'pattern_rows', None)
+    if _PF and _PR and any(r > 64 or r < 64 for r in _PR):
+        _nch = mod.num_channels
+        _new_pats = []
+        _map = []          # orig pattern idx -> [sub-pattern indices]
+        _n_split = _n_brk = _n_clobber = _n_bd = 0
+        for _p in range(len(_PF)):
+            _cells = _PF[_p]
+            _R = len(_cells)
+            _chunks = [ _cells[_b:_b+64] for _b in range(0, max(1, _R), 64) ]
+            if _R > 64:
+                _n_split += 1
+                for _row in _cells:                       # mid-pattern B/D?
+                    for _cl in _row:
+                        if _cl.get('effect', 0) in (0x0B, 0x0D):
+                            _n_bd += 1
+            _idxs = []
+            for _seg in _chunks:
+                _sr = len(_seg)
+                _sub = [[dict(_cl) for _cl in _row] for _row in _seg]
+                if 0 < _sr < 64:                          # force advance
+                    _last = _sub[_sr - 1]
+                    _free = next((_c for _c in range(min(_nch, len(_last)))
+                                  if _last[_c].get('effect', 0) == 0), None)
+                    if _free is None:
+                        _free = 0
+                        _n_clobber += 1
+                    if _free < len(_last):
+                        _last[_free]['effect'] = 0x0D     # MOD pattern break
+                        _last[_free]['param']  = 0
+                        _n_brk += 1
+                _idxs.append(len(_new_pats))
+                _new_pats.append(_sub)
+            _map.append(_idxs)
+        _old_ord = list(mod.song_positions)
+        _new_ord = []
+        for _e in _old_ord:
+            if isinstance(_e, int) and 0 <= _e < len(_map):
+                _new_ord.extend(_map[_e])
+            else:
+                _new_ord.append(_e)                       # 254/255 end-marks
+        mod.patterns      = _new_pats
+        mod.num_patterns  = len(_new_pats)
+        mod.song_positions = _new_ord
+        mod.orders         = _new_ord
+        mod.song_length    = len(_new_ord)
+        _q(f"   ✓ Variable-row split: {_n_split} >64-row patterns → "
+              f"{len(_new_pats)} sub-patterns, order {len(_old_ord)}→"
+              f"{len(_new_ord)}, {_n_brk} synthetic breaks")
+    return mod, it
 
 def main():
     import argparse
@@ -12440,11 +14198,11 @@ def main():
                         help='Sample decimation factor: 1=full-rate, 2=22kHz, 4=11kHz. '
                              '(DEFAULT 1.) '
                              'HF percussion (cymbals/rides) gets max(1,DS//2) to keep shimmer.')
-    parser.add_argument('--bitrate', choices=['lo','med','hi','ultra'], default='hi',
+    parser.add_argument('--bitrate', choices=['lo','med','hi','ultra'], default='ultra',
                         help='RVQ codebook size (mp3-style quality knob). '
                              'lo=K(128,64) 13b/pair smallest+grainy, med=K(256,128) 15b/pair balanced, '
                              'hi=K(512,256) 17b/pair sharper, ultra=K(1024,512) 19b/pair near-transparent.')
-    parser.add_argument('--vec-dim', type=int, default=8, choices=[2, 4, 8],
+    parser.add_argument('--vec-dim', type=int, default=4, choices=[2, 4, 8],
                         help='RVQ vector dimensionality. 8=smallest (~2.1 bits/sample), '
                              '4=medium (4.25 bits/sample), 2=highest fidelity (8.5 bits/sample).')
     parser.add_argument('--resampler', choices=['linear','bspline','lanczos3'],
@@ -12476,12 +14234,12 @@ def main():
             iv = int(v)
         except (TypeError, ValueError):
             iv = None
-        if iv is None or not (0 <= iv <= 20):
+        if iv is None or not (0 <= iv <= 21):
             raise argparse.ArgumentTypeError(
-                "invalid choice: %r (choose from [0..20], 0=sun rays backdrop)" % v)
+                "invalid choice: %r (choose from [0..21], 0=sun rays backdrop)" % v)
         return iv
-    parser.add_argument('--viz', type=_viz_arg, default=None, metavar='[0..20]',
-                        help='Image-tab visualizer (choose from [0..20]; run --viz with no number to list these). Default:\n'
+    parser.add_argument('--viz', type=_viz_arg, default=None, metavar='[0..21]',
+                        help='Image-tab visualizer (choose from [0..21]; run --viz with no number to list these). Default:\n'
                              '0 for non-PNG (embedded) builds, 6 for --png builds.\n'
                              '  0 = Sun Rays          (cabbibo-style — warm/cool god-ray corona)  ← non-PNG default\n'
                              '  1 = Reactive 001     (PAEz fork — SDF circles + cosmic web)\n'
@@ -12503,6 +14261,8 @@ def main():
                              ' 17 = Evrthing Temp.   (diatribes/FabriceNeyret2 — noise terrain + orb march)\n'
                              ' 18 = sm0g             (diatribes/Shane — tri-planar SDF box corridors + bump)\n'
                              ' 19 = LED Band Spectro 3D (Orblivious — pentagon LED tunnel + spectro history)')
+    parser.add_argument('--simplegui', dest='simplegui', action='store_true', default=False,
+                        help='Compact GUI: one row of per-track note+effect + vol meter above the oscilloscope instead of the scrolling tracker grid.')
     parser.add_argument('--samples', action='store_true', default=False,
                         help='Extract each sample (instrument) from the module as a separate '
                              'WAV file (named like 1-samplename.wav, 2-anothername.wav). '
@@ -12603,6 +14363,19 @@ def main():
                              'Common AND new Sound — otherwise mismatched RVQ_BITS produces '
                              'high-pitch garbage from a stale Common reading 15-bit-packed '
                              'codes that were actually written at 8 bits.')
+    parser.add_argument('--background', dest='background', action='store_true', default=False,
+                        help='Emit ONLY <base>_background.html (no player HTML): the '
+                             'visualizer scene ONLY (no tracker grid / text / progress / '
+                             'oscilloscope), no controls — a fullscreen page-background '
+                             'wallpaper that plays the music and resizes with the window.')
+    parser.add_argument('--earwax', dest='earwax', action='store_true', default=False,
+                        help='HTML player loads with the earwax headphone FX on (FFmpeg '
+                             'af_earwax 32-tap stereo crossfeed). Switch live via the 🎧 '
+                             'dropdown / A key (off/earwax/soundfield).')
+    parser.add_argument('--sf', dest='sf', action='store_true', default=False,
+                        help='HTML player loads with the soundfield headphone FX on (the '
+                             'head-shadow + ITD + FIR spatializer). Overrides --earwax for '
+                             'the on-load default.')
     parser.add_argument('--preserve', dest='preserve', type=str, default='',
                         help='Comma-separated 1-based instrument numbers stored UNCOMPRESSED '
                              '(raw int8, no VQ quantization) for perfect quality — e.g. '
@@ -12684,6 +14457,12 @@ def main():
                         action=argparse.BooleanOptionalAction, default=None,
                         help="FAT4X harmonic exciter on master output. "
                              "Default: ON (kept ON even under --max-compat — it's cheap).")
+    parser.add_argument('--no-filters', '--nofilters', dest='no_filters',
+                        action='store_true', default=False,
+                        help="Force the IT resonant filter (it2play 2-pole LPF) OFF. The filter now "
+                             "defaults ON only for --png (the small PNG shader affords more FIR taps) "
+                             "and OFF for non-PNG builds (the tap-limited FIR sounds worse than dry, "
+                             "e.g. JEFF93.IT). This flag forces it off in any mode.")
     parser.add_argument('--no-dsp', dest='no_dsp', action='store_true', default=False,
                         help="MASTER SWITCH: disable ALL DSP effect processing in the output "
                              "shaders (3D surround, FAT4X exciter, PhatBass; velvet/comb reverb "
@@ -12700,7 +14479,7 @@ def main():
                              "resolution but slower compile. Default: 1024 (or 128 if "
                              "--max-compat without override).")
     parser.add_argument('--max-compat', action='store_true', default=False,
-                        help='[NO-OP — max-compat is now the DEFAULT in v1.40+ (current: v1.75)] '
+                        help='[NO-OP — max-compat is now the DEFAULT in v1.40+ (current: v1.8)] '
                              'This flag previously enabled compatibility mode '
                              'for problematic GPUs/drivers (Windows + Firefox + '
                              'NVIDIA, etc.). The compat preset (--resampler '
@@ -12731,6 +14510,34 @@ def main():
             sys.exit(0)
     args = parser.parse_args()
 
+    # ── No-extension convenience: `mod_player.py NAME` with no .it/.xm/.s3m/.mod
+    # extension → scan for all four types and build each one that exists.
+    _KNOWN_EXTS = ('.it', '.xm', '.s3m', '.mod')
+    if not args.modfile.lower().endswith(_KNOWN_EXTS):
+        _scan = []; _seen_inodes = set()
+        for _ext in _KNOWN_EXTS:
+            for _cand in (args.modfile + _ext, args.modfile + _ext.upper()):
+                try:
+                    _st = os.stat(_cand)
+                except OSError:
+                    continue
+                _key = (_st.st_dev, _st.st_ino)   # dedupe case-variants on case-insensitive FS
+                if _key not in _seen_inodes:
+                    _seen_inodes.add(_key); _scan.append(_cand)
+        if len(_scan) == 1:
+            print(f"   🔎 No extension given — building {_scan[0]}")
+            args.modfile = _scan[0]
+        elif len(_scan) > 1:
+            import subprocess as _sp
+            print(f"   🔎 No extension given — found {len(_scan)}: {', '.join(_scan)} — building each")
+            _rest = [a for a in sys.argv[1:] if a != args.modfile]
+            _rc = 0
+            for _f in _scan:
+                print(f"\n═══════════════════ {_f} ═══════════════════")
+                _rc = _sp.run([sys.executable, __file__, _f] + _rest).returncode or _rc
+            sys.exit(_rc)
+        # else: no matches → fall through (literal file may exist, or normal not-found error)
+
     # --viz default depends on the data path: non-PNG (embedded) builds — the
     # GPU-constrained shadertoy.com publish target — default to viz 0 (the
     # lightweight Sun Rays scene, no raymarch); --png builds keep the richer
@@ -12755,8 +14562,32 @@ def main():
     # which kills high-channel XM files (e.g. maxmlism.xm @ 30ch) before they
     # even load. Drops a little drum crispness; trades for build that runs.
     if args.use_png:
+        # --png: ultra VQ (near-transparent), repackaged into the PNG; raw-perc
+        # off. NOTE: storing ALL samples raw (no VQ) overflows the ANGLE
+        # "declared private variables" limit in the Sound tab on many GPUs — each
+        # raw sample adds decode sites to the giant getChannelOutput function — so
+        # VQ is the safe default. Use --preserve <list> to keep specific samples
+        # bit-exact raw (rest VQ); that's also the lever for huge modules
+        # (radix-yuki 15 MB) to fit under the 4 MB PNG cap.
         args.bitrate = 'ultra'
         args.raw_perc = False
+        # --sf (soundfield spatializer) is the DEFAULT headphone FX for --png
+        # players (user can switch to off/earwax live via the 🎧 dropdown or 'A').
+        if not args.earwax:
+            args.sf = True
+        args.png_raw_all = False
+        if '--vec-dim' not in sys.argv:
+            args.vec_dim = 2        # highest-fidelity VQ tier (lighter than vec-dim 8 → fits)
+        if '--no-rvq2' not in sys.argv:
+            args.no_rvq2 = False    # keep RVQ2 (2nd residual stage adds ~4 dB SNR = cleaner)
+        # The 3D-surround + PhatBass DSP overflows the ANGLE "declared private
+        # variables" limit in the Sound tab on stricter GPUs (worst at high
+        # channel counts — skyscraper has 16). Default --png to DSP-OFF so it
+        # compiles everywhere; opt back in with --surround / --phatbass / --fat4x
+        # (or --dsp) if your GPU has the headroom.
+        if not any(_x in sys.argv for _x in ('--surround','--no-surround','--phatbass',
+                   '--no-phatbass','--fat4x','--no-fat4x','--dsp','--no-dsp')):
+            args.no_dsp = True
 
     # ── NNA --png fast path (IT) ──────────────────────────────────────────────
     # IT files with --png get the per-voice NNA blob build: emit per-tick stream
@@ -12770,6 +14601,36 @@ def main():
         print(f"🎛️  NNA --png build (IT): {args.modfile} → {_nbase}_shadertoy.json")
         _bnna.build_nna(args.modfile, _nbase)
         print(f"   ✅ {_nbase}_shadertoy.json   ← ShaderToy ▸ Import")
+        # Standalone HTML player: bundle the REAL shadertoy.com renderer + this
+        # shader — the SAME new player the S3M/XM --png path emits (your v1.8
+        # visualizer, oscilloscope, solo, …), NOT the old hand-rolled tracker
+        # (create_fixed_player_html). build_nna's json is the {ver,renderpass,
+        # flags,info} import descriptor with the NNA PNG embedded as base64, so
+        # the player is fully self-contained. NOTE: this runs the GLSL NNA replay
+        # (approximate audio for NNA-heavy IT) — same engine as the ShaderToy
+        # import; the ear-correct JS engine is a separate (old-player) path.
+        try:
+            import json as _json_it
+            with open(f"{_nbase}_shadertoy.json") as _jf_it:
+                _shader_it = _json_it.load(_jf_it)
+            # --background: emit ONLY the viz-only fullscreen wallpaper (no player
+            # UI), exactly like the S3M/XM --png path. emit_player(background=True)
+            # turns the Image pass into a _VizScene-only output.
+            _bg_only_it = getattr(args, 'background', False)
+            _out_html_it = f"{_nbase}_background.html" if _bg_only_it else f"{_nbase}_player.html"
+            emit_player_from_blob(_shader_it, _out_html_it,
+                                  assets_base="shadertoy.com/assets/",
+                                  title=f"{_nbase} — MOD2GLSL", background=_bg_only_it,
+                                  fx_mode=(2 if getattr(args,'sf',False) else 1 if getattr(args,'earwax',False) else 0))
+            if _bg_only_it:
+                print(f"   ✅ {_nbase}_background.html   (viz-only fullscreen wallpaper)")
+            else:
+                print(f"   ✅ {_nbase}_player.html   (self-contained, real shadertoy renderer — open in a browser)")
+        except Exception as _e_html:
+            import traceback as _tb_it
+            print(f"   ⚠️  HTML player emit skipped ({_e_html}) — ShaderToy json still OK")
+            if os.environ.get('NOISY'):
+                _tb_it.print_exc()
         sys.exit(0)
 
     # args.emit_json defaults True; pass --no-json to suppress JSON output.
@@ -12965,6 +14826,37 @@ def main():
             'channel_settings': list(getattr(s3m, 'channel_settings', []) or []),
             'is_s3m': True
         })()
+        # ── Resolve S3M S8x (set-pan) into per-channel pan ───────────────────
+        # MikIT applies S8x set-pan, but the static channelPan[] used only the
+        # channel-settings L/R defaults (S8 was ignored) → per-voice L/R imbalance
+        # vs C++ MikIT. Resolve each channel's pan from its FIRST S8 (S command =
+        # eff 19, param 0x8X) via the (now S8-aware) mikit_engine, and store it in
+        # mod.channel_pan (0..64) so the channelPan[] bake emits it. NOTE: constant
+        # per channel — mid-song S8 pan automation is NOT captured by a static array.
+        try:
+            import mikit_engine as _me_pan
+            _plp = _me_pan.load_s3m_native(args.modfile)
+            _nchp = mod.num_channels
+            _cpan = [None] * _nchp
+            for _cip in range(_nchp):
+                _hit = False
+                for _ordp in _plp.orders:
+                    if _ordp >= len(_plp.patterns): continue
+                    for _rowp in _plp.patterns[_ordp]:
+                        _cl = _rowp[_cip] if _cip < len(_rowp) else None
+                        if _cl is not None and _cl.has_eff and _cl.eff == 19 and (_cl.par >> 4) == 0x8:
+                            _cpan[_cip] = ((_cl.par & 0xF) * 64 + 7) // 15
+                            _hit = True; break
+                    if _hit: break
+            _csp = mod.channel_settings or []
+            for _cip in range(_nchp):
+                if _cpan[_cip] is None:   # no S8 → channel-settings L/R default
+                    _cv = (_csp[_cip] & 0x7F) if _cip < len(_csp) else 8
+                    _cpan[_cip] = 0 if _cv < 8 else (64 if _cv < 16 else 32)
+            mod.channel_pan = _cpan
+            print(f"   ✓ S3M S8 set-pan → channelPan ({sum(1 for v in _cpan if v not in (0,32,64))}/{_nchp} fine pans)")
+        except Exception as _pe:
+            print(f"   ⚠ S3M S8 pan resolution skipped ({_pe})")
     elif fmt == 'MOD':
         mod = MODFile(args.modfile)
         mod.is_s3m = False
@@ -12977,114 +14869,9 @@ def main():
         # IT-packed samples, so downstream treats it exactly like a MOD
         # (is_s3m=False → no S3M re-remap; pattern-player path, no timeline
         # DSP). Phase-1: envelopes/NNA/filters/c5speed-precision dropped.
-        import os as _os_it, sys as _sys_it
-        _here_it = _os_it.path.dirname(_os_it.path.abspath(__file__))
-        if _here_it not in _sys_it.path:
-            _sys_it.path.insert(0, _here_it)
-        import mod_player_archived as _mp_it
-        it = _mp_it.ITFile(args.modfile)
-        print(f"🎵 {it.title}")
-        print(f"   Patterns: {it.num_patterns}, Channels: {it.num_channels}")
-        print(f"   Speed: {it.initial_speed}, Tempo: {it.initial_tempo}")
-        print("   ⚠️  IT support (reused from mod_player.py): IT-packed "
-              "samples decoded, effects IT→MOD at parse.")
-        mod = type('obj', (object,), {
-            'title':          it.title,
-            'samples':        it.samples,
-            'num_patterns':   it.num_patterns,
-            'song_length':    len(it.song_positions),
-            'song_positions': it.song_positions,
-            'orders':         it.song_positions,
-            'patterns':       it.patterns,          # MOD-numbered effects
-            'num_channels':   it.num_channels,
-            'initial_speed':  it.initial_speed,
-            'initial_tempo':  it.initial_tempo,
-            'channel_settings': list(getattr(it, 'channel_settings', []) or []),
-            'channel_pan':    list(getattr(it, 'channel_pan', []) or []),   # IT 0..64 per-channel pan (was dropped → all-left bug)
-            'is_s3m':         False,
-            'is_it':          True,
-        })()
-        # Attach the inst_table so the NNA envelope-follower port can build
-        # PER-INSTRUMENT env arrays (not per-sample). IT envelopes are an
-        # instrument property; ITFile's per-sample env_pts is a lossy
-        # collapse (one sample referenced by N instruments → N different
-        # envelopes; ITFile keeps only one). 34/99 jeff.it instruments
-        # have note_to_sample[60] != instrument_index → sample-indexed
-        # arrays would read the WRONG env. Also lets us honor env_on
-        # per-instrument (e.g. jeff.it inst 1 env_on=False → no wooump).
-        mod._it_inst_table = getattr(it, 'inst_table', None)
-        # ── Variable-row pattern support (jeff.it 128-row root-cause fix) ─
-        # ITFile keeps the legacy 64-row truncated form in `it.patterns`
-        # (every MOD-shaped consumer needs fixed 64-row). IT files whose
-        # patterns are NOT 64 rows (jeff.it: 128/120/112/80/32-row) had
-        # rows 64+ silently DELETED and short patterns padded with silence
-        # → the whole song desynced from the first pattern ("keys all over
-        # the keyboard", ~0 corr vs the HTML oracle). Fix WITHOUT touching
-        # the 64-row storage stride / getNote / VQ-crunch / GLSL: SPLIT each
-        # >64-row pattern into ceil(R/64) sub-patterns of ≤64 rows and
-        # EXPAND the order list so they play back-to-back. Any sub-pattern
-        # with <64 real rows (a short final chunk, or a natively-short
-        # pattern) gets a synthetic MOD pattern-break (effect 0x0D) on its
-        # last real row in an effect-free channel — Dxx is already a
-        # first-class effect for the rowStartTick walker, the
-        # patStartRow/patRowOffset builder AND the GLSL, so the engine
-        # advances after exactly the real row count with ZERO downstream
-        # changes. Safe for jeff.it (its long patterns carry no B/D/loop —
-        # verified); a >64-row pattern containing its own B/D is flagged.
-        _PF = getattr(it, 'patterns_full', None)
-        _PR = getattr(it, 'pattern_rows', None)
-        if _PF and _PR and any(r > 64 or r < 64 for r in _PR):
-            _nch = mod.num_channels
-            _new_pats = []
-            _map = []          # orig pattern idx -> [sub-pattern indices]
-            _n_split = _n_brk = _n_clobber = _n_bd = 0
-            for _p in range(len(_PF)):
-                _cells = _PF[_p]
-                _R = len(_cells)
-                _chunks = [ _cells[_b:_b+64] for _b in range(0, max(1, _R), 64) ]
-                if _R > 64:
-                    _n_split += 1
-                    for _row in _cells:                       # mid-pattern B/D?
-                        for _cl in _row:
-                            if _cl.get('effect', 0) in (0x0B, 0x0D):
-                                _n_bd += 1
-                _idxs = []
-                for _seg in _chunks:
-                    _sr = len(_seg)
-                    _sub = [[dict(_cl) for _cl in _row] for _row in _seg]
-                    if 0 < _sr < 64:                          # force advance
-                        _last = _sub[_sr - 1]
-                        _free = next((_c for _c in range(min(_nch, len(_last)))
-                                      if _last[_c].get('effect', 0) == 0), None)
-                        if _free is None:
-                            _free = 0
-                            _n_clobber += 1
-                        if _free < len(_last):
-                            _last[_free]['effect'] = 0x0D     # MOD pattern break
-                            _last[_free]['param']  = 0
-                            _n_brk += 1
-                    _idxs.append(len(_new_pats))
-                    _new_pats.append(_sub)
-                _map.append(_idxs)
-            _old_ord = list(mod.song_positions)
-            _new_ord = []
-            for _e in _old_ord:
-                if isinstance(_e, int) and 0 <= _e < len(_map):
-                    _new_ord.extend(_map[_e])
-                else:
-                    _new_ord.append(_e)                       # 254/255 end-marks
-            mod.patterns      = _new_pats
-            mod.num_patterns  = len(_new_pats)
-            mod.song_positions = _new_ord
-            mod.orders         = _new_ord
-            mod.song_length    = len(_new_ord)
-            _q(f"   ✓ Variable-row split: {_n_split} >64-row patterns → "
-                  f"{len(_new_pats)} sub-patterns, order {len(_old_ord)}→"
-                  f"{len(_new_ord)}, {_n_brk} synthetic breaks"
-                  + (f", ⚠{_n_bd} mid-pattern B/D in long patterns (split "
-                     f"may mis-time those)" if _n_bd else "")
-                  + (f", ⚠{_n_clobber} rows had no free effect slot"
-                     if _n_clobber else ""))
+        # Load + variable-row split → see _build_it_mod (single source of truth,
+        # shared with the NNA --png fast path that emits the HTML player).
+        mod, it = _build_it_mod(args.modfile)
         # ── MOD+ pattern-player path (the budget-viable IT route) ───────
         # The NNA timeline (load_it_native→tlGetOutput) was PROVEN an
         # architectural dead-end for loop/envelope-heavy IT (jeff.it):
@@ -13620,7 +15407,15 @@ def main():
             # WHOLE song — no per-part HTMLs (the part children ran --no-html).
             print(f"\n🌐 full-song HTML player (entire song, single file):")
             try:
-                _emit_html_player(mod, _base + "_player.html", args.downsample, args.vec_dim)
+                # HTML player ALWAYS uses the real emit_player engine (gzip ShaderToy
+                # renderer + visualizer) running the actual GLSL, never the archived
+                # softsynth — via a one-shot --png full-song child (PNG-packed → fits
+                # one shader, plays the whole song). Inline ShaderToy part-tabs above
+                # are untouched. Falls back to the archived player only if --png fails.
+                _ok = _emit_fullsong_png_player(_base, _passthru, getattr(args, 'background', False))
+                if not _ok:
+                    print(f"   ⚠️  --png full-song player failed (PNG cap?) — archived fallback")
+                    _emit_html_player(mod, _base + "_player.html", args.downsample, args.vec_dim)
                 print(f"      {_base}_player.html   (all positions 0-{_last} — open in a browser)")
             except Exception as _he:
                 print(f"   ✗ full-song HTML generation failed: {_he}")
@@ -14148,15 +15943,18 @@ Generated by MOD2GLSL
     # inside its own module. (Local current create_fixed_player_html kept for
     # reference but no longer the default path.)
     html_file = base_name + "_player.html"
-    if getattr(args, 'no_html', False):
-        # Auto-split GLSL child — the parent emits the single full-song HTML.
-        print("   ⤷ skipping HTML (auto-split child; parent emits one full-song player)")
-    else:
-        _emit_html_player(mod, html_file, args.downsample, args.vec_dim)
+    # The self-contained ShaderToy-engine player is emitted later (in the JSON
+    # block, where the full shader object exists) AS html_file — it REPLACES the
+    # old hand-rolled HTML player route. Auto-split children skip it (the parent
+    # emits one full-song player).
+    _emit_player = not bool(getattr(args, 'no_html', False))
+    if not _emit_player:
+        print("   ⤷ skipping player (auto-split child; parent emits the full-song player)")
 
     # ShaderToy Common tab: VQ-encoded via embedded vq_encoder_v2 (default),
     # or legacy PNG-loaded Common via create_shadertoy_glsl when --png.
     glsl_common_file = base_name + "_shadertoy_common.glsl"
+    _rst_ok = False   # True once tempo-aware rowStartTime[] is injected into Common
     if args.use_png:
         print(f"\n\U0001f5bc\ufe0f  --png: skipping VQ encoder, generating PNG-loaded Common")
         # Legacy Common is generated below by create_shadertoy_glsl into the
@@ -14184,12 +15982,21 @@ Generated by MOD2GLSL
             _pos_init_spd = int(getattr(mod, 'initial_speed', 6) or 6)
             _pos_init_tmp = int(getattr(mod, 'initial_tempo', 125) or 125)
 
+            # Tempo-aware per-row absolute-start-time table (variable BPM / Txx).
+            # Populated INSIDE the row walk below so it shares the encoder's exact
+            # row indexing (same speed + Dxx/Bxx break handling). getPosition then
+            # searches real seconds instead of constant-rate ticks. At fixed BPM
+            # every entry equals rowStartTick/TICKS_PER_SEC → no behaviour change.
+            _captured_row_start_times = []
+
             def _bpm_aware_compute_row_speed_table(_mod):
                 speed = _pos_init_spd  # honours --positions carryover (was hardcoded 6)
                 bpm   = _pos_init_tmp  # honours --positions carryover (was hardcoded 125)
                 rowSpeed = []
                 cumF = 0.0
                 rowStartTickF = [0.0]
+                _timeF = 0.0            # cumulative ABSOLUTE seconds (tempo-aware)
+                _rowStartTimeF = [0.0]  # rowStartTime[r] = second at which row r starts
                 bpm_changes = False
                 # ── Stride detection ───────────────────────────────────────────
                 # _XMITtoVQAdapter packs cells as 5 bytes (4 MOD bytes + vol_col);
@@ -14238,10 +16045,18 @@ Generated by MOD2GLSL
                         # limitation: TICKS_PER_SEC would need to vary per row).
                         cumF += speed
                         rowStartTickF.append(cumF)
+                        # Tempo-aware ABSOLUTE seconds for THIS row: one tick lasts
+                        # 1/(bpm*2/5) s and the row has `speed` ticks. A mid-song
+                        # Txx/Fxx tempo change alters row duration HERE, where a
+                        # single constant TICKS_PER_SEC cannot. Collapses exactly to
+                        # rowStartTick/TICKS_PER_SEC when BPM is fixed → no regression.
+                        _timeF += (speed / (bpm * 2.0 / 5.0)) if bpm > 0 else 0.0
+                        _rowStartTimeF.append(_timeF)
                         if broke:
                             break
                 # Round cumulative (not per-row) → max drift 0.5 tick = 10ms
                 rowStartTick = [int(round(t)) for t in rowStartTickF]
+                _captured_row_start_times[:] = _rowStartTimeF
                 return rowSpeed, rowStartTick, bpm_changes
             _vqmod.compute_row_speed_table = _bpm_aware_compute_row_speed_table
 
@@ -14743,6 +16558,27 @@ Generated by MOD2GLSL
                         raise
             finally:
                 _vqmod.MODFile = _saved_modfile
+            # ── S3M S8 set-pan → channelPan[] (VQ / --png Common) ────────────
+            # The VQ encoder built channelPan[] from the coarse channel_settings
+            # (hard L/R), ignoring the S8-resolved mod.channel_pan. Rewrite the
+            # line with the fine S8 pans so the --png Common matches C++ MikIT.
+            # (The embedded path already uses mod.channel_pan directly.)
+            if getattr(mod, 'is_s3m', False) and getattr(mod, 'channel_pan', None):
+                import re as _re_cpan
+                _cpv = mod.channel_pan
+                _cpvals = ", ".join(f"{(_cpv[i]/64.0 if i < len(_cpv) else 0.5):.4f}" for i in range(32))
+                _cpnew = f"const float channelPan[32] = float[]({_cpvals});"
+                try:
+                    _ct = open(glsl_common_file).read()
+                    _ct2 = _re_cpan.sub(r"const float channelPan\[32\] = float\[\]\([^)]*\);",
+                                        _cpnew, _ct, count=1)
+                    if _ct2 != _ct:
+                        open(glsl_common_file, 'w').write(_ct2)
+                        print("   ✓ S3M S8 channelPan[] rewritten in VQ Common (matches C++ pan)")
+                    else:
+                        print("   ⚠ channelPan[] anchor not found in VQ Common")
+                except Exception as _ce:
+                    print(f"   ⚠ channelPan[] rewrite failed: {_ce}")
             # Stamp visualizer name into the b64-emitted Common header so it
             # matches the other 3 tabs.
             _viz_names = {
@@ -14776,7 +16612,7 @@ Generated by MOD2GLSL
                 # glsl_state_dump.py / sound_exec.py inject it themselves.
                 _ct = _ct.replace(
                     "GLSL (The Last) MOD Player v1.42 (c) 2026 Orblivius",
-                    "GLSL (The Last) MOD Player v1.75 (c) 2026 Orblivius", 1)
+                    "GLSL (The Last) MOD Player v1.8 (c) 2026 Orblivius", 1)
                 _ct = _ct.replace("   COMMON TAB\n", f"   COMMON TAB\n   Visualizer: {_vname}\n", 1)
 
                 # Inject visualizer note-synth helpers (waveType[] + _synthWave).
@@ -14884,6 +16720,54 @@ Generated by MOD2GLSL
                     1
                 )
 
+                # ── Tempo-aware getPosition: search baked rowStartTime[] seconds ──
+                # The constant-TICKS_PER_SEC getPosition maps time→row at ONE rate,
+                # so songs with mid-song Txx tempo changes drift (skyscraper.s3m
+                # modulates BPM 98↔162 → measured ~8s drift + flattened groove vs
+                # C++ MikIT). Swap the integer-tick binary search for an
+                # absolute-seconds search over a baked rowStartTime[] table.
+                # rowSpeed stays RAW (fetchTick) so per-tick effects are unchanged,
+                # and at constant BPM rowStartTime[r] == fetchTick(r)/TICKS_PER_SEC
+                # exactly → byte-for-byte no-op for every constant-tempo song.
+                import re as _re_rst
+                _m_nsr = _re_rst.search(r'#define\s+NUM_SONG_ROWS\s+(\d+)', _ct)
+                if (_captured_row_start_times and _m_nsr
+                        and 'const float rowStartTime[' not in _ct
+                        and 'float totalTickF = loopedTime * TICKS_PER_SEC;' in _ct):
+                    _nsr = int(_m_nsr.group(1))
+                    _rst = list(_captured_row_start_times)
+                    while len(_rst) < _nsr + 1:            # pad if walk fell short
+                        _rst.append(_rst[-1] if _rst else 0.0)
+                    _rst = _rst[:_nsr + 1]
+                    _rst_str = ', '.join(f'{t:.6f}' for t in _rst)
+                    _rst_decl = (
+                        "// Tempo-aware absolute row-start times (seconds). Tracks variable\n"
+                        "// BPM/Txx; equals rowStartTick/TICKS_PER_SEC when BPM is constant.\n"
+                        f"const float rowStartTime[{len(_rst)}] = float[]({_rst_str});\n\n")
+                    _ct = _ct.replace("Position getPosition(float time) {",
+                                      _rst_decl + "Position getPosition(float time) {", 1)
+                    _ct = _ct.replace(
+                        "    float songDuration = float(TOTAL_TICKS) / TICKS_PER_SEC;\n"
+                        "    float loopedTime = mod(time, songDuration);\n"
+                        "    float totalTickF = loopedTime * TICKS_PER_SEC;\n",
+                        "    float songDuration = rowStartTime[NUM_SONG_ROWS];  // tempo-aware total\n"
+                        "    float loopedTime = mod(time, songDuration);\n", 1)
+                    _ct = _ct.replace(
+                        "        if (float(fetchTick(mid)) <= totalTickF) lo = mid;",
+                        "        if (rowStartTime[mid] <= loopedTime) lo = mid;", 1)
+                    _ct = _ct.replace(
+                        "    pos.tick       = totalTickF - float(rowTick);\n"
+                        "    pos.rowTime    = float(rowSpeed) / TICKS_PER_SEC;",
+                        "    float _rstart = rowStartTime[globalRow];\n"
+                        "    float _rdur   = max(rowStartTime[globalRow + 1] - _rstart, 1e-9);\n"
+                        "    pos.tick       = (loopedTime - _rstart) * float(rowSpeed) / _rdur;\n"
+                        "    pos.rowTime    = _rdur;", 1)
+                    try:
+                        _q("   ⏱️  Tempo-aware rowStartTime[] timeline injected (variable BPM/Txx)")
+                    except Exception:
+                        print("   ⏱️  Tempo-aware rowStartTime[] timeline injected")
+                    _rst_ok = True
+
                 # Override FX flags hardcoded by the VQ encoder.
                 # The encoder bakes `enableFAT = true` and `enable3D = true`
                 # into its emitted Common file regardless of CLI flags. The
@@ -14917,6 +16801,11 @@ Generated by MOD2GLSL
                         'const bool  enableFAT     = true;',
                         'const bool  enableFAT     = false;', 1
                     )
+                # --surround (3D surround) is honored again now that its channel
+                # loop (~line 4046) is DE-UNROLLED. That loop was the lone un-de-
+                # unrolled one, so ANGLE unrolled it into ~2N inlined getChannelOutput
+                # copies and overflowed private-vars (dead loader). With the sentinel
+                # guard it stays a single rolled body. Disable only on --no-surround.
                 if _no_surround:
                     _ct = _ct.replace(
                         'const bool  enable3D      = true;',
@@ -15441,6 +17330,7 @@ Generated by MOD2GLSL
                                      'extra_pragmas': getattr(args, '_compat_extra_pragmas', False),
                                      'phatbass_mode': args.phatbass_mode,
                                      'use_png':       _png_mode,
+                                     'simplegui':     getattr(args, 'simplegui', False),
                                  })
             glsl_common_file = _fb_glsl.replace('.glsl', '_common.glsl')
 
@@ -15462,6 +17352,7 @@ Generated by MOD2GLSL
                              'extra_pragmas': getattr(args, '_compat_extra_pragmas', False),
                              'phatbass_mode': args.phatbass_mode,
                              'use_png':       _png_mode,
+                             'simplegui':     getattr(args, 'simplegui', False),
                          })
     import os as _os2
     # create_shadertoy_glsl writes: _tmp_tabs_shadertoy_common/sound/image/bufferA.glsl
@@ -16264,6 +18155,37 @@ Generated by MOD2GLSL
                           f"(anchor×{_dq_an} exp 1, _Cf×{_dq_cfn} exp 3) "
                           f"— high-note pitch still 12-bit quantized")
 
+                # ── Tempo-aware sample-position integrator (variable BPM/Txx) ──
+                # _fSamplePosAcc integrates C·_dt/period per tick with _dt =
+                # 1/TICKS_PER_SEC (constant). getPosition's pos.tick now advances
+                # at the REAL (variable) tick rate, so a constant _dt would bend
+                # playback pitch during tempo modulation (flat below bpm 125,
+                # sharp above). Make _dt each row's real tick duration
+                # = (rowStartTime[sgr+1]-rowStartTime[sgr]) / speed; equals
+                # 1/TICKS_PER_SEC at constant BPM → no regression. Gated on the
+                # rowStartTime[] table having been injected into the Common tab.
+                if _rst_ok:
+                    _d1 = _sound_src.count('float _dt = 1.0 / TICKS_PER_SEC;')
+                    _d2 = _sound_src.count('float _dt  = 1.0 / TICKS_PER_SEC;')
+                    _d3 = _sound_src.count('float _dt   = 1.0 / TICKS_PER_SEC;')
+                    if _d1 == 1 and _d2 == 1 and _d3 == 1:
+                        _sound_src = _sound_src.replace(
+                            '        float _dt = 1.0 / TICKS_PER_SEC;',
+                            '        float _dt = (rowStartTime[_sgrTrig + 1] - rowStartTime[_sgrTrig])\n'
+                            '                    / float(max(1, _trigFull));', 1)
+                        _sound_src = _sound_src.replace(
+                            '                float _dt  = 1.0 / TICKS_PER_SEC;',
+                            '                float _dt  = (rowStartTime[_sgr + 1] - rowStartTime[_sgr])\n'
+                            '                             / float(max(1, _full + 1));', 1)
+                        _sound_src = _sound_src.replace(
+                            '        float _dt   = 1.0 / TICKS_PER_SEC;',
+                            '        int _sgrCur = patTickOffset[pos.songPos] + (pos.row - patStartRow[pos.songPos]);\n'
+                            '        float _dt   = (rowStartTime[_sgrCur + 1] - rowStartTime[_sgrCur])\n'
+                            '                      / float(max(1, fetchTick(_sgrCur + 1) - fetchTick(_sgrCur)));', 1)
+                        _q("   ⏱️  Sample-position integrator tempo-aware (3 _dt → real tick duration)")
+                    else:
+                        _q(f"   ⚠️  tempo _dt fix skipped (sites {_d1}/{_d2}/{_d3}, want 1/1/1)")
+
                 # ── Tone-porta current-row target fix (porta-lead declick) ──
                 # The forward scan rebuilds pitch trigger→current, overwriting
                 # targetPeriod with EACH intermediate row's tone-porta target.
@@ -16553,12 +18475,22 @@ Generated by MOD2GLSL
                 # resonance rings longer than K → softer peak vs the oracle.
                 _itf_def_anchor = ("#ifndef AA_MAX_TAPS\n#define AA_MAX_TAPS 4"
                                    "\n#endif\n")
-                _itf_defs = (_itf_def_anchor
-                             + "#ifndef IT_FILTER\n#define IT_FILTER 1\n#endif\n"
-                             + "#ifndef IT_FILT_TAPS\n#define IT_FILT_TAPS 32"
-                               "\n#endif\n")
+                # The #defines now live WITH the apply block, anchored to the
+                # always-present getChannelOutput "Anti-click ramps" marker — NOT
+                # the --aa block's AA_MAX_TAPS (which is absent unless --aa is
+                # passed, so the def-anchor matched 0× and the filter silently
+                # never injected). Default taps 32→16 to fit the non-png ANGLE
+                # private-variable budget (this FIR is inlined ~60×/sample into
+                # getChannelOutput): `#define IT_FILT_TAPS 32` for sharper
+                # resonance on strong GPUs, or 8 if a weak GPU hits CONTEXT_LOST.
                 _itf_anchor = "    // ── Anti-click ramps ──"
                 _itf_block = (
+                    # Default: filter ON only for --png (the small PNG-packed shader can
+                    # afford a longer FIR tail); OFF for non-PNG (the tap-limited FIR sounds
+                    # worse than dry, e.g. JEFF93.IT). --no-filters forces OFF in any mode.
+                    # Use sys.argv (args.use_png is munged False here, see 14480/18973).
+                    f"#ifndef IT_FILTER\n#define IT_FILTER {1 if (('--png' in sys.argv) and not getattr(args,'no_filters',False)) else 0}\n#endif\n"
+                    "#ifndef IT_FILT_TAPS\n#define IT_FILT_TAPS 16\n#endif\n"
                     "#if IT_FILTER\n"
                     "    // it2play 2-pole resonant LPF — stateless truncated\n"
                     "    // impulse-response FIR (see generator note). Inert\n"
@@ -16577,6 +18509,8 @@ Generated by MOD2GLSL
                     "        float _fC = 1.0 - _fA - _fB;\n"
                     "        float _fstride = freq / (44100.0 * float(max(1,"
                     " smp.bwFactor)));\n"
+                    "        int _absLoopLen = abs(smp.loopLen);   // v1.666"
+                    " getChannelOutput exposes no _absLoopLen local here\n"
                     "        float _fy1 = 0.0, _fy2 = 0.0, _facc = 0.0;\n"
                     "        for (int _fk = 0; _fk < IT_FILT_TAPS; _fk++) {\n"
                     "            float _fh = ((_fk == 0) ? _fA : 0.0) +"
@@ -16598,20 +18532,21 @@ Generated by MOD2GLSL
                     "    }\n"
                     "#endif\n"
                     + _itf_anchor)
-                _itf_dn = _sound_src.count(_itf_def_anchor)
                 _itf_an = _sound_src.count(_itf_anchor)
-                if _itf_dn >= 1 and _itf_an == 1:
-                    _sound_src = _sound_src.replace(
-                        _itf_def_anchor, _itf_defs, 1)
+                # Gate on is_it: the apply block reads smp.itCut/itRes, which exist
+                # ONLY in the is_it-gated grown SampleInfo — injecting it for
+                # S3M/MOD/XM would reference missing fields → compile error. The
+                # anchor lives in getChannelOutput, so this targets the non-png
+                # pattern-player path; the --png IT NNA engine guts that fn (×0).
+                if getattr(mod, 'is_it', False) and _itf_an == 1:
                     _sound_src = _sound_src.replace(
                         _itf_anchor, _itf_block, 1)
-                    _q(f"   ✓ IT resonant filter injected (it2play 2-pole, "
-                          f"stateless K=IT_FILT_TAPS FIR; ON by default, "
-                          f"#define IT_FILTER 0 to skip; inert for non-filter "
-                          f"samples)")
-                else:
-                    print(f"   ⚠ IT filter skipped (def-anchor×{_itf_dn} "
-                          f"apply-anchor×{_itf_an}; expected ≥1,1) — "
+                    print(f"   ✓ IT resonant filter injected (it2play 2-pole, "
+                          f"stateless K=IT_FILT_TAPS=16 FIR; #define IT_FILTER 0 "
+                          f"to skip; inert for non-filter samples)")
+                elif getattr(mod, 'is_it', False):
+                    print(f"   ⚠ IT filter not injected (getChannelOutput "
+                          f"anchor×{_itf_an}; the --png NNA path has none) — "
                           f"playback unchanged")
 
                 # ── MOD+ : per-sample VOL ENVELOPE in the pattern-player ──
@@ -16856,6 +18791,32 @@ Generated by MOD2GLSL
                         print(f"   ⚠ XM dynamic-pan mix patch skipped "
                               f"(panR anchor ×{_pm_n}, expected 1) — "
                               f"static channelPan[] retained")
+
+                # ── S3M dynamic panning (S8x used as per-row AUTO-PAN) ──────────
+                # Many S3M tunes ping-pong S8x set-pan every few rows for a stereo
+                # auto-pan effect. The static channelPan[] baked only each channel's
+                # FIRST S8 → the movement was lost. Back-walk for the most-recent
+                # S8x (S→eff 0xE, param 0x8X) within 64 rows; fall back to the baked
+                # first-S8 pan (channelPan[ch]) for channels that set pan once.
+                if getattr(mod, 'is_s3m', False):
+                    _s3p_old = "float panR = 0.25 + 0.5 * channelPan[ch];"
+                    _s3p_new = (
+                        "float _s3mPan = channelPan[ch];\n"
+                        "        { int _spR = pos.row, _spP = pos.songPos;\n"
+                        "          for (int _spb = 0; _spb < (rowTime < 0. ? 99999 : 18); _spb++) {\n"
+                        "            Note _spn = getNote(_spP, _spR, ch);\n"
+                        "            if (_spn.effect == 0xE && (_spn.param >> 4) == 0x8) { _s3mPan = float(((_spn.param & 0xF)*64+7)/15)/64.0; break; }\n"
+                        "            _spR--;\n"
+                        "            if (_spR < 0) { if (_spP > 0) { _spP--; _spR = patStartRow[_spP] + (patRowOffset[_spP+1] - patRowOffset[_spP]) - 1; } else break; }\n"
+                        "          } }\n"
+                        "        float panR = 0.25 + 0.5 * _s3mPan;"
+                    )
+                    _s3p_n = _sound_src.count(_s3p_old)
+                    if _s3p_n == 1:
+                        _sound_src = _sound_src.replace(_s3p_old, _s3p_new, 1)
+                        _q("   ✓ S3M dynamic per-tick pan (S8 auto-pan) wired into mix")
+                    else:
+                        print(f"   ⚠ S3M pan patch anchor ×{_s3p_n} (expected 1) — static pan retained")
 
                 # ── XM key-off detection (note=97 → bit7 of instrument byte) ──
                 # Three patches needed so _itVolEnv receives keyOffEtick:
@@ -17409,6 +19370,32 @@ Generated by MOD2GLSL
                         "#define USE_EMBEDDED_DATA",
                         "#define USE_TIMELINE_DSP 0\n#define USE_EMBEDDED_DATA",
                         1)
+                # ── Segment-player bake (S3M/XM/MOD --png) ──────────────────
+                # Replace the per-sample getChannelOutput engine replay with a
+                # baked VoiceSegment timeline (mikit_engine, accurate per-tick;
+                # piecewise-linear "interpolation points"). Cuts ~91% of the
+                # Sound-shader compile. Reuses the format-agnostic tlGetOutput
+                # reader below — exactly the IT timeline path, fed for S3M/XM.
+                _seg_fmt = detect_module_format(args.modfile).lower()
+                if (_png_mode and _seg_fmt in ('s3m', 'xm', 'mod')
+                        and 'SEG_BYPASS' not in os.environ
+                        and getattr(mod, '_it_timeline_glsl', None) is None):
+                    try:
+                        import bake_segments as _bseg
+                        _seg_glsl, _seg_stats, _seg_tps = _bseg.bake_from_module(
+                            args.modfile, fmt=_seg_fmt,
+                            n_samples=max(31, len(getattr(mod, 'samples', []) or [])),
+                            quiet=True)
+                        if _seg_glsl and _seg_stats.get('num_pieces', 0) > 0:
+                            mod._it_timeline_glsl = _seg_glsl
+                            _q(f"   🎚️  segment player ({_seg_fmt}): "
+                                  f"{_seg_stats['num_pieces']} pieces "
+                                  f"({_seg_stats['bytes']//1024} KB, "
+                                  f"{_seg_stats['num_slides']} slides) — "
+                                  f"getChannelOutput replaced by timeline")
+                    except Exception as _seg_err:
+                        print(f"   ⚠ segment-player bake failed ({_seg_err}); "
+                              f"keeping pattern path")
                 _tlg = getattr(mod, '_it_timeline_glsl', None)
                 if _tlg:
                     # Bake the SampleInfo array size (mirrors the rebuild's
@@ -17420,10 +19407,29 @@ Generated by MOD2GLSL
                         "\n// ── Timeline: sum active voice segments at T (NNA"
                         " baked in by mod_player.py ITPlayer) ──\n"
                         "#if USE_TIMELINE_DSP\n"
-                        "vec2 tlGetOutput(float T) {\n"
+                        "vec2 tlGetOutput(int playSamp) {\n"
                         "    vec2 out_lr = vec2(0.0);\n"
-                        "    int tick_T = int(T * TL_TICKS_PER_SEC);\n"
+                        "    // Integer-sample timing (441 = 44100/100): float32"
+                        " playbackTime jitters\n"
+                        "    // past ~153s → click. tick + dt computed in exact"
+                        " int sample space.\n"
+                        "    int tick_T = playSamp / 441;\n"
                         "    int _nseg = TL_NUM_SEGS;\n"
+                        "    // Per-track SOLO mask (1 bit/channel). PNG header"
+                        " bytes 40-43; the\n"
+                        "    // HTML player writes it on a track-header click and"
+                        " re-bakes.\n"
+                        "    // Default -1 (all bits set) = every channel plays"
+                        " (no solo).\n"
+                        "    // SOLO (live): read the header-click flags from Buffer A\n"
+                        "    // (iChannel0) row 2 px 16+ch — the same source getChannelOutput\n"
+                        "    // uses. The old _pI32(40) PNG-header mask was static (never\n"
+                        "    // updated on click) so solo never engaged in the segment player.\n"
+                        "    int _soloMask = 0; bool _soloAny = false;\n"
+                        "    for (int _sc = 0; _sc < NUM_CHANNELS; _sc++)\n"
+                        "        if (texelFetch(iChannel0, ivec2(16 + _sc, 2), 0).r > 0.5)"
+                        " { _soloMask |= (1 << _sc); _soloAny = true; }\n"
+                        "    if (!_soloAny) _soloMask = -1;   // none soloed → all play\n"
                         "    for (int i = 0; i < _nseg; i++) {\n"
                         "        ivec4 ip = tlSegI[i];\n"
                         "        int start_tick = ip.x & 0xFFFF;\n"
@@ -17431,6 +19437,9 @@ Generated by MOD2GLSL
                         " 0xFFFF);\n"
                         "        if (start_tick > tick_T) break;\n"
                         "        if (tick_T >= end_tick) continue;\n"
+                        "        int _ch = (ip.w >> 27) & 0x1F;\n"
+                        "        if ((_soloMask & (1 << _ch)) == 0) continue;"
+                        "   // SOLO: skip muted tracks\n"
                         "        int sp0   = ip.y & 0x3FFFFF;\n"
                         "        int smIdx = (ip.y >> 22) & 0x7F;\n"
                         "        ivec4 _L = tlLoop[smIdx];\n"
@@ -17439,7 +19448,7 @@ Generated by MOD2GLSL
                         "        float _vol0 = float(ip.w & 0xFF) / 255.0;\n"
                         "        float _pan  = float((ip.w >> 8) & 0xFF) /"
                         " 255.0;\n"
-                        "        int _si = (ip.w >> 16) & 0xFFFF;\n"
+                        "        int _si = (ip.w >> 16) & 0x7FF;\n"
                         "        float _fmul = 1.0, _vdelta = 0.0;\n"
                         "        if (_si > 0) {\n"
                         "            ivec4 _sv = tlSlide[(_si - 1) >> 1];\n"
@@ -17450,10 +19459,9 @@ Generated by MOD2GLSL
                         " intBitsToFloat(_sv.z); _vdelta ="
                         " intBitsToFloat(_sv.w); }\n"
                         "        }\n"
-                        "        float seg_t0 = float(start_tick) /"
-                        " TL_TICKS_PER_SEC;\n"
-                        "        float dt = T - seg_t0;\n"
-                        "        if (dt < 0.0) continue;\n"
+                        "        int _dts = playSamp - start_tick * 441;\n"
+                        "        if (_dts < 0) continue;\n"
+                        "        float dt = float(_dts) / 44100.0;\n"
                         "        float freq = freq0 * pow(_fmul, dt *"
                         " TL_TICKS_PER_SEC);\n"
                         "        float vol  = clamp(_vol0 + _vdelta * dt *"
@@ -17473,14 +19481,32 @@ Generated by MOD2GLSL
                         "        float s = getSampleF(smp.start, fpos,"
                         " smp.smpLen, ls, le > ls ? le - ls : 0);\n"
                         "        float panR = 0.125 + 0.75 * _pan;\n"
-                        "        out_lr += s * vol * vec2(1.0 - panR,"
+                        "        // Note onset/offset ramp (32 frames @44.1kHz) —"
+                        " kills sample-restart\n"
+                        "        // and note-off clicks (MikIT no-click). Flags in"
+                        " ip.y bits 29/30;\n"
+                        "        // piece-to-piece joins inside a note are"
+                        " continuous → no ramp.\n"
+                        "        int _rf = (ip.y >> 29) & 3;\n"
+                        "        float _rmp = 1.0;\n"
+                        "        if ((_rf & 1) != 0) _rmp = min(_rmp,"
+                        " clamp(float(_dts) / 32.0, 0.0, 1.0));\n"
+                        "        if ((_rf & 2) != 0) _rmp = min(_rmp,"
+                        " clamp(float(end_tick * 441 - playSamp) / 32.0, 0.0,"
+                        " 1.0));\n"
+                        "        out_lr += s * vol * _rmp * vec2(1.0 - panR,"
                         " panR);\n"
                         "    }\n"
                         "    return out_lr;\n"
                         "}\n"
                         "#endif // USE_TIMELINE_DSP\n")
                     _tl_block = _tlg + _TLGETOUTPUT_GLSL
-                    _tl_anchor = "#ifndef AA_RESAMPLE\n"
+                    # IT builds anchor on the AA_RESAMPLE guard; S3M/XM Sound
+                    # tabs don't have it → fall back to mainSound (still after
+                    # getSampleF + samples[], before the tlGetOutput call).
+                    _tl_anchor = ("#ifndef AA_RESAMPLE\n"
+                                  if "#ifndef AA_RESAMPLE\n" in _sound_src
+                                  else "vec2 mainSound(int samp, float time) {")
                     # The define lives in COMMON now; flip it there. The
                     # tlGetOutput fn + segment arrays still go into SOUND
                     # (it's a Sound function), at the AA anchor.
@@ -17518,27 +19544,34 @@ Generated by MOD2GLSL
                 if _tlg and "#define USE_TIMELINE_DSP 1" in _common_src:
                     import re as _re_ds
                     _ds_saved = 0; _ds_hit = []
-                    for _an in ("patDict0", "patBitmap0", "patIdx0",
-                                "patIdx1", "patIdx2", "patRowSeek0"):
-                        # const <T> <name>[<N>] = <T>[]( …no ';' until end… );
-                        _rx = (r'const\s+(\w+)\s+' + _an +
-                               r'\s*\[\s*\d+\s*\]\s*=\s*\1\s*\[\]\s*\([^;]*\)\s*;')
-                        _m = _re_ds.search(_rx, _common_src)
-                        if _m:
-                            _ty = _m.group(1)
-                            _new = (f"const {_ty} {_an}[1] = "
-                                    f"{_ty}[]({_ty}(0));")
-                            _ds_saved += (_m.end() - _m.start()) - len(_new)
-                            _common_src = (_common_src[:_m.start()] + _new
-                                           + _common_src[_m.end():])
-                            _ds_hit.append(_an)
-                    if _ds_hit:
-                        print(f"   ✂️  Dead pattern arrays emptied under "
-                              f"timeline ({'+'.join(_ds_hit)}; "
-                              f"~{_ds_saved//1024} KB off Common).")
+                    # IT empties the pattern-data arrays to fit the ANGLE
+                    # private-var budget. S3M/XM KEEP them: the note-grid
+                    # display reads patBitmap/patDict/patIdx via getNote
+                    # ("pattern for display, segment for playback"). The --png
+                    # PNG holds them cheaply, so display + segment audio coexist.
+                    if _seg_fmt == 'it':
+                        for _an in ("patDict0", "patBitmap0", "patIdx0",
+                                    "patIdx1", "patIdx2", "patRowSeek0"):
+                            # const <T> <name>[<N>] = <T>[]( …no ';' until end… );
+                            _rx = (r'const\s+(\w+)\s+' + _an +
+                                   r'\s*\[\s*\d+\s*\]\s*=\s*\1\s*\[\]\s*\([^;]*\)\s*;')
+                            _m = _re_ds.search(_rx, _common_src)
+                            if _m:
+                                _ty = _m.group(1)
+                                _new = (f"const {_ty} {_an}[1] = "
+                                        f"{_ty}[]({_ty}(0));")
+                                _ds_saved += (_m.end() - _m.start()) - len(_new)
+                                _common_src = (_common_src[:_m.start()] + _new
+                                               + _common_src[_m.end():])
+                                _ds_hit.append(_an)
+                        if _ds_hit:
+                            print(f"   ✂️  Dead pattern arrays emptied under "
+                                  f"timeline ({'+'.join(_ds_hit)}; "
+                                  f"~{_ds_saved//1024} KB off Common).")
                     else:
-                        print(f"   ⚠ dead-pattern strip: no pattern arrays "
-                              f"matched — build valid, just larger")
+                        print(f"   📊 pattern data KEPT for note display "
+                              f"(segment player handles audio; --png holds "
+                              f"patterns) — pattern+segment coexist.")
 
                     # ── GUT the dead pattern-player FUNCTION BODIES too.
                     # Keeping them as "inert dead-code" still pays their
@@ -18245,7 +20278,9 @@ Generated by MOD2GLSL
                  "code": _c_bufA, "name": "Buffer A",
                  "description": "", "type": "buffer"},
                 {"outputs": [],
-                 "inputs": ([_IN_PNG3] if args.use_png else []),
+                 # iChannel0 = Buffer A → per-channel SOLO flags (row 2 px 16+ch).
+                 # No cycle: Buffer A does not read the Sound pass.
+                 "inputs": ([_IN_PNG3, _IN_BUFA_SELF] if args.use_png else [_IN_BUFA_SELF]),
                  "code": _c_sound, "name": "Sound",
                  "description": "", "type": "sound"},
             ]
@@ -18268,11 +20303,37 @@ Generated by MOD2GLSL
             _jb = os.path.getsize(_stj)
             _json_listing = (f"   📦 Import JSON:   {_stj}  ({_jb:,} B)"
                              f"  ← ShaderToy ▸ Import (all 4 tabs in one)")
+            # ── THE player: self-contained ShaderToy-engine, auto-start ────
+            # <base>_player.html bundles the real shadertoy.com renderer
+            # (gzip-embedded) + this shader inlined → opens in any browser,
+            # auto-starts, fixed-res + bilinear scale, plays exactly like
+            # shadertoy.com. REPLACES the old hand-rolled HTML player. Textures
+            # resolve from shadertoy.com/assets/ (served alongside).
+            if _emit_player:
+                try:
+                    _bg_only = getattr(args, 'background', False)
+                    if not _bg_only:
+                        emit_player_from_blob(_shader, html_file,
+                                                   assets_base="shadertoy.com/assets/",
+                                                   title=f"{base_name} — MOD2GLSL",
+                                                   fx_mode=(2 if getattr(args,'sf',False) else 1 if getattr(args,'earwax',False) else 0))
+                        _json_listing += (f"\n   ▶️  Player:        {html_file}"
+                                          f"  ({os.path.getsize(html_file):,} B, self-contained, auto-start)")
+                    if _bg_only:
+                        # --background: emit ONLY the viz-only wallpaper (no player UI)
+                        _bg_html = base_name + "_background.html"
+                        emit_player_from_blob(_shader, _bg_html,
+                                                   assets_base="shadertoy.com/assets/",
+                                                   title=f"{base_name} — MOD2GLSL", background=True,
+                                                   fx_mode=(2 if getattr(args,'sf',False) else 1 if getattr(args,'earwax',False) else 0))
+                        _json_listing += (f"\n   🖼️  Background:    {_bg_html}"
+                                          f"  ({os.path.getsize(_bg_html):,} B, viz-only fullscreen wallpaper)")
+                except Exception as _ppe:
+                    print(f"   ⚠ player emit skipped ({_ppe})")
         except Exception as _je:
             _json_listing = f"   ⚠ json emit failed ({_je}); .glsl tabs are fine"
 
     print(f"\n✅ Generated:")
-    print(f"   🌐 HTML Player:    {html_file}")
     if _json_listing:
         print(_json_listing)
     _enc_label = "PNG-loaded" if args.use_png else "VQ-encoded"
@@ -18352,6 +20413,341 @@ Generated by MOD2GLSL
 
 
 
+
+
+
+# ==== Embedded ShaderToy renderer (gzip) + self-contained player emitter ====
+# Inlined from shadertoy_player_emit.py so mod_player.py is the single engine source.
+import gzip, base64
+# shadertoy.com /media/a/<hash> -> local assets/<file>
+MEDIA_MAP = {
+"/media/a/10eb4fe0ac8a7dc348a2cc282ca5df1759ab8bf680117e4047728100969e7b43.jpg":"tex00.jpg",
+"/media/a/cd4c518bc6ef165c39d4405b347b51ba40f8d7a065ab0e8d2e4f422cbc1e8a43.jpg":"tex01.jpg",
+"/media/a/95b90082f799f48677b4f206d856ad572f1d178c676269eac6347631d4447258.jpg":"tex02.jpg",
+"/media/a/e6e5631ce1237ae4c05b3563eda686400a401df4548d0f9fad40ecac1659c46c.jpg":"tex03.jpg",
+"/media/a/8de3a3924cb95bd0e95a443fff0326c869f9d4979cd1d5b6e94e2a01f5be53e9.jpg":"tex04.jpg",
+"/media/a/1f7dca9c22f324751f2a5a59c9b181dfe3b5564a04b724c657732d0bf09c99db.jpg":"tex05.jpg",
+"/media/a/fb918796edc3d2221218db0811e240e72e340350008338b0c07a52bd353666a6.jpg":"tex06.jpg",
+"/media/a/52d2a8f514c4fd2d9866587f4d7b2a5bfa1a11a0e772077d7682deb8b3b517e5.jpg":"tex07.jpg",
+"/media/a/bd6464771e47eed832c5eb2cd85cdc0bfc697786b903bfd30f890f9d4fc36657.jpg":"tex08.jpg",
+"/media/a/92d7758c402f0927011ca8d0a7e40251439fba3a1dac26f5b8b62026323501aa.jpg":"tex09.jpg",
+"/media/a/0a40562379b63dfb89227e6d172f39fdce9022cba76623f1054a2c83d6c0ba5d.png":"tex10.png",
+"/media/a/3083c722c0c738cad0f468383167a0d246f91af2bfa373e9c5c094fb8c8413e0.png":"tex11.png",
+"/media/a/0c7bf5fe9462d5bffbd11126e82908e39be3ce56220d900f633d58fb432e56f5.png":"tex12.png",
+"/media/a/cbcbb5a6cfb55c36f8f021fbb0e3f69ac96339a39fa85cd96f2017a2192821b5.png":"tex14.png",
+"/media/a/85a6d68622b36995ccb98a89bbb119edf167c914660e4450d313de049320005c.png":"tex15.png",
+"/media/a/f735bee5b64ef98879dc618b016ecf7939a5756040c2cde21ccb15e69a6e1cfb.png":"tex16.png",
+"/media/a/3871e838723dd6b166e490664eead8ec60aedd6b8d95bc8e2fe3f882f0fd90f0.jpg":"tex17.jpg",
+"/media/a/79520a3d3a0f4d3caa440802ef4362e99d54e12b1392973e4ea321840970a88a.jpg":"tex18.jpg",
+"/media/a/ad56fba948dfba9ae698198c109e71f118a54d209c0ea50d77ea546abad89c57.png":"tex19.png",
+"/media/a/8979352a182bde7c3c651ba2b2f4e0615de819585cc37b7175bcefbca15a6683.jpg":"tex20.jpg",
+"/media/a/08b42b43ae9d3c0605da11d0eac86618ea888e62cdd9518ee8b9097488b31560.png":"tex21.png",
+"/media/a/08b42b43ae9d3c0605da11d0eac86618ea888e62cdd9518ee8b9097488b31562.jpg":"tex22.jpg",
+"/media/a/cb49c003b454385aa9975733aff4571c62182ccdda480aaba9a8d250014f00ec.png":"tex23.png",
+"/media/a/aea6b99da1d53055107966b59ac5444fc8bc7b3ce2d0bbb6a4a3cbae1d97f3aa.bin":"rgbanoise3d.bin",
+}
+
+# Engine blob (piLibs_full.js + effect.js, gzip+base64). Filled by the build
+# script; mod_player.py carries the baked copy.
+_SHADERTOY_ENGINE_GZ_B64 = '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'
+
+def _engine_js(blob=None):
+    blob = blob or _SHADERTOY_ENGINE_GZ_B64
+    return gzip.decompress(base64.b64decode(blob)).decode("utf-8")
+
+_TEMPLATE = r'''<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>__TITLE__</title>
+<style>
+ html,body{margin:0;height:100%;background:#000;color:#cfcfcf;font-family:Menlo,Consolas,monospace;font-size:13px;overflow:hidden}
+ #wrap{display:flex;flex-direction:column;height:100%;background:#000}
+ #cvwrap{flex:1 1 auto;min-height:0;display:block;overflow:hidden;background:#000;position:relative}
+ canvas{background:#000;display:block;width:100%;height:100%;image-rendering:auto;cursor:default}
+ #err{position:absolute;left:0;right:0;top:0;color:#f99;white-space:pre-wrap;font-size:11px;max-height:60%;overflow:auto;padding:4px 10px;background:rgba(25,8,8,.92);z-index:5}
+ #err:empty{display:none}
+ #loading{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);display:none;flex-direction:column;align-items:center;gap:13px;padding:22px 38px;color:#dff;font-size:19px;letter-spacing:2px;background:rgba(14,17,22,.985);border:1px solid rgba(105,125,160,.4);border-radius:11px;z-index:50;pointer-events:none;box-shadow:0 0 0 100vmax rgba(0,0,0,.85),0 8px 34px rgba(0,0,0,.55)}
+ #loading .ldbar{position:relative;width:230px;height:6px;border-radius:3px;background:rgba(86,112,150,.22);overflow:hidden}
+ #loading .ldfill{display:block;width:0;height:100%;border-radius:3px;background:linear-gradient(90deg,#3cf,#cff);box-shadow:0 0 7px rgba(95,205,255,.75)}
+ /* shadertoy.com-style bottom control bar */
+ #bar{flex:0 0 54px;height:54px;background:#2f2f2f;display:flex;align-items:center;gap:16px;padding:0 12px;color:#cfcfcf;user-select:none}
+ #bar button{background:none;border:none;color:#cfcfcf;font-size:25px;cursor:pointer;padding:0;line-height:1;display:flex;align-items:center}
+ #bar button:hover{color:#fff}
+ #bar .num{font-size:16px;white-space:nowrap}
+ #bar #t{min-width:52px;color:#e2e2e2}
+ #bar #fps{min-width:66px;color:#e2e2e2}
+ #bar #res{color:#9aa0a6;min-width:104px}
+ #bar #status{color:#b0b0b0;font-size:14px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;max-width:30vw}
+ #bar .spacer{flex:1 1 auto}
+ #rec.on,#bar #rec.on:hover{color:#ff4040}
+ #bgmute{display:none;position:fixed;right:16px;bottom:16px;width:52px;height:52px;background:none;border:none;color:#e0e0e0;font-size:34px;cursor:pointer;z-index:11;align-items:center;justify-content:center;transition:transform .12s ease,filter .12s ease;filter:drop-shadow(0 1px 3px rgba(0,0,0,.75))}
+ #bgmute:hover{filter:brightness(1.4) drop-shadow(0 0 8px rgba(190,225,255,.9));transform:scale(1.12)}
+ #bar #mute{font-size:20px}
+ #bar #vol{width:80px;height:4px;cursor:pointer;accent-color:#9aa0a6}
+</style></head>
+<body>
+<div id="wrap">
+ <div id="cvwrap"><canvas id="cv" width="1096" height="616"></canvas><div id="err"></div></div>
+ <div id="bar">
+  <button id="restart" title="Rewind / Restart">&#9198;</button>
+  <button id="play" title="Pause / Resume">&#9208;</button>
+  <span class="num" id="t">0.00</span>
+  <span class="num" id="fps">&#8211; fps</span>
+  <span class="num" id="res">&#8211; x &#8211;</span>
+  <span id="status"></span>
+  <span class="spacer"></span>
+  <button id="mute" title="Mute / Unmute">&#128264;</button>
+  <input id="vol" type="range" min="0" max="100" value="100" title="Volume">
+  <button id="rec" title="Record video + audio (webm, hi-bitrate)">&#9679;</button>
+  <button id="full" title="Fullscreen">&#9974;</button>
+ </div>
+</div>
+<div id="loading"><span id="loadtxt"></span><span class="ldbar"><i class="ldfill"></i></span></div>
+<button id="bgmute" title="Mute / Unmute">&#128264;</button>
+<script>
+__ENGINE__
+</script>
+<script>
+"use strict";
+const ASSETS_BASE="__ASSETS_BASE__";
+const MEDIA_MAP=__MEDIA_MAP__;
+const SHADER=__SHADER_JSON__;
+window.gDLName="__DLNAME__";
+let gEffect=null,gAudio=null,gData=null,gStart=0,gLast=0,gPaused=false,gRAF=0,gPauseAccum=0,gPauseAt=0,gFps=0,gMuted=false,gRec=null,gChunks=[],gVol=1,gGL=null,gMouse=[0,0,0,0],gMdown=false,gFirst=false;
+const cv=document.getElementById("cv"),tEl=document.getElementById("t"),fpsEl=document.getElementById("fps"),
+      resEl=document.getElementById("res"),statusEl=document.getElementById("status"),errEl=document.getElementById("err"),
+      playBtn=document.getElementById("play"),muteBtn=document.getElementById("mute"),recBtn=document.getElementById("rec");
+const log=m=>{statusEl.textContent=m;},showErr=m=>{errEl.textContent=m||"";};
+function setLoading(m,prog){var l=document.getElementById("loading");if(!l)return;var tx=document.getElementById("loadtxt");if(tx)tx.textContent=m||"";var fl=document.querySelector("#loading .ldfill");if(fl&&typeof prog==="number")fl.style.width=(Math.max(0,Math.min(1,prog))*100)+"%";l.style.display=m?"flex":"none";}
+function compilePerPass(cb){if(!gEffect||typeof gEffect.NewShader!=="function"){gEffect.Compile(false,cb);return;}var _np=gEffect.mPasses.length,_ci=0;(function _nx(){if(_ci>=_np){var _bad=false;for(var k=0;k<gEffect.mPasses.length;k++)if(gEffect.mPasses[k].mError)_bad=true;cb(!_bad);return;}setLoading("Compiling shader "+(_ci+1)+" / "+_np,(_ci+1)/_np);setTimeout(function(){try{gEffect.NewShader(_ci,false,function(){_ci++;_nx();});}catch(e){_ci++;_nx();}},0);})();}
+const _STUB1PX="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+function rewriteTextures(sh){for(const rp of (sh.renderpass||[]))for(const inp of (rp.inputs||[])){if(!inp||!inp.filepath)continue;if(inp.filepath.slice(0,5)==="data:")continue;if(MEDIA_MAP[inp.filepath]){inp.filepath=ASSETS_BASE+MEDIA_MAP[inp.filepath];}else if(inp.filepath.slice(0,7)==="/media/"){inp.filepath=_STUB1PX;}}}
+// shadertoy.com renders at a FIXED canvas buffer and bilinear-scales the bitmap to
+// the window -- that's why resizing only stretches the image. We copy that 1:1:
+// cap the GL render buffer, set ONCE; CSS scales it to fill -> fast + same look.
+var IS_MOBILE=/Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+var RENDER_CAP=IS_MOBILE?720:1366;   // mobile/in-app-WebView GPUs context-lose on the heavy raymarch viz at full res → cap render to 720px on phones (was 1366). Desktop 1366 sized so 8 FULL track columns fit (8*160+78=1358<1366). Lower=faster.
+function setInternalRes(){
+  var w=cv.offsetWidth|0,h=cv.offsetHeight|0,m=Math.max(w,h);
+  if(m>RENDER_CAP){var s=RENDER_CAP/m; w=Math.round(w*s); h=Math.round(h*s);}
+  w=Math.max(16,w); h=Math.max(16,h);
+  cv.width=w; cv.height=h;
+  if(gEffect){gEffect.mXres=w;gEffect.mYres=h;if(gEffect.ResizeBuffers)gEffect.ResizeBuffers(w,h);}
+}
+function updateRes(){resEl.textContent=(cv.offsetWidth|0)+" x "+(cv.offsetHeight|0);}   // DISPLAY size, like shadertoy
+window.addEventListener("resize",updateRes);
+function applyAudio(){if(gAudio){if(gPaused)gAudio.suspend();else gAudio.resume();}}
+function setGain(){if(gEffect&&gEffect.mGainNode)gEffect.mGainNode.gain.value=gMuted?0:gVol;}
+function stopAll(){if(gRAF){cancelAnimationFrame(gRAF);gRAF=0;}if(gAudio){try{gAudio.close();}catch(e){}gAudio=null;}gEffect=null;}
+function loadShaderObj(j){gData=j;stopAll();showErr("");const sh=j.Shader||j;if(!sh||!sh.renderpass){showErr("No renderpass in JSON");return;}rewriteTextures(sh);setInternalRes();updateRes();
+ gAudio=(typeof piCreateAudioContext==="function")?piCreateAudioContext():new (window.AudioContext||window.webkitAudioContext)();gAudio.resume().then(function(){},function(){});
+ gEffect=new Effect(null,gAudio,cv,function(){},null,false,false,function(){},function(){showErr("WebGL context lost");});
+ if(gEffect.mRO){try{gEffect.mRO.disconnect();}catch(e){}}   // kill engine ResizeObserver (renders full display x dpr)
+ setInternalRes();   // re-apply our capped render buffer after the Effect grabbed the canvas
+ gGL=cv.getContext("webgl2")||cv.getContext("webgl");   // for gl.finish() honest-fps sync
+ if(!gEffect.Load(sh)){showErr("Effect.Load failed");return;}log("compiling "+sh.renderpass.length+" passes...");setLoading("COMPILING "+sh.renderpass.length+" PASSES\u2026");
+ setTimeout(function(){compilePerPass(function(ok){if(!ok){const m=[];for(const p of gEffect.mPasses)if(p.mError)m.push("["+(p.mName||p.mType)+"]\n"+(p.mErrorStr||p.mError||""));showErr(m.join("\n\n")||"compile error");log("compile FAILED");setLoading("COMPILE FAILED \u2014 see below");}else {log("");setLoading("");gFirst=true;}
+  gStart=performance.now();gLast=gStart;gPauseAccum=0;gPaused=false;gFps=0;playBtn.innerHTML="&#9208;";setGain();setTimeout(loop,70);
+  setTimeout(function(){if(gAudio&&gAudio.state==="suspended"&&!gMuted)log("click for sound");},500);});},70);}
+function loop(){gRAF=requestAnimationFrame(loop);const now=performance.now();if(gPaused){gLast=now;return;}const rawDt=(now-gLast)/1000.0,time=(now-gStart-gPauseAccum)/1000.0,dt=Math.min(0.1,rawDt);gLast=now;if(cv.width>RENDER_CAP||cv.height>RENDER_CAP)setInternalRes();if(rawDt>0)gFps=gFps?gFps*0.9+0.1/rawDt:1/rawDt;tEl.textContent=time.toFixed(2);fpsEl.textContent=gFps.toFixed(1)+" fps";try{gEffect.Paint(time,dt,60,gMouse[2],gMouse[3],gMouse[0],gMouse[1],gPaused);if(gGL)gGL.finish();if(gFirst){gFirst=false;setLoading("");}var _s=gEffect.mPasses.find(p=>p.mType==="sound");if(_s&&_s.mPlayNode&&!_s.mPlayNode.loop)_s.mPlayNode.loop=true;}catch(e){if(!window._pErr){window._pErr=1;showErr("Paint: "+e);}/* keep looping — a transient mobile GPU/context-loss must not kill the player; audio + UI stay alive and the render can recover */}}
+playBtn.onclick=function(){if(!gEffect)return;gPaused=!gPaused;if(gPaused)gPauseAt=performance.now();else gPauseAccum+=performance.now()-gPauseAt;this.innerHTML=gPaused?"&#9654;":"&#9208;";applyAudio();};
+document.getElementById("restart").onclick=function(){if(gData)loadShaderObj(gData);};
+function toggleMute(){gMuted=!gMuted;var v=document.getElementById("vol");if(v)v.value=gMuted?0:Math.round(gVol*100);var g=gMuted?"&#128263;":"&#128264;";muteBtn.innerHTML=g;var bm=document.getElementById("bgmute");if(bm)bm.innerHTML=g;setGain();}
+muteBtn.onclick=toggleMute;var _bgm=document.getElementById("bgmute");if(_bgm)_bgm.onclick=toggleMute;
+document.getElementById("vol").oninput=function(){gVol=this.value/100;if(gMuted){gMuted=false;muteBtn.innerHTML="&#128264;";var bm=document.getElementById("bgmute");if(bm)bm.innerHTML="&#128264;";}setGain();};
+document.getElementById("full").onclick=function(){var el=document.getElementById("wrap");if(!document.fullscreenElement&&!document.webkitFullscreenElement){(el.requestFullscreen||el.webkitRequestFullscreen||function(){}).call(el);}else{(document.exitFullscreen||document.webkitExitFullscreen||function(){}).call(document);}};
+function _onFs(){setTimeout(function(){setInternalRes();updateRes();},80);}document.addEventListener("fullscreenchange",_onFs);document.addEventListener("webkitfullscreenchange",_onFs);
+recBtn.onclick=function(){if(gRec){gRec.stop();return;}if(!cv.captureStream){showErr("recording not supported here");return;}try{var st=cv.captureStream(60);try{if(gAudio&&gEffect&&gEffect.mGainNode){var _ad=gAudio.createMediaStreamDestination();gEffect.mGainNode.connect(_ad);_ad.stream.getAudioTracks().forEach(function(t){st.addTrack(t);});}}catch(e){}var _mime="video/webm;codecs=vp9,opus";if(!MediaRecorder.isTypeSupported(_mime))_mime="video/webm;codecs=vp8,opus";if(!MediaRecorder.isTypeSupported(_mime))_mime="video/webm";var _vbps=Math.min(120000000,Math.max(20000000,cv.width*cv.height*12));gChunks=[];gRec=new MediaRecorder(st,{mimeType:_mime,videoBitsPerSecond:_vbps,audioBitsPerSecond:320000});gRec.ondataavailable=e=>{if(e.data.size)gChunks.push(e.data);};gRec.onstop=function(){var b=new Blob(gChunks,{type:"video/webm"}),u=URL.createObjectURL(b),a=document.createElement("a");a.href=u;window.gRecN=(parseInt(localStorage.getItem("gRecN")||"0",10)||0)+1;try{localStorage.setItem("gRecN",String(window.gRecN));}catch(_e){}a.download=String(window.gDLName||"capture.webm").replace(".webm","-"+window.gRecN+".webm");a.click();setTimeout(()=>URL.revokeObjectURL(u),1000);gRec=null;recBtn.classList.remove("on");};gRec.start();recBtn.classList.add("on");}catch(e){showErr("record: "+e);gRec=null;}};
+function _wake(){if(!gPaused&&gAudio&&gAudio.state==="suspended")gAudio.resume();}
+function _mxy(e){var r=cv.getBoundingClientRect();return [(e.clientX-r.left)/Math.max(1,r.width)*cv.width,(1-(e.clientY-r.top)/Math.max(1,r.height))*cv.height];}
+cv.addEventListener("mousedown",function(e){var p=_mxy(e);gMouse=[p[0],p[1],p[0],p[1]];gMdown=true;if(!window.gBg)cv.style.cursor=(p[1]>cv.height-595.&&p[1]<cv.height-179.)?"grabbing":"default";});
+cv.addEventListener("mousemove",function(e){if(!gMdown){if(!window.gBg){var pp=_mxy(e);cv.style.cursor=(pp[1]>cv.height-595.&&pp[1]<cv.height-179.)?"grab":"default";}return;}var p=_mxy(e);gMouse[0]=p[0];gMouse[1]=p[1];});
+window.addEventListener("mouseup",function(){if(gMdown){gMdown=false;gMouse[2]=-Math.abs(gMouse[2]);gMouse[3]=-Math.abs(gMouse[3]);cv.style.cursor="default";}});
+["pointerdown","keydown","touchstart"].forEach(function(ev){window.addEventListener(ev,_wake);});
+window.addEventListener("keydown",function(e){if((e.code==="Space"||e.key===" ")&&gEffect){e.preventDefault();playBtn.click();}});
+loadShaderObj(SHADER);
+</script>
+</body></html>'''
+
+# ── AuralSpace spatializer (user's C++ class), JS port. Appended to the engine
+# JS so it runs as a Web Audio post-process on the piLibs Sound node's output
+# (HTML player only — the ShaderToy .json export is never touched). Press 'A' to
+# A/B. Head-shadow IIR + 64-tap linear-phase FIR + ITD delay. Stateful → only
+# possible here (the JS output buffer), not in the stateless GLSL Sound shader.
+_AURAL_JS = r'''
+;(function(){
+// ── FFmpeg af_earwax: 32-tap STEREO crossfeed FIR for headphones (Beingessner/SoX) ──
+// L_out = L*f1 + R*f0 ; R_out = L*f0 + R*f1  (f0=even taps, f1=odd taps; /128).
+var MODE_DEFAULT=1; // headphone FX on load: 0=off, 1=earwax, 2=auralspace. Press A to cycle.
+var EWFILT=[4,-6,4,-11,-1,-5,3,3,-2,5,-5,0,9,1,6,3,-4,-1,-5,-3,-2,-5,-7,1,6,-7,30,-29,12,-3,-11,4,-3,7,-20,23,2,0,1,-6,-14,-5,15,-18,6,7,15,-10,-14,22,-7,-2,-4,9,6,-12,6,-6,0,-11,0,-5,4,0];
+var EW=1.0; // earwax output level (faithful /128); raise if too quiet.
+function Earwax(){this.f0=new Float32Array(32);this.f1=new Float32Array(32);
+ for(var i=0;i<32;i++){this.f0[i]=EWFILT[i*2]/128;this.f1[i]=EWFILT[i*2+1]/128;}
+ this.hL=new Float32Array(32);this.hR=new Float32Array(32);this.p=0;}
+Earwax.prototype.pr=function(ib,ob){var iL=ib.getChannelData(0),iR=ib.getChannelData(1),
+ oL=ob.getChannelData(0),oR=ob.getChannelData(1),L=iL.length;
+ for(var s=0;s<L;s++){this.hL[this.p]=iL[s];this.hR[this.p]=iR[s];
+  var Lf0=0,Lf1=0,Rf0=0,Rf1=0;
+  for(var j=0;j<32;j++){var k=(this.p+1+j)&31,lv=this.hL[k],rv=this.hR[k];
+   Lf0+=lv*this.f0[j];Lf1+=lv*this.f1[j];Rf0+=rv*this.f0[j];Rf1+=rv*this.f1[j];}
+  var lo=(Lf1+Rf0)*EW,ro=(Lf0+Rf1)*EW;
+  oL[s]=lo<-1?-1:lo>1?1:lo;oR[s]=ro<-1?-1:ro>1?1:ro;this.p=(this.p+1)&31;}};
+var FFT=[0.158679625409819,0.00523049100855436,0.00531300623243236,0.00538848110491647,
+0.00548464392636858,0.00556593331023983,0.00566048954952847,0.00573454184721844,
+0.00582335101518208,0.00589051581378136,0.00597379720731156,0.00602460689693898,
+0.00608510771621834,0.00608907822109611,0.00610205493952379,0.00600111106161672,
+0.00638755660131146,0.00633709813255301,0.00634142428049436,0.00637770822065878,
+0.00639814242518927,0.00643181598851039,0.00645833398105875,0.00648404488302978,
+0.00650555222454002,0.00652232336253855,0.00654489217882526,0.00656173771900931,
+0.00659027784244443,0.00659500329054849,0.00660684987966123,0.00654120259345378,
+0.00654120259345378,0.00660684987966123,0.00659500329054849,0.00659027784244443,
+0.00656173771900931,0.00654489217882526,0.00652232336253855,0.00650555222454002,
+0.00648404488302978,0.00645833398105875,0.00643181598851039,0.00639814242518927,
+0.00637770822065878,0.00634142428049436,0.00633709813255301,0.00638755660131146,
+0.00600111106161672,0.00610205493952379,0.00608907822109611,0.00608510771621834,
+0.00602460689693898,0.00597379720731156,0.00589051581378136,0.00582335101518208,
+0.00573454184721844,0.00566048954952847,0.00556593331023983,0.00548464392636858,
+0.00538848110491647,0.00531300623243236,0.00523049100855436,0.158679625409819];
+var SC=0.6; // output scale: the model's gain-compensation is ~1.5x → would clip at
+            // full scale; 0.6 keeps it clean. Set SC=1.0 for the raw C++ level.
+var DRY=0.6; // dry/wet of the final mix (was lpf_coeff). 1.0=bypass, 0.0=full
+             // effect (head-shadow+FIR+ITD). The C++ had 0.95 → 5% wet = barely
+             // audible; 0.6 here so you actually HEAR it. Tune to taste.
+function AS(sr){this.sr=sr;this.a1=-0.84;this.OT=1/3;this.lpf=DRY;this.STR=0.7;this.bbc=0.8;
+ this.theta0=150;this.c=334;this.a=0.2;this.w0=200;this.smp=new Float32Array(128);this.n=0;
+ this.x1=[0,0];this.y1=[0,0];this.bbs=[0,0];this.dly=new Float32Array(256);this.dw=0;this.st(0);}
+AS.prototype.st=function(it){var B=function(x){return (x+360)%360;},C=function(x){return x>180?x-360:x;};
+ var th=[B(it+30),B(it+330)];this.b0=[0,0];this.b1=[0,0];this.g=[0,0];this.ds=[0,0];var wr=this.w0/this.sr;
+ for(var ch=0;ch<2;ch++){var al=1.05+0.95*Math.cos(C(th[ch])/this.theta0*Math.PI);
+  this.b0[ch]=(al+wr)/(1+wr);this.b1[ch]=(-al+wr)/(1+wr);var rad=th[ch]*Math.PI/180,sn=Math.sin(rad);
+  this.ds[ch]=(this.a/this.c)*(sn+rad)*this.sr;
+  this.g[ch]=(1-this.STR)+this.STR*(1+Math.cos(C(th[ch])/this.theta0*Math.PI));}};
+AS.prototype.pr=function(ib,ob){var iL=ib.getChannelData(0),iR=ib.getChannelData(1),
+ oL=ob.getChannelData(0),oR=ob.getChannelData(1),L=iL.length;
+ for(var s=0;s<L;s++){for(var ch=0;ch<2;ch++){var inp=(ch?iR[s]:iL[s])*this.g[ch];
+  var o=(this.b0[ch]*inp+this.b1[ch]*this.x1[ch]+this.a1*this.y1[ch])*this.OT;this.x1[ch]=inp;this.y1[ch]=o;
+  this.smp[(this.n&63)*2+ch]=o;var acc=0;for(var i=0;i<64;i++){acc+=FFT[i]*this.smp[(((this.n+64-i)&63)*2+ch)];}o=acc;
+  this.bbs[ch]=this.bbc*o+(1-this.bbc)*this.bbs[ch];o+=this.bbs[ch];
+  this.dly[(this.dw&127)*2+ch]=o;var ri=(((this.dw-this.ds[ch])|0)%128+128)%128;var del=o*0.7+this.dly[ri*2+ch]*0.3;
+  var so=(this.lpf*this.x1[ch]+(1-this.lpf)*del)*SC;if(ch)oR[s]=so;else oL[s]=so;}
+  this.dw=(this.dw+1)&8388607;this.n=(this.n+1)&8388607;}};
+var ew=null,as=null,sp=null,MODE=MODE_DEFAULT,NAMES=['off','earwax','soundfield'];
+function hk(){if(!window.gEffect||!gEffect.mPasses)return;var _s=gEffect.mPasses.find(function(p){return p.mType==='sound';});
+ if(!_s||!_s.mPlayNode||_s.mPlayNode._aural)return;var nd=_s.mPlayNode,ctx=nd.context;nd._aural=true;
+ ew=new Earwax();as=new AS(ctx.sampleRate);
+ sp=ctx.createScriptProcessor(4096,2,2);sp.onaudioprocess=function(e){var ib=e.inputBuffer,ob=e.outputBuffer;
+  if(MODE===1)ew.pr(ib,ob);else if(MODE===2)as.pr(ib,ob);
+  else{ob.getChannelData(0).set(ib.getChannelData(0));ob.getChannelData(1).set(ib.getChannelData(1));}};
+ try{nd.disconnect();}catch(_e){}nd.connect(sp);sp.connect(ctx.destination);
+ if(window.console)console.log('Headphone FX ready ('+NAMES[MODE]+') — press A to cycle off/earwax/soundfield');}
+function mkUI(){if(window.gBg||document.getElementById('hpfx'))return;
+ var bar=document.getElementById('bar');if(!bar)return;   // dock in the control bar, themed to match
+ var d=document.createElement('span');d.id='hpfx';
+ d.style.cssText='display:inline-flex;align-items:center;gap:5px;color:#cfcfcf;font-size:20px;line-height:1';
+ var sel=document.createElement('select');
+ sel.style.cssText='background:#262626;color:#cfcfcf;border:1px solid #4a4a4a;border-radius:4px;font:13px Menlo,Consolas,monospace;padding:2px 6px 2px 4px;outline:none;cursor:pointer';
+ for(var i=0;i<NAMES.length;i++){var o=document.createElement('option');o.value=i;o.textContent=NAMES[i];o.style.color='#cfcfcf';o.style.background='#262626';sel.appendChild(o);}
+ sel.value=MODE;sel.title='Headphone FX (or press A)';
+ sel.onchange=function(){MODE=parseInt(sel.value,10)||0;if(window.console)console.log('Headphone FX: '+NAMES[MODE]);};
+ d.appendChild(document.createTextNode('🎧'));d.appendChild(sel);bar.appendChild(d);window._hpfxSel=sel;}
+setInterval(function(){mkUI();hk();},400);
+window.addEventListener('keydown',function(e){if(e.key==='a'||e.key==='A'){MODE=(MODE+1)%3;if(window._hpfxSel)window._hpfxSel.value=MODE;if(window.console)console.log('Headphone FX: '+NAMES[MODE]);}});
+})();
+'''
+
+
+def emit_player(shader_json_obj, out_html, engine_js, title="MOD2GLSL Player", assets_base="assets/", background=False, fx_mode=0):
+    """Write a self-contained player HTML. engine_js = piLibs_full + effect (concatenated)."""
+    import copy as _copy
+    shader_json_obj = _copy.deepcopy(shader_json_obj)   # don't mutate caller's object
+    try:
+        nm = (shader_json_obj.get("info") or {}).get("name")
+        if nm: title = nm
+    except Exception:
+        pass
+    # ── Loop-forever transform (PLAYER ONLY; the ShaderToy.com .json keeps the cap) ──
+    # Drop the `min(iTime, AUDIO_BUFFER_S)` clamp so the visualizer loops past 180s,
+    # and neuter the 180s "limit reached" dialog. The audio buffer is looped in JS.
+    # --background wallpaper: output ONLY the viz scene; mainImage computes
+    # `vec3 col = _VizScene(C)` up front, so emit it and return before any tracker
+    # grid / HUD text / progress bar / oscilloscope / loading screen. Done in its
+    # OWN loop, INDEPENDENT of the AUDIO_BUFFER_S loop-forever transform below —
+    # the IT/NNA Image pass has no AUDIO_BUFFER_S clamp, so folding this into that
+    # gated loop (as before) silently skipped --background for IT files.
+    if background:
+        for _rp in (shader_json_obj.get("renderpass") or []):
+            if _rp.get("type") == "image":
+                _c = _rp.get("code", "")
+                if "vec3 col = _VizScene(C);" in _c:
+                    _rp["code"] = _c.replace(
+                        "vec3 col = _VizScene(C);",
+                        "vec3 col = _VizScene(C);\n    O = vec4(col, 1.0); return;   // --background: viz scene only")
+    for _rp in (shader_json_obj.get("renderpass") or []):
+        _c = _rp.get("code", "")
+        if "AUDIO_BUFFER_S" not in _c:   # iTime clamp lives in BOTH Image and Buffer A
+            continue
+        _c = _c.replace("min(iTime, AUDIO_BUFFER_S)", "iTime")  # loop-forever: drop the 180s clamp (robust — SONG_DURATION_S is baked as a literal now, so the old full-string match silently failed)
+        _c = _c.replace("if (iTime < AUDIO_BUFFER_S - INTRO_SILENCE_S - 0.30) return;",
+                        "return;  // loop-forever: 180s cap dialog disabled")
+        _rp["code"] = _c
+    # ── Loop-forever AUDIO: size the engine sound buffer to the full song + drop the 180s fade ──
+    # Engine default is this.mPlayTime=60*3 (180s) and the Sound tab fades out at BUFFER_CAP=180,
+    # so long songs (pod=314s) truncated + looped the audio at 180s. Size the buffer to the song's
+    # loop period (the mod() arg baked into the iTime define) and neuter the fade.
+    import re as _re3
+    _song_dur_s = 180.0
+    for _rp in (shader_json_obj.get("renderpass") or []):
+        _c = _rp.get("code", "")
+        _m = _re3.search(r"INTRO_SILENCE_S, 0\.0\), ([0-9.]+)\)", _c)
+        if _m:
+            try: _song_dur_s = max(_song_dur_s, float(_m.group(1)))
+            except ValueError: pass
+        if "BUFFER_CAP   = 180.0" in _c:
+            _rp["code"] = _c.replace("const float BUFFER_CAP   = 180.0;", "const float BUFFER_CAP   = 1e9;")
+    engine_js = engine_js.replace("this.mPlayTime = 60*3;", "this.mPlayTime = %.2f;" % _song_dur_s)
+    # Append the AuralSpace spatializer post-process (HTML player only; press 'A'
+    # to A/B). Goes into __ENGINE__ so the later non-rescanned replace covers it.
+    engine_js = engine_js + _AURAL_JS
+    # CLI --earwax / --sf set which headphone FX is active on load (0 off, 1 earwax,
+    # 2 soundfield); the 🎧 dropdown / A key still switch live.
+    engine_js = engine_js.replace("var MODE_DEFAULT=1;", "var MODE_DEFAULT=%d;" % int(fx_mode))
+    # Embed referenced textures as base64 data URLs => FULLY self-contained
+    # player: no external shadertoy.com/assets/ loads, so it works anywhere you
+    # move the .html (no 404/retry when the assets folder is not alongside).
+    try:
+        import os as _os2, base64 as _b64e
+        for _rp in (shader_json_obj.get("renderpass") or []):
+            for _inp in (_rp.get("inputs") or []):
+                _fp = _inp.get("filepath")
+                if _inp.get("type") == "texture" and _fp in MEDIA_MAP:
+                    _loc = MEDIA_MAP[_fp]; _pth = _os2.path.join(assets_base, _loc)
+                    if _os2.path.exists(_pth):
+                        _ext = _loc.rsplit(".", 1)[-1].lower()
+                        _mime = "image/jpeg" if _ext in ("jpg","jpeg") else ("image/png" if _ext=="png" else "application/octet-stream")
+                        with open(_pth, "rb") as _ff: _enc = _b64e.b64encode(_ff.read()).decode("ascii")
+                        _inp["filepath"] = "data:" + _mime + ";base64," + _enc
+    except Exception:
+        pass
+    _dlbase = os.path.basename(out_html); _dlbase = (_dlbase[:-5] if _dlbase.lower().endswith(".html") else _dlbase) + ".webm"
+    html = (_TEMPLATE
+            .replace("__TITLE__", str(title))
+            .replace("__DLNAME__", _dlbase)
+            .replace("__ASSETS_BASE__", assets_base)
+            .replace("__MEDIA_MAP__", json.dumps(MEDIA_MAP))
+            .replace("__SHADER_JSON__", json.dumps(shader_json_obj))
+            .replace("__ENGINE__", engine_js))   # engine LAST so its content is never re-scanned
+    if background:
+        html = html.replace("</style></head>",
+                            " #bar{display:none!important} #cvwrap{position:fixed;inset:0;z-index:0} #bgmute{display:flex!important}"
+                            " h1{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);margin:0;z-index:10;color:#fff;font-family:Menlo,Consolas,monospace;text-align:center;text-shadow:0 2px 14px #000,0 0 34px rgba(0,0,0,.7)}"
+                            "</style><script>window.gBg=1;</script></head>", 1)
+        # placeholder so users see where to put their webpage content (centered+white via the h1 CSS above)
+        html = html.replace('<div id="wrap">', '    <h1>Your website goes here...</h1>\n<div id="wrap">', 1)
+    with open(out_html, "w", encoding="utf-8") as f:
+        f.write(html)
+    return out_html
+
+def emit_player_from_blob(shader_json_obj, out_html, assets_base="assets/", title="MOD2GLSL Player", background=False, fx_mode=0):
+    """Emit using the embedded gzipped engine blob (no external .js needed)."""
+    return emit_player(shader_json_obj, out_html, _engine_js(), title=title, assets_base=assets_base, background=background, fx_mode=fx_mode)
 
 if __name__ == '__main__':
     # Turn expected user-facing failures (missing file, unsupported/unknown
